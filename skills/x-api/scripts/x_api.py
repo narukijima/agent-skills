@@ -64,12 +64,27 @@ class ApiFailure(RuntimeError):
         payload: Any = None,
         retry_after: Optional[str] = None,
         rate_limit_reset: Optional[str] = None,
+        credential_state: Optional[str] = None,
+        recovery_marker: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.payload = payload
         self.retry_after = retry_after
         self.rate_limit_reset = rate_limit_reset
+        self.credential_state = credential_state
+        self.recovery_marker = recovery_marker
+
+
+class CredentialRotationFailure(ApiFailure):
+    """OAuth refresh may have rotated, but the durable credential state is unknown."""
+
+    def __init__(self, message: str, marker: Path) -> None:
+        super().__init__(
+            message,
+            credential_state="reauthorization_required",
+            recovery_marker=str(marker),
+        )
 
 
 def json_loads(raw: bytes) -> Any:
@@ -117,12 +132,83 @@ def oauth2_refresh_configuration() -> Optional[Dict[str, str]]:
     }
 
 
-def write_private_json(path: Path, value: Dict[str, Any]) -> None:
+def _atomic_write_private_json(path: Path, value: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    temporary = path.with_name(path.name + ".tmp." + str(os.getpid()) + "." + secrets.token_hex(8))
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
+            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_private_json(path: Path, value: Dict[str, Any]) -> None:
+    _atomic_write_private_json(path, value)
+
+
+def write_refresh_marker(path: Path, value: Dict[str, Any]) -> None:
+    _atomic_write_private_json(path, value)
+
+
+def clear_private_marker(path: Path) -> None:
+    path.unlink()
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def read_json_object(path: Path, label: str) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ApiFailure("invalid " + label + ": " + str(path)) from exc
+    if not isinstance(loaded, dict):
+        raise ApiFailure("invalid " + label + ": " + str(path))
+    return loaded
+
+
+@contextmanager
+def file_lock(path: Path, purpose: str, required: bool = True):
+    """Hold an advisory lock for a complete read/modify/write transaction."""
+    if fcntl is None:
+        if required:
+            raise ApiFailure(purpose + " locking is unavailable on this platform; refusing unsafe concurrent access")
+        print("warning: " + purpose + " locking is unavailable; do not run concurrently", file=sys.stderr)
+        yield
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_name(path.name + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            os.chmod(lock_path, 0o600)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise ApiFailure("could not lock " + purpose + ": " + str(exc)) from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except ApiFailure:
+        raise
+    except OSError as exc:
+        raise ApiFailure("could not open lock for " + purpose + ": " + str(exc)) from exc
 
 
 def oauth2_refreshed_access_token(config: Dict[str, str]) -> str:
@@ -132,51 +218,92 @@ def oauth2_refreshed_access_token(config: Dict[str, str]) -> str:
     X_OAUTH2_TOKEN_STORE atomically (0600). Tokens are never printed.
     """
     store_path = Path(config["store"])
-    stored: Dict[str, Any] = {}
-    if store_path.exists():
+    marker_path = store_path.with_name(store_path.name + ".refresh-pending")
+    with file_lock(store_path, "OAuth 2.0 token store"):
+        stored = read_json_object(store_path, "OAuth 2.0 token store")
+        marker = read_json_object(marker_path, "OAuth 2.0 refresh marker")
+        if marker:
+            marker_rotation = marker.get("rotation_id")
+            if marker_rotation and stored.get("last_rotation_id") == marker_rotation:
+                try:
+                    clear_private_marker(marker_path)
+                except OSError:
+                    pass  # The committed store proves this marker is stale.
+            else:
+                raise CredentialRotationFailure(
+                    "OAuth 2.0 refresh state is unresolved; a refresh may have rotated without a durable store update. Re-authorization is required",
+                    marker_path,
+                )
+        access_token = stored.get("access_token", "")
+        expires_at = stored.get("access_token_expires_at", 0)
+        if access_token and isinstance(expires_at, (int, float)) and time.time() < float(expires_at) - 60:
+            return access_token
+        refresh_token = stored.get("refresh_token") or config["refresh_token"]
+        if not refresh_token:
+            raise ApiFailure("no refresh token available in X_OAUTH2_TOKEN_STORE or X_OAUTH2_REFRESH_TOKEN")
+        rotation_id = secrets.token_hex(16)
         try:
-            loaded = json.loads(store_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                stored = loaded
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ApiFailure("invalid OAuth 2.0 token store: " + str(store_path)) from exc
-    access_token = stored.get("access_token", "")
-    expires_at = stored.get("access_token_expires_at", 0)
-    if access_token and isinstance(expires_at, (int, float)) and time.time() < float(expires_at) - 60:
-        return access_token
-    refresh_token = stored.get("refresh_token") or config["refresh_token"]
-    if not refresh_token:
-        raise ApiFailure("no refresh token available in X_OAUTH2_TOKEN_STORE or X_OAUTH2_REFRESH_TOKEN")
-    fields = {"grant_type": "refresh_token", "refresh_token": refresh_token}
-    request = Request(resolve_base_url() + "/2/oauth2/token", method="POST")
-    request.add_header("Content-Type", "application/x-www-form-urlencoded")
-    request.add_header("User-Agent", USER_AGENT)
-    if config["client_secret"]:
-        basic = base64.b64encode((config["client_id"] + ":" + config["client_secret"]).encode("utf-8")).decode("ascii")
-        request.add_header("Authorization", "Basic " + basic)
-    else:
-        fields["client_id"] = config["client_id"]
-    request.data = urlencode(fields).encode("utf-8")
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json_loads(response.read())
-    except HTTPError as exc:
-        raise ApiFailure("OAuth 2.0 token refresh was rejected", exc.code, json_loads(exc.read())) from exc
-    except (URLError, TimeoutError) as exc:
-        raise ApiFailure("OAuth 2.0 token refresh did not complete: " + str(exc)) from exc
-    access_token = payload.get("access_token", "") if isinstance(payload, dict) else ""
-    if not access_token:
-        raise ApiFailure("OAuth 2.0 token refresh response did not contain an access token")
-    write_private_json(
-        store_path,
-        {
+            write_refresh_marker(
+                marker_path,
+                {"schema_version": 1, "state": "refresh_pending", "rotation_id": rotation_id, "started_at": utc_now()},
+            )
+        except OSError as exc:
+            raise ApiFailure("could not persist OAuth 2.0 refresh intent; no refresh request was sent") from exc
+        fields = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+        request = Request(resolve_base_url() + "/2/oauth2/token", method="POST")
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        request.add_header("User-Agent", USER_AGENT)
+        if config["client_secret"]:
+            basic = base64.b64encode((config["client_id"] + ":" + config["client_secret"]).encode("utf-8")).decode("ascii")
+            request.add_header("Authorization", "Basic " + basic)
+        else:
+            fields["client_id"] = config["client_id"]
+        request.data = urlencode(fields).encode("utf-8")
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json_loads(response.read())
+        except HTTPError as exc:
+            payload = json_loads(exc.read())
+            if exc.code < 500:
+                try:
+                    clear_private_marker(marker_path)
+                except OSError:
+                    pass
+                raise ApiFailure("OAuth 2.0 token refresh was rejected", exc.code, payload) from exc
+            raise CredentialRotationFailure(
+                "OAuth 2.0 refresh returned a server error after dispatch; the refresh token state is unknown. Re-authorization is required",
+                marker_path,
+            ) from exc
+        except (URLError, TimeoutError) as exc:
+            raise CredentialRotationFailure(
+                "OAuth 2.0 refresh result is unknown; the refresh token may have rotated. Re-authorization is required",
+                marker_path,
+            ) from exc
+        access_token = payload.get("access_token", "") if isinstance(payload, dict) else ""
+        if not access_token:
+            raise CredentialRotationFailure(
+                "OAuth 2.0 refresh response did not contain an access token; the refresh token may have rotated. Re-authorization is required",
+                marker_path,
+            )
+        new_store = {
             "access_token": access_token,
             "access_token_expires_at": time.time() + float(payload.get("expires_in") or 7200),
             "refresh_token": payload.get("refresh_token") or refresh_token,
+            "last_rotation_id": rotation_id,
             "updated_at": utc_now(),
-        },
-    )
-    return access_token
+        }
+        try:
+            write_private_json(store_path, new_store)
+        except OSError as exc:
+            raise CredentialRotationFailure(
+                "OAuth 2.0 credential rotated but was not persisted; re-authorization is required",
+                marker_path,
+            ) from exc
+        try:
+            clear_private_marker(marker_path)
+        except OSError:
+            pass  # next run recognizes last_rotation_id and clears safely
+        return access_token
 
 
 def require_user_credentials() -> Tuple[str, Dict[str, str]]:
@@ -354,30 +481,6 @@ def append_ledger(path: Path, record: Dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
-@contextmanager
-def ledger_lock(path: Path):
-    """Exclusive lock covering the duplicate check and the write-ahead append.
-
-    Without this, two concurrent runs can both pass the check before either
-    writes its attempt row, and the same content is posted twice.
-    """
-    if fcntl is None:
-        print("warning: ledger locking is unavailable on this platform; do not run posts concurrently", file=sys.stderr)
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(path.name + ".lock")
-    with lock_path.open("w", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except OSError as exc:
-            raise ApiFailure("could not lock the ledger: " + str(exc)) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def attempt_budget_used(matching: Iterable[Dict[str, Any]]) -> int:
     """Count attempts against the 2-attempt budget.
 
@@ -436,7 +539,7 @@ def post_text(args: argparse.Namespace) -> Any:
     base_record = {"content_id": args.content_id, "content_sha256": digest}
     # The duplicate check and the write-ahead append must be one atomic unit;
     # otherwise two concurrent runs can both pass the check and double-post.
-    with ledger_lock(ledger_path):
+    with file_lock(ledger_path, "post ledger", required=False):
         matching = [
             record
             for record in read_ledger(ledger_path)
@@ -471,17 +574,17 @@ def post_text(args: argparse.Namespace) -> Any:
             result["retry_after"] = exc.retry_after
         if exc.rate_limit_reset is not None:
             result["rate_limit_reset"] = exc.rate_limit_reset
-        with ledger_lock(ledger_path):
+        with file_lock(ledger_path, "post ledger", required=False):
             append_ledger(ledger_path, result)
         raise
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict) or not payload["data"].get("id"):
         result["http_status"] = status
-        with ledger_lock(ledger_path):
+        with file_lock(ledger_path, "post ledger", required=False):
             append_ledger(ledger_path, result)
         raise ApiFailure("post response did not contain a post id")
     post_id = str(payload["data"]["id"])
     result.update({"status": "sent", "post_id": post_id, "http_status": status})
-    with ledger_lock(ledger_path):
+    with file_lock(ledger_path, "post ledger", required=False):
         append_ledger(ledger_path, result)
     return {"content_sha256": digest, "ledger": str(ledger_path), "post_id": post_id, "url": "https://x.com/i/web/status/" + post_id}
 
@@ -565,6 +668,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             detail["retry_after"] = exc.retry_after
         if exc.rate_limit_reset is not None:
             detail["rate_limit_reset"] = exc.rate_limit_reset
+        if exc.credential_state is not None:
+            detail["credential_state"] = exc.credential_state
+        if exc.recovery_marker is not None:
+            detail["recovery_marker"] = exc.recovery_marker
         if exc.payload is not None:
             detail["response"] = exc.payload
         print_json(detail, True, sys.stderr)

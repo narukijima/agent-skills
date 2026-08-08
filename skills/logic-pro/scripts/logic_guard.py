@@ -86,6 +86,23 @@ def canonical(path: str) -> str:
     return os.path.realpath(os.path.abspath(path))
 
 
+def request_fingerprint(request: dict[str, Any]) -> str:
+    stable = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(stable).hexdigest()
+
+
+def artifact_requirement(operation: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    if operation == "project.bounce":
+        path = arguments.get("path")
+        require(isinstance(path, str) and os.path.isabs(path), "bounce preflight path must be absolute")
+        return {"path": canonical(path), "kind": "regular-file", "min_size_bytes": 1}
+    if operation == "project.save_as":
+        path = arguments.get("path")
+        require(isinstance(path, str) and os.path.isabs(path), "save-as preflight path must be absolute")
+        return {"path": canonical(path), "kind": "logicx-directory"}
+    return None
+
+
 def absolute_path(value: Any, label: str) -> str:
     require(isinstance(value, str) and value != "", f"{label} must be a non-empty string")
     require(os.path.isabs(value), f"{label} must be an absolute path")
@@ -200,23 +217,94 @@ def preflight(request: dict[str, Any]) -> dict[str, Any]:
     if operation in PROJECT_SCOPED:
         project_proof = bind_project(environment)
     validate_arguments(operation, arguments, environment, policy)
-    stable = json.dumps(
-        {"operation": operation, "arguments": arguments, "expected_project": environment.get("expected_project")},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return {
+    normalized_arguments = dict(arguments)
+    if operation in {"midi.import_file", "project.save_as", "project.bounce"}:
+        normalized_arguments["path"] = canonical(arguments["path"])
+    normalized_request = {
+        "operation": operation,
+        "arguments": normalized_arguments,
+        "expected_project": canonical(environment["expected_project"]) if operation in PROJECT_SCOPED else None,
+    }
+    output = {
         "ok": True,
         "classification": "authorized",
         "operation": operation,
         "impact": "write" if operation in WRITE_OPERATIONS else "read",
         "project_proof": project_proof,
-        "request_sha256": hashlib.sha256(stable).hexdigest(),
+        "request": normalized_request,
+        "request_sha256": request_fingerprint(normalized_request),
     }
+    requirement = artifact_requirement(operation, normalized_arguments)
+    if requirement is not None:
+        output["artifact_requirement"] = requirement
+    return output
+
+
+def validate_classify_preflight(value: Any) -> tuple[dict[str, Any], str]:
+    require(isinstance(value, dict), "preflight must be the guard output object")
+    require(value.get("ok") is True and value.get("classification") == "authorized", "preflight was not authorized")
+    require(value.get("impact") == "write", "classify requires a write preflight")
+    request = value.get("request")
+    require(isinstance(request, dict), "preflight.request must be an object")
+    operation = request.get("operation")
+    arguments = request.get("arguments")
+    require(operation in WRITE_OPERATIONS, "preflight request operation is not an allowlisted write")
+    require(value.get("operation") == operation, "preflight operation does not match request")
+    require(isinstance(arguments, dict), "preflight request arguments must be an object")
+    require(value.get("request_sha256") == request_fingerprint(request), "preflight request fingerprint does not match")
+    expected_requirement = artifact_requirement(operation, arguments)
+    require(value.get("artifact_requirement") == expected_requirement, "preflight artifact requirement does not match operation")
+    return value, operation
+
+
+def verify_artifact(preflight: dict[str, Any], observed: Any) -> tuple[bool, dict[str, Any] | None]:
+    requirement = preflight.get("artifact_requirement")
+    if requirement is None:
+        return True, None
+    evidence: dict[str, Any] = {"path": requirement["path"], "verified": False}
+    if not isinstance(observed, dict):
+        evidence["reason"] = "artifact evidence is missing"
+        return False, evidence
+    if observed.get("observed_after_dispatch") is not True:
+        evidence["reason"] = "artifact was not observed after dispatch"
+        return False, evidence
+    observed_path = observed.get("path")
+    if not isinstance(observed_path, str) or canonical(observed_path) != requirement["path"]:
+        evidence["reason"] = "artifact path does not match preflight"
+        return False, evidence
+    path = Path(requirement["path"])
+    if not path.exists():
+        evidence["reason"] = "artifact does not exist"
+        return False, evidence
+    if path.is_symlink():
+        evidence["reason"] = "artifact must not be a symlink"
+        return False, evidence
+    if requirement["kind"] == "regular-file":
+        if not path.is_file():
+            evidence["reason"] = "artifact is not a regular file"
+            return False, evidence
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            evidence["reason"] = "artifact stat failed: " + str(exc)
+            return False, evidence
+        evidence["size_bytes"] = size
+        if size < requirement["min_size_bytes"]:
+            evidence["reason"] = "artifact is smaller than the required size"
+            return False, evidence
+    elif requirement["kind"] == "logicx-directory":
+        if not path.is_dir() or path.suffix.lower() != ".logicx":
+            evidence["reason"] = "artifact is not a .logicx directory"
+            return False, evidence
+    else:
+        evidence["reason"] = "unknown artifact requirement"
+        return False, evidence
+    evidence["verified"] = True
+    return True, evidence
 
 
 def classify(result: dict[str, Any]) -> dict[str, Any]:
+    preflight, _operation = validate_classify_preflight(result.get("preflight"))
     dispatch = result.get("dispatch")
     readback = result.get("readback")
     require(isinstance(dispatch, dict), "dispatch must be an object")
@@ -230,8 +318,16 @@ def classify(result: dict[str, Any]) -> dict[str, Any]:
             and readback.get("source") in VERIFIED_SOURCES
             and readback.get("matches_expected") is True
         )
-        if verified:
-            return {"ok": True, "class": "A", "classification": "verified_success", "retry": "not-needed", "gui_fallback_eligible": False}
+        artifact_ok, artifact_evidence = verify_artifact(preflight, result.get("artifact"))
+        if verified and artifact_ok:
+            output = {"ok": True, "class": "A", "classification": "verified_success", "retry": "not-needed", "gui_fallback_eligible": False}
+            if artifact_evidence is not None:
+                output["artifact_evidence"] = artifact_evidence
+            return output
+        output = {"ok": False, "class": "B", "classification": "unknown", "retry": "forbidden-until-state-is-resolved", "gui_fallback_eligible": False}
+        if artifact_evidence is not None:
+            output["artifact_evidence"] = artifact_evidence
+        return output
     return {"ok": False, "class": "B", "classification": "unknown", "retry": "forbidden-until-state-is-resolved", "gui_fallback_eligible": False}
 
 

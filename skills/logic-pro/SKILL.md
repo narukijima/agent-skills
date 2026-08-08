@@ -3,7 +3,7 @@ name: logic-pro
 description: Safely inspect and operate Logic Pro on macOS through a compatible MCP or adapter. Use for transport, tracks, instruments, MIDI import, save, and bounce with project binding and verified readback.
 status: active
 aliases: [logic pro, operate-logic-pro]
-version: 0.1.0
+version: 0.2.0
 ---
 
 # logic-pro — Logic Proを安全に操作する
@@ -46,8 +46,8 @@ MCP名やtool名を固定しない。実行時に利用可能なLogic Pro用MCP�
 2. **Bind**: 期待する `.logicx` と現在Projectを一致確認する。file URLを取得できない場合だけ、完全な `.logicx` 名とLogicのProject表示名の厳密一致を代替証拠にする。
 3. **Guard**: 操作要求をJSONにし、`scripts/logic_guard.py preflight` でallowlist、権限、引数、path、Project境界を検査する。
 4. **Act**: MCPまたは安全なローカルアダプタへ意味操作を一度だけ送る。複数操作を一つのtool callへまとめない。
-5. **Read back**: 操作応答とは別に、Logicの状態を新しく読み、期待状態と比較する。
-6. **Classify**: `scripts/logic_guard.py classify` でA/B/Cを判定する。Aだけを成功として次へ進める。
+5. **Read back**: 操作応答とは別に、Logicの状態を新しく読み、期待状態と比較する。bounceなど出力を作る操作ではartifactも観測する。
+6. **Classify**: preflight出力をそのまま結果JSONへ含め、`scripts/logic_guard.py classify` で同じ要求のfingerprint、Logic読戻し、必要なartifactをA/B/Cへ判定する。Aだけを成功として次へ進める。
 7. **Report**: 操作、対象Project、観測前後、証拠source、分類を返す。操作成功と音楽作品の完成を混同しない。
 
 preflightの例:

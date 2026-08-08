@@ -3,7 +3,7 @@ name: x-api
 description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
 status: active
 aliases: [x api, twitter-api]
-version: 0.4.1
+version: 0.4.2
 ---
 
 # x-api — X API v2 の取得と安全な投稿
@@ -42,7 +42,7 @@ version: 0.4.1
 
 - 秘密値は環境変数だけで受け取る。トークンをコマンド引数、原稿、ログ、Gitへ書かない。
 - 公開データの読み取りは `X_BEARER_TOKEN` を使う。
-- ユーザーコンテキストの第一経路は**OAuth 1.0a**（`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数、トークンは失効しない）。OAuth 2.0運用の利用側は `X_OAUTH2_CLIENT_ID` + `X_OAUTH2_TOKEN_STORE` でSkillにrefreshを任せられる（ローテーションされたトークンは指定ファイルへ0600で保存、出力へは出さない）。`X_ACCESS_TOKEN` だけの静的トークンも使える（約2時間で失効）。詳細は `references/api-surface.md`。
+- ユーザーコンテキストの第一経路は**OAuth 1.0a**（`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数、トークンは失効しない）。OAuth 2.0運用の利用側は `X_OAUTH2_CLIENT_ID` + `X_OAUTH2_TOKEN_STORE` でSkillにrefreshを任せられる。store更新は排他lockと秘密値を含まないwrite-ahead markerで保護し、回転結果が不明または保存に失敗した場合は自動再試行せず再認可を要求する。`X_ACCESS_TOKEN` だけの静的トークンも使える（約2時間で失効）。詳細は `references/api-surface.md`。
 - `me` と投稿はユーザーコンテキストを必須とする。`X_BEARER_TOKEN`だけで代用しない。
 - APIの料金、利用可能なEndpoint、Rate Limitは実行時の公式情報を優先し、Skill内に固定値を作らない。
 

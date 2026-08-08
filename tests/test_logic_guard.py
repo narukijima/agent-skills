@@ -48,6 +48,14 @@ class LogicGuardTests(unittest.TestCase):
     def request(self, operation="transport.play", arguments=None):
         return base_request(operation, arguments, self.project)
 
+    def successful_result(self, request=None):
+        request = request or self.request()
+        return {
+            "preflight": logic_guard.preflight(request),
+            "dispatch": {"status": "success", "definitive": True},
+            "readback": {"fresh": True, "source": "logic-mcp-state", "matches_expected": True},
+        }
+
     def test_authorizes_allowlisted_bound_single_operation(self):
         result = logic_guard.preflight(self.request())
         self.assertTrue(result["ok"])
@@ -115,22 +123,20 @@ class LogicGuardTests(unittest.TestCase):
         self.assertTrue(logic_guard.preflight(request)["ok"])
 
     def test_success_without_independent_readback_is_unknown(self):
-        result = logic_guard.classify({"dispatch": {"status": "success", "definitive": True}})
+        payload = self.successful_result()
+        payload.pop("readback")
+        result = logic_guard.classify(payload)
         self.assertEqual(result["class"], "B")
         self.assertFalse(result["gui_fallback_eligible"])
 
     def test_fresh_logic_readback_is_verified_success(self):
-        result = logic_guard.classify(
-            {
-                "dispatch": {"status": "success", "definitive": True},
-                "readback": {"fresh": True, "source": "logic-mcp-state", "matches_expected": True},
-            }
-        )
+        result = logic_guard.classify(self.successful_result())
         self.assertEqual(result["class"], "A")
 
     def test_only_definitive_failure_is_gui_fallback_eligible(self):
-        confirmed = logic_guard.classify({"dispatch": {"status": "failed", "definitive": True}})
-        ambiguous = logic_guard.classify({"dispatch": {"status": "failed", "definitive": False}})
+        preflight = logic_guard.preflight(self.request())
+        confirmed = logic_guard.classify({"preflight": preflight, "dispatch": {"status": "failed", "definitive": True}})
+        ambiguous = logic_guard.classify({"preflight": preflight, "dispatch": {"status": "failed", "definitive": False}})
         self.assertEqual(confirmed["class"], "C")
         self.assertTrue(confirmed["gui_fallback_eligible"])
         self.assertEqual(ambiguous["class"], "B")
@@ -146,6 +152,43 @@ class LogicGuardTests(unittest.TestCase):
         request["environment"]["capabilities"] = ["transport.play"]
         with self.assertRaises(logic_guard.GuardFailure):
             logic_guard.preflight(request)
+
+    def test_classify_rejects_a_modified_preflight_fingerprint(self):
+        payload = self.successful_result()
+        payload["preflight"]["request"]["operation"] = "transport.stop"
+        with self.assertRaises(logic_guard.GuardFailure):
+            logic_guard.classify(payload)
+
+    def test_bounce_missing_or_zero_byte_artifact_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "mix.wav"
+            request = self.request("project.bounce", {"path": str(output)})
+            request["policy"]["allowed_output_roots"] = [directory]
+            payload = self.successful_result(request)
+            payload["artifact"] = {"path": str(output), "observed_after_dispatch": True}
+            missing = logic_guard.classify(payload)
+            self.assertEqual(missing["class"], "B")
+            self.assertIn("does not exist", missing["artifact_evidence"]["reason"])
+            output.write_bytes(b"")
+            empty = logic_guard.classify(payload)
+            self.assertEqual(empty["class"], "B")
+            self.assertEqual(empty["artifact_evidence"]["size_bytes"], 0)
+
+    def test_bounce_requires_matching_post_dispatch_artifact_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "mix.wav"
+            request = self.request("project.bounce", {"path": str(output)})
+            request["policy"]["allowed_output_roots"] = [directory]
+            payload = self.successful_result(request)
+            output.write_bytes(b"RIFFaudio")
+            payload["artifact"] = {"path": str(Path(directory) / "other.wav"), "observed_after_dispatch": True}
+            self.assertEqual(logic_guard.classify(payload)["class"], "B")
+            payload["artifact"] = {"path": str(output), "observed_after_dispatch": False}
+            self.assertEqual(logic_guard.classify(payload)["class"], "B")
+            payload["artifact"]["observed_after_dispatch"] = True
+            verified = logic_guard.classify(payload)
+            self.assertEqual(verified["class"], "A")
+            self.assertGreater(verified["artifact_evidence"]["size_bytes"], 0)
 
 
 if __name__ == "__main__":

@@ -77,7 +77,29 @@
 }
 ```
 
-`authorization.write` は、利用者の現在の依頼がその変更を含む場合だけtrueにする。preflightはLogicを操作しない。許可時は要求fingerprintを返し、拒否時は理由をJSONで返して終了code 2になる。
+`authorization.write` は、利用者の現在の依頼がその変更を含む場合だけtrueにする。preflightはLogicを操作しない。許可時は正規化された`request`、要求fingerprint、必要な`artifact_requirement`を返し、拒否時は理由をJSONで返して終了code 2になる。このpreflight出力を変更せずclassifyへ渡す。
+
+`project.bounce`のpreflight出力例:
+
+```json
+{
+  "ok": true,
+  "classification": "authorized",
+  "operation": "project.bounce",
+  "impact": "write",
+  "request": {
+    "operation": "project.bounce",
+    "arguments": {"path": "/Users/me/Music/output/mix.wav"},
+    "expected_project": "/Users/me/Music/Song.logicx"
+  },
+  "request_sha256": "...",
+  "artifact_requirement": {
+    "path": "/Users/me/Music/output/mix.wav",
+    "kind": "regular-file",
+    "min_size_bytes": 1
+  }
+}
+```
 
 Project scoped read (`transport.state`以降のread) と全writeはProject bindingを要求する。`current_project`を取得できない場合、`current_project_unavailable=true`かつ`window_project_name`が期待Projectのbasenameと完全一致するときだけfallback証拠を認める。
 
@@ -95,25 +117,49 @@ symlink解決後のpathでroot境界を判定する。既存出力は上書き�
 
 ## 5. classify入力
 
-変更後、操作応答と独立した読戻しを次の形にする。
+変更後、preflight出力、操作応答、独立した読戻しを次の形にする。出力操作では`artifact`も含める。
 
 ```json
 {
+  "preflight": {
+    "ok": true,
+    "classification": "authorized",
+    "operation": "project.bounce",
+    "impact": "write",
+    "request": {
+      "operation": "project.bounce",
+      "arguments": {"path": "/Users/me/Music/output/mix.wav"},
+      "expected_project": "/Users/me/Music/Song.logicx"
+    },
+    "request_sha256": "...",
+    "artifact_requirement": {
+      "path": "/Users/me/Music/output/mix.wav",
+      "kind": "regular-file",
+      "min_size_bytes": 1
+    }
+  },
   "dispatch": {"status": "success", "definitive": true},
   "readback": {
     "fresh": true,
     "source": "logic-accessibility",
     "matches_expected": true
+  },
+  "artifact": {
+    "path": "/Users/me/Music/output/mix.wav",
+    "observed_after_dispatch": true
   }
 }
 ```
 
+- `preflight`: 実行前にguardが返したJSON全体。fingerprintを再計算して要求との結合を検査する。
 - `dispatch.status`: `success`, `failed`, `unknown`
 - `dispatch.definitive`: 明示的な未対応、拒否、入力エラーなど失敗が確定した場合だけtrue
 - `readback.source`: `logic-accessibility`または`logic-mcp-state`
 - `readback.matches_expected`: 操作ごとに定めた期待状態との比較結果
+- `artifact.path`: preflightが許可した出力pathと厳密に同じpath
+- `artifact.observed_after_dispatch`: dispatch後の観測である場合だけtrue
 
-成功応答だけではAにならない。freshで独立したLogic読戻しが一致して初めて`verified_success`になる。timeout、接続断、stale値、source不明、不一致は`unknown`であり、自動再送しない。
+成功応答だけではAにならない。freshで独立したLogic読戻しが一致し、artifact requirementがある操作ではguard自身のfilesystem検査も通って初めて`verified_success`になる。`project.bounce`はsymlinkでない通常fileの存在と1 byte以上、`project.save_as`はsymlinkでない`.logicx` directoryの存在を要求する。timeout、接続断、stale値、source不明、不一致、artifact不在、zero-byte出力は`unknown`であり、自動再送しない。
 
 ## 6. 接続先への対応付け
 

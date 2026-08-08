@@ -266,8 +266,118 @@ class XApiTests(unittest.TestCase):
                 self.assertEqual(mocked.call_count, 1)
             stored = json.loads(store.read_text(encoding="utf-8"))
             self.assertEqual(stored["refresh_token"], "rt2")
+            self.assertIn("last_rotation_id", stored)
+            self.assertFalse(store.with_name(store.name + ".refresh-pending").exists())
             mode = stat.S_IMODE(store.stat().st_mode)
             self.assertEqual(mode, 0o600)
+
+    def test_oauth2_refresh_lock_allows_only_one_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            calls = []
+
+            def slow_refresh(*_args, **_kwargs):
+                calls.append(1)
+                time.sleep(0.2)
+                return FakeResponse(
+                    status=200,
+                    body=json.dumps({"access_token": "at1", "refresh_token": "rt2", "expires_in": 7200}).encode("utf-8"),
+                )
+
+            outcomes = []
+            with patch.object(x_api, "urlopen", side_effect=slow_refresh):
+                threads = [threading.Thread(target=lambda: outcomes.append(x_api.oauth2_refreshed_access_token(config))) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+            self.assertEqual(calls, [1])
+            self.assertEqual(outcomes, ["at1", "at1"])
+
+    def test_oauth2_store_failure_after_rotation_requires_reauthorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            marker = store.with_name(store.name + ".refresh-pending")
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            response = FakeResponse(
+                status=200,
+                body=json.dumps({"access_token": "at1", "refresh_token": "rt2", "expires_in": 7200}).encode("utf-8"),
+            )
+            with patch.object(x_api, "urlopen", return_value=response), patch.object(
+                x_api, "write_private_json", side_effect=OSError("read-only file system")
+            ):
+                with self.assertRaises(x_api.CredentialRotationFailure) as raised:
+                    x_api.oauth2_refreshed_access_token(config)
+            self.assertEqual(raised.exception.credential_state, "reauthorization_required")
+            self.assertEqual(raised.exception.recovery_marker, str(marker))
+            marker_text = marker.read_text(encoding="utf-8")
+            self.assertNotIn("rt1", marker_text)
+            self.assertNotIn("rt2", marker_text)
+            self.assertNotIn("at1", marker_text)
+            with patch.object(x_api, "urlopen") as retry:
+                with self.assertRaises(x_api.CredentialRotationFailure):
+                    x_api.oauth2_refreshed_access_token(config)
+                retry.assert_not_called()
+
+    def test_oauth2_refresh_intent_failure_sends_no_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            with patch.object(x_api, "write_refresh_marker", side_effect=OSError("disk full")), patch.object(
+                x_api, "urlopen"
+            ) as request:
+                with self.assertRaises(x_api.ApiFailure) as raised:
+                    x_api.oauth2_refreshed_access_token(config)
+                request.assert_not_called()
+            self.assertNotIsInstance(raised.exception, x_api.CredentialRotationFailure)
+            self.assertIn("no refresh request was sent", str(raised.exception))
+
+    def test_oauth2_server_error_keeps_marker_and_requires_reauthorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            marker = store.with_name(store.name + ".refresh-pending")
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            server_error = HTTPError("https://api.x.com/2/oauth2/token", 503, "Unavailable", {}, io.BytesIO(b"{}"))
+            with patch.object(x_api, "urlopen", side_effect=server_error):
+                with self.assertRaises(x_api.CredentialRotationFailure):
+                    x_api.oauth2_refreshed_access_token(config)
+            self.assertTrue(marker.exists())
+
+    def test_oauth2_rejected_refresh_clears_pending_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            marker = store.with_name(store.name + ".refresh-pending")
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            rejected = HTTPError("https://api.x.com/2/oauth2/token", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+            with patch.object(x_api, "urlopen", side_effect=rejected):
+                with self.assertRaises(x_api.ApiFailure) as raised:
+                    x_api.oauth2_refreshed_access_token(config)
+            self.assertNotIsInstance(raised.exception, x_api.CredentialRotationFailure)
+            self.assertFalse(marker.exists())
+
+    def test_oauth2_committed_store_recovers_stale_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            marker = store.with_name(store.name + ".refresh-pending")
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            x_api.write_private_json(
+                store,
+                {
+                    "access_token": "at1",
+                    "access_token_expires_at": time.time() + 3600,
+                    "refresh_token": "rt2",
+                    "last_rotation_id": "rotation-1",
+                },
+            )
+            x_api.write_refresh_marker(
+                marker,
+                {"schema_version": 1, "state": "refresh_pending", "rotation_id": "rotation-1", "started_at": x_api.utc_now()},
+            )
+            with patch.object(x_api, "urlopen") as request:
+                self.assertEqual(x_api.oauth2_refreshed_access_token(config), "at1")
+                request.assert_not_called()
+            self.assertFalse(marker.exists())
 
     def test_user_agent_tracks_the_skill_version(self):
         text = (SCRIPT.parents[1] / "SKILL.md").read_text(encoding="utf-8")

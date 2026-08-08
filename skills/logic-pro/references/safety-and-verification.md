@@ -43,7 +43,7 @@ fresh stateを読む
 
 ### A: verified_success
 
-操作経路が成功を返し、別の状態読取でLogicのfreshな実状態が期待値と一致した。Aだけを成功として報告できる。
+操作経路が成功を返し、別の状態読取でLogicのfreshな実状態が期待値と一致し、必要な出力artifactもguardが検証した。preflight fingerprintが一致する同じ要求だけを分類し、Aだけを成功として報告できる。
 
 ### B: unknown
 
@@ -77,7 +77,7 @@ timeout、接続断、UI変化中、stale値、証拠source不明、読戻し不
 | MIDI import | 取込前後のregion/track差分と対象MIDIに対応する新規要素 |
 | save | dirty stateの解消または保存時刻など、接続先が保証する保存証拠 |
 | save as | 現在Projectのpathが新規pathへ変わり、対象が存在 |
-| bounce | 新規出力が存在し、サイズが0より大きい。可能ならaudio metadataも検査 |
+| bounce | preflightで不在を確認した同一pathに、symlinkでない通常fileが新規作成され、サイズが0より大きい。可能ならaudio metadataも検査 |
 
 UI表示値しか取れないときは、その制限を証拠sourceへ明記する。MIDI commandの送信成功やファイルの存在だけで、Logic内の反映を保証しない。
 
