@@ -31,7 +31,7 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 ### logic-pro
 
-Logic Pro専用MCPまたは互換アダプタを利用し、状態確認、transport、track、内蔵音源、MIDI取込、保存、bounceをProject境界と独立読戻し付きで扱います。特定MCPのtool名には依存せず、実行時capabilityを意味操作へ対応付けます。
+Logic Pro専用MCPまたは互換アダプタを利用し、状態確認、transport、track、内蔵音源、MIDI取込、保存、bounceをProject境界と独立読戻し付きで扱います。特定MCPのtool名には依存せず、実行時capabilityを意味操作へ対応付けます。macOS向けには、状態・Project・Play/Stopを日英Accessibility labelと独立読戻しで扱う自己完結reference adapterを同梱します。
 
 ### x-api
 

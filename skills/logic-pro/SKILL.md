@@ -3,7 +3,7 @@ name: logic-pro
 description: Safely inspect and operate Logic Pro on macOS through a compatible MCP or adapter. Use for transport, tracks, instruments, MIDI import, save, and bounce with project binding and verified readback.
 status: active
 aliases: [logic pro, operate-logic-pro]
-version: 0.2.0
+version: 0.3.0
 ---
 
 # logic-pro — Logic Proを安全に操作する
@@ -18,7 +18,7 @@ version: 0.2.0
 - 変更: play、stop、tempo、position、track選択、内蔵音源設定、ローカルMIDI取込、現在Projectの保存、新規保存、安全なbounce
 - 対象外: Logic終了、新規Project作成、track/region削除、録音、既存ファイルへのSave As、任意plugin、任意mixer操作、任意ファイル取込
 
-MCP名やtool名を固定しない。実行時に利用可能なLogic Pro用MCPまたはアダプタのcapabilityを調べ、`references/operation-contract.md` の意味操作へ対応付ける。互換経路がなければ、操作できるふりをせず停止する。
+MCP名やtool名を固定しない。実行時に利用可能なLogic Pro用MCPまたはアダプタのcapabilityを調べ、`references/operation-contract.md` の意味操作へ対応付ける。標準macOS環境には同梱の `scripts/logic_macos_adapter.py` をreference profileとして使える。互換経路がなければ、操作できるふりをせず停止する。
 
 ## 使用するKnowledge
 
@@ -26,6 +26,7 @@ MCP名やtool名を固定しない。実行時に利用可能なLogic Pro用MCP�
 
 - `references/operation-contract.md`: 意味操作、アダプタ要件、引数契約
 - `references/safety-and-verification.md`: 安全ゲート、読戻し、結果分類、fallback規則
+- `references/macos-adapter.md`: 同梱reference adapterの導入、対応表、終了code、実行例
 
 ### Conditional
 
@@ -33,8 +34,8 @@ MCP名やtool名を固定しない。実行時に利用可能なLogic Pro用MCP�
 
 ## 最初に行うこと
 
-1. Requiredの2資料を最後まで読む。
-2. 利用可能なMCP、ローカルアダプタ、computer-control toolを列挙し、Logic専用の状態読取と意味操作があるか確認する。
+1. Requiredの3資料を最後まで読む。
+2. 利用可能なMCP、ローカルアダプタ、computer-control toolを列挙し、Logic専用の状態読取と意味操作があるか確認する。互換MCPがなければ、macOSでは同梱adapterの `capabilities` とfreshなruntime capabilityを確認する。
 3. Logicの起動、画面ロック、Accessibility権限、モーダルダイアログ、現在Projectを読み取る。
 4. 利用者の依頼から、変更してよい範囲と期待する完全な `.logicx` パスを確定する。推測で別Projectを選ばない。
 
@@ -63,6 +64,17 @@ python3 skills/logic-pro/scripts/logic_guard.py classify --result result.json
 ```
 
 JSON形式は `references/operation-contract.md` を使う。ガードが拒否した要求を、引数名だけ変えて迂回しない。
+
+同梱macOS adapterの確認とdispatch:
+
+```bash
+python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty capabilities
+python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --operation app.status
+python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty dispatch --preflight preflight.json
+python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --operation transport.state
+```
+
+adapterのdispatch応答をreadbackとして使わない。必ず別の `observe` callを行い、期待値との比較をclassify入力へ入れる。対応範囲とmacOS権限は `references/macos-adapter.md` を使う。
 
 ## GUI fallback
 

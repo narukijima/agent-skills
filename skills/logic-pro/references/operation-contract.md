@@ -20,6 +20,8 @@
 
 下位実装はAccessibility、CGEvent、CoreMIDI/MCU、AppleScript、Logic Scripterなどを利用してよい。ただし、入力を送信できることとLogic状態が変わったことを同一視しない。
 
+このSkillは標準実装として `scripts/logic_macos_adapter.py` を同梱する。macOS Accessibilityだけで安全に意味と独立読戻しを確定できるoperationを実装し、残りは理由付きの`not-implemented`として列挙する。導入、runtime capability、全allowlist対応表、終了codeは `macos-adapter.md` を参照する。
+
 ## 2. 意味操作
 
 初期allowlistは次のとおり。接続先のtool名は右辺へ対応付け、左辺の意味を変えない。
@@ -163,11 +165,11 @@ symlink解決後のpathでroot境界を判定する。既存出力は上書き�
 
 ## 6. 接続先への対応付け
 
-1. tool schemaを読む。
+1. tool schema、または同梱adapterの `capabilities` を読む。
 2. 読み取りtoolと変更toolを分ける。
 3. 各toolを上記の意味操作へ一対一に対応付ける。
 4. toolが複数副作用を持つ場合は使わない。
 5. 接続先が返す成功値、timeout、拒否を`dispatch`へ正規化する。
 6. 操作toolの返却値をreadbackとして再利用せず、状態読取toolをもう一度呼ぶ。
 
-Logic専用toolが見つからない場合、一般的なshellやGUIから同等操作を即席で作らず、必要なMCP/adapterが未導入だと報告する。
+互換MCPがなくmacOSで実行する場合は、同梱reference adapterの静的対応表とfreshなruntime capabilityを確認する。それでも意味操作または独立読戻しが見つからない場合、一般的なshellやGUIから同等操作を即席で作らず、当該operationが未対応だと報告する。
