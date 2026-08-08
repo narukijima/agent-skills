@@ -53,7 +53,7 @@ def skill_version() -> str:
     return match.group(1) if match else "unknown"
 
 
-USER_AGENT = "agent-sills-x-api/" + skill_version()
+USER_AGENT = "agent-skills-x-api/" + skill_version()
 
 
 class ApiFailure(RuntimeError):

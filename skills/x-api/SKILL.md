@@ -3,7 +3,7 @@ name: x-api
 description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
 status: active
 aliases: [x api, twitter-api]
-version: 0.4.0
+version: 0.4.1
 ---
 
 # x-api — X API v2 の取得と安全な投稿

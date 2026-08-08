@@ -1,4 +1,4 @@
-# agent-sills
+# agent-skills
 
 共有Skillの配布元。各Skillは自己完結した `skills/<name>/` とし、利用側Agentへ必要なSkillだけをコピーして導入する。
 

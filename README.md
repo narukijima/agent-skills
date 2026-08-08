@@ -1,9 +1,9 @@
-# agent-sills
+# agent-skills
 
 `agent-directory` で作った複数のAgentが共有できるSkillの公式配布元です。SkillはAgent Workspaceへ直接組み込まず、必要なSkillのディレクトリだけを導入します。
 
 - 利用側: [`claudagt/agent-directory`](https://github.com/claudagt/agent-directory)
-- 配布元: [`claudagt/agent-sills`](https://github.com/claudagt/agent-sills)
+- 配布元: [`claudagt/agent-skills`](https://github.com/claudagt/agent-skills)
 
 ## 構成
 
