@@ -13,8 +13,14 @@ import re
 import secrets
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX platform: locking degrades to a warning
+    fcntl = None  # type: ignore[assignment]
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -37,11 +43,33 @@ DEFAULT_BASE_URL = "https://api.x.com"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+def skill_version() -> str:
+    """Read the version from SKILL.md frontmatter so it has a single source."""
+    try:
+        text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    match = re.search(r"^version:\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$", text, re.M)
+    return match.group(1) if match else "unknown"
+
+
+USER_AGENT = "agent-sills-x-api/" + skill_version()
+
+
 class ApiFailure(RuntimeError):
-    def __init__(self, message: str, status: Optional[int] = None, payload: Any = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: Optional[int] = None,
+        payload: Any = None,
+        retry_after: Optional[str] = None,
+        rate_limit_reset: Optional[str] = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.payload = payload
+        self.retry_after = retry_after
+        self.rate_limit_reset = rate_limit_reset
 
 
 def json_loads(raw: bytes) -> Any:
@@ -68,17 +96,105 @@ def oauth1_credentials() -> Optional[Dict[str, str]]:
     return values
 
 
+def oauth2_refresh_configuration() -> Optional[Dict[str, str]]:
+    client_id = os.environ.get("X_OAUTH2_CLIENT_ID", "")
+    refresh_token = os.environ.get("X_OAUTH2_REFRESH_TOKEN", "")
+    store = os.environ.get("X_OAUTH2_TOKEN_STORE", "")
+    if not client_id and not refresh_token and not store:
+        return None
+    if not client_id:
+        raise ApiFailure("OAuth 2.0 refresh requires X_OAUTH2_CLIENT_ID")
+    if not store:
+        raise ApiFailure(
+            "OAuth 2.0 refresh requires X_OAUTH2_TOKEN_STORE: rotated refresh tokens "
+            "must be persisted to a private file, never printed or logged"
+        )
+    return {
+        "client_id": client_id,
+        "client_secret": os.environ.get("X_OAUTH2_CLIENT_SECRET", ""),
+        "refresh_token": refresh_token,
+        "store": store,
+    }
+
+
+def write_private_json(path: Path, value: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def oauth2_refreshed_access_token(config: Dict[str, str]) -> str:
+    """Return a valid access token, refreshing and rotating through the store file.
+
+    X rotates the refresh token on every use, so the new one is written back to
+    X_OAUTH2_TOKEN_STORE atomically (0600). Tokens are never printed.
+    """
+    store_path = Path(config["store"])
+    stored: Dict[str, Any] = {}
+    if store_path.exists():
+        try:
+            loaded = json.loads(store_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                stored = loaded
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ApiFailure("invalid OAuth 2.0 token store: " + str(store_path)) from exc
+    access_token = stored.get("access_token", "")
+    expires_at = stored.get("access_token_expires_at", 0)
+    if access_token and isinstance(expires_at, (int, float)) and time.time() < float(expires_at) - 60:
+        return access_token
+    refresh_token = stored.get("refresh_token") or config["refresh_token"]
+    if not refresh_token:
+        raise ApiFailure("no refresh token available in X_OAUTH2_TOKEN_STORE or X_OAUTH2_REFRESH_TOKEN")
+    fields = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    request = Request(resolve_base_url() + "/2/oauth2/token", method="POST")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    request.add_header("User-Agent", USER_AGENT)
+    if config["client_secret"]:
+        basic = base64.b64encode((config["client_id"] + ":" + config["client_secret"]).encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", "Basic " + basic)
+    else:
+        fields["client_id"] = config["client_id"]
+    request.data = urlencode(fields).encode("utf-8")
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json_loads(response.read())
+    except HTTPError as exc:
+        raise ApiFailure("OAuth 2.0 token refresh was rejected", exc.code, json_loads(exc.read())) from exc
+    except (URLError, TimeoutError) as exc:
+        raise ApiFailure("OAuth 2.0 token refresh did not complete: " + str(exc)) from exc
+    access_token = payload.get("access_token", "") if isinstance(payload, dict) else ""
+    if not access_token:
+        raise ApiFailure("OAuth 2.0 token refresh response did not contain an access token")
+    write_private_json(
+        store_path,
+        {
+            "access_token": access_token,
+            "access_token_expires_at": time.time() + float(payload.get("expires_in") or 7200),
+            "refresh_token": payload.get("refresh_token") or refresh_token,
+            "updated_at": utc_now(),
+        },
+    )
+    return access_token
+
+
 def require_user_credentials() -> Tuple[str, Dict[str, str]]:
     credentials = oauth1_credentials()
     if credentials is not None:
         return "oauth1", credentials
+    oauth2_config = oauth2_refresh_configuration()
+    if oauth2_config is not None:
+        return "oauth2", {"X_ACCESS_TOKEN": oauth2_refreshed_access_token(oauth2_config)}
     token = os.environ.get("X_ACCESS_TOKEN", "")
     if token:
         return "oauth2", {"X_ACCESS_TOKEN": token}
     raise ApiFailure(
-        "user-context auth requires either the OAuth 1.0a variables "
+        "user-context auth requires one of: the OAuth 1.0a variables "
         + ", ".join(OAUTH1_VARIABLES)
-        + " (non-expiring; preferred for long-running agents) or an OAuth 2.0 user token in X_ACCESS_TOKEN"
+        + " (non-expiring; preferred for long-running agents); the OAuth 2.0 refresh variables "
+        "X_OAUTH2_CLIENT_ID + X_OAUTH2_TOKEN_STORE (+ X_OAUTH2_REFRESH_TOKEN to bootstrap); "
+        "or a pre-issued OAuth 2.0 user token in X_ACCESS_TOKEN"
     )
 
 
@@ -164,7 +280,7 @@ def api_request(
     request = Request(url + query, method=method)
     request.add_header("Authorization", authorization_for(auth_kind, method, url, params))
     request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "agent-sills-x-api/0.2")
+    request.add_header("User-Agent", USER_AGENT)
     if body is not None:
         request.add_header("Content-Type", "application/json")
         request.data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -176,7 +292,13 @@ def api_request(
             return response.status, payload
     except HTTPError as exc:
         payload = json_loads(exc.read())
-        raise ApiFailure("X API returned an HTTP error", exc.code, payload) from exc
+        raise ApiFailure(
+            "X API returned an HTTP error",
+            exc.code,
+            payload,
+            retry_after=exc.headers.get("retry-after"),
+            rate_limit_reset=exc.headers.get("x-rate-limit-reset"),
+        ) from exc
     except URLError as exc:
         raise ApiFailure("X API request result is unknown: " + str(exc.reason)) from exc
     except TimeoutError as exc:
@@ -228,6 +350,53 @@ def append_ledger(path: Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+@contextmanager
+def ledger_lock(path: Path):
+    """Exclusive lock covering the duplicate check and the write-ahead append.
+
+    Without this, two concurrent runs can both pass the check before either
+    writes its attempt row, and the same content is posted twice.
+    """
+    if fcntl is None:
+        print("warning: ledger locking is unavailable on this platform; do not run posts concurrently", file=sys.stderr)
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("w", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise ApiFailure("could not lock the ledger: " + str(exc)) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def attempt_budget_used(matching: Iterable[Dict[str, Any]]) -> int:
+    """Count attempts against the 2-attempt budget.
+
+    Each attempt writes an "attempt" row before sending and a "result" row
+    after. A rate_limited result refunds its attempt because the request was
+    certainly not processed. Rows without an event field come from older
+    ledgers where one row was one attempt.
+    """
+    used = 0
+    for record in matching:
+        event = record.get("event")
+        if event == "attempt":
+            used += 1
+        elif event == "result":
+            if record.get("status") == "rate_limited":
+                used -= 1
+        elif record.get("http_status") != 429:
+            used += 1
+    return max(0, used)
 
 
 def post_text(args: argparse.Namespace) -> Any:
@@ -264,44 +433,56 @@ def post_text(args: argparse.Namespace) -> Any:
     require_user_credentials()
 
     ledger_path = Path(args.ledger)
-    matching = [
-        record
-        for record in read_ledger(ledger_path)
-        if record.get("content_sha256") == digest or record.get("content_id") == args.content_id
-    ]
-    if any(record.get("status") == "sent" for record in matching):
-        raise ApiFailure("duplicate post refused: content is already marked sent")
-    if matching and matching[-1].get("status") == "unknown" and not args.retry_unknown:
-        raise ApiFailure("unknown post result refused: inspect and explicitly use --retry-unknown")
-    # Each attempt writes an "attempt" row before sending and a "result" row
-    # after; rows without an event field come from older ledgers where one row
-    # was one attempt.
-    attempts = sum(1 for record in matching if record.get("event") != "result")
-    if attempts >= 2:
-        raise ApiFailure("post attempt limit reached: maximum 2 attempts per content_id or content_sha256")
-
     base_record = {"content_id": args.content_id, "content_sha256": digest}
-    # Write-ahead: if the process dies mid-send, this row survives and gates
-    # the next run behind --retry-unknown.
-    append_ledger(ledger_path, {"attempted_at": utc_now(), "event": "attempt", "status": "unknown", **base_record})
+    # The duplicate check and the write-ahead append must be one atomic unit;
+    # otherwise two concurrent runs can both pass the check and double-post.
+    with ledger_lock(ledger_path):
+        matching = [
+            record
+            for record in read_ledger(ledger_path)
+            if record.get("content_sha256") == digest or record.get("content_id") == args.content_id
+        ]
+        if any(record.get("status") == "sent" for record in matching):
+            raise ApiFailure("duplicate post refused: content is already marked sent")
+        if matching and matching[-1].get("status") == "unknown" and not args.retry_unknown:
+            raise ApiFailure("unknown post result refused: inspect and explicitly use --retry-unknown")
+        if attempt_budget_used(matching) >= 2:
+            raise ApiFailure("post attempt limit reached: maximum 2 attempts per content_id or content_sha256")
+        # Write-ahead: if the process dies mid-send, this row survives and gates
+        # the next run behind --retry-unknown.
+        append_ledger(ledger_path, {"attempted_at": utc_now(), "event": "attempt", "status": "unknown", **base_record})
+
     result: Dict[str, Any] = {"attempted_at": utc_now(), "event": "result", "status": "unknown", **base_record}
     try:
         status, payload = api_request("POST", "/2/tweets", "user", body={"text": text})
     except ApiFailure as exc:
-        # 4xx means the request was rejected before processing; 5xx and network
-        # failures may have published the post, so they stay "unknown".
-        result["status"] = "failed" if (exc.status is not None and exc.status < 500) else "unknown"
+        # 429 means the request was certainly not processed and refunds the
+        # attempt budget; other 4xx were rejected before processing; 5xx and
+        # network failures may have published the post, so they stay "unknown".
+        if exc.status == 429:
+            result["status"] = "rate_limited"
+        elif exc.status is not None and exc.status < 500:
+            result["status"] = "failed"
+        else:
+            result["status"] = "unknown"
         if exc.status is not None:
             result["http_status"] = exc.status
-        append_ledger(ledger_path, result)
+        if exc.retry_after is not None:
+            result["retry_after"] = exc.retry_after
+        if exc.rate_limit_reset is not None:
+            result["rate_limit_reset"] = exc.rate_limit_reset
+        with ledger_lock(ledger_path):
+            append_ledger(ledger_path, result)
         raise
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict) or not payload["data"].get("id"):
         result["http_status"] = status
-        append_ledger(ledger_path, result)
+        with ledger_lock(ledger_path):
+            append_ledger(ledger_path, result)
         raise ApiFailure("post response did not contain a post id")
     post_id = str(payload["data"]["id"])
     result.update({"status": "sent", "post_id": post_id, "http_status": status})
-    append_ledger(ledger_path, result)
+    with ledger_lock(ledger_path):
+        append_ledger(ledger_path, result)
     return {"content_sha256": digest, "ledger": str(ledger_path), "post_id": post_id, "url": "https://x.com/i/web/status/" + post_id}
 
 
@@ -380,6 +561,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         detail = {"error": str(exc)}
         if exc.status is not None:
             detail["http_status"] = exc.status
+        if exc.retry_after is not None:
+            detail["retry_after"] = exc.retry_after
+        if exc.rate_limit_reset is not None:
+            detail["rate_limit_reset"] = exc.rate_limit_reset
         if exc.payload is not None:
             detail["response"] = exc.payload
         print_json(detail, True, sys.stderr)

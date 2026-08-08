@@ -2,7 +2,11 @@ import importlib.util
 import io
 import json
 import os
+import re
+import stat
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -174,6 +178,101 @@ class XApiTests(unittest.TestCase):
         # Japanese text is normally written with no space after a URL.
         self.assertEqual(x_api.weighted_length("https://example.com/a" + "あ" * 130), 23 + 260)
         self.assertEqual(x_api.weighted_length("https://example.com/aです。"), 23 + 6)
+
+    def test_concurrent_runs_send_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.jsonl"
+            sends = []
+            first_read = threading.Event()
+            original_read = x_api.read_ledger
+
+            def slow_first_read(path):
+                records = original_read(path)
+                if not first_read.is_set():
+                    first_read.set()
+                    time.sleep(0.4)  # hold the ledger lock while the second run waits on it
+                return records
+
+            def fake_api_request(*_args, **_kwargs):
+                sends.append(1)
+                return 201, {"data": {"id": "123"}}
+
+            outcomes = []
+
+            def run():
+                try:
+                    x_api.post_text(live_args(ledger))
+                    outcomes.append("sent")
+                except x_api.ApiFailure:
+                    outcomes.append("refused")
+
+            with patch.dict(os.environ, OAUTH2_ENV, clear=False), \
+                    patch.object(x_api, "read_ledger", side_effect=slow_first_read), \
+                    patch.object(x_api, "api_request", side_effect=fake_api_request):
+                threads = [threading.Thread(target=run) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+            self.assertEqual(len(sends), 1)
+            self.assertEqual(sorted(outcomes), ["refused", "sent"])
+
+    def test_429_does_not_consume_the_attempt_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.jsonl"
+            with patch.dict(os.environ, OAUTH2_ENV, clear=False):
+                for _ in range(3):
+                    rate_limited = HTTPError(
+                        "https://api.x.com/2/tweets", 429, "Too Many Requests",
+                        {"retry-after": "900", "x-rate-limit-reset": "1750000000"}, io.BytesIO(b"{}"),
+                    )
+                    with patch.object(x_api, "urlopen", side_effect=rate_limited):
+                        with self.assertRaises(x_api.ApiFailure) as raised:
+                            x_api.post_text(live_args(ledger))
+                    # Never the attempt-limit error, and the reset info is surfaced.
+                    self.assertNotIn("attempt limit", str(raised.exception))
+                    self.assertEqual(raised.exception.retry_after, "900")
+                    self.assertEqual(raised.exception.rate_limit_reset, "1750000000")
+                last = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+                self.assertEqual(last["status"], "rate_limited")
+                self.assertEqual(last["retry_after"], "900")
+                # After the rate limit clears, the post still has its budget.
+                with patch.object(x_api, "urlopen", return_value=FakeResponse()):
+                    result = x_api.post_text(live_args(ledger))
+                self.assertEqual(result["post_id"], "123")
+
+    def test_oauth2_refresh_requires_a_token_store(self):
+        env = {"X_OAUTH2_CLIENT_ID": "cid", "X_OAUTH2_REFRESH_TOKEN": "rt1"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("X_OAUTH2_TOKEN_STORE", None)
+            for variable in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET"):
+                os.environ.pop(variable, None)
+            with self.assertRaises(x_api.ApiFailure) as raised:
+                x_api.require_user_credentials()
+            self.assertIn("X_OAUTH2_TOKEN_STORE", str(raised.exception))
+
+    def test_oauth2_refresh_rotates_the_store_and_caches_the_access_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "tokens.json"
+            config = {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt1", "store": str(store)}
+            token_response = FakeResponse(
+                status=200,
+                body=json.dumps({"access_token": "at1", "refresh_token": "rt2", "expires_in": 7200}).encode("utf-8"),
+            )
+            with patch.object(x_api, "urlopen", return_value=token_response) as mocked:
+                self.assertEqual(x_api.oauth2_refreshed_access_token(config), "at1")
+                # Second call must reuse the cached access token, not refresh again.
+                self.assertEqual(x_api.oauth2_refreshed_access_token(config), "at1")
+                self.assertEqual(mocked.call_count, 1)
+            stored = json.loads(store.read_text(encoding="utf-8"))
+            self.assertEqual(stored["refresh_token"], "rt2")
+            mode = stat.S_IMODE(store.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+    def test_user_agent_tracks_the_skill_version(self):
+        text = (SCRIPT.parents[1] / "SKILL.md").read_text(encoding="utf-8")
+        version = re.search(r"^version:\s*(\S+)", text, re.M).group(1)
+        self.assertEqual(x_api.USER_AGENT, "agent-sills-x-api/" + version)
 
     def test_base_url_override_is_limited_to_loopback(self):
         with patch.dict(os.environ, {"X_API_BASE_URL": "https://evil.example"}, clear=False):

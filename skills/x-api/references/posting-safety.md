@@ -27,11 +27,14 @@
 - `event`: `attempt`, `result`（無い行は旧形式で、1行=1試行として数える）
 - `content_sha256`
 - `content_id`
-- `status`: `sent`, `failed`, `unknown`
+- `status`: `sent`, `failed`, `unknown`, `rate_limited`
 - `post_id`（取得できた場合）
 - `http_status`（取得できた場合）
+- `retry_after` / `rate_limit_reset`（429の場合）
 
-現在の状態は同一 `content_id` / `content_sha256` の**最新行**で判定する。試行回数は `attempt` 行（と旧形式の行）の数で数え、上限は2回のまま変わらない。
+現在の状態は同一 `content_id` / `content_sha256` の**最新行**で判定する。試行回数は `attempt` 行（と旧形式の行）の数で数え、上限は2回のまま変わらない。ただし `rate_limited` の `result` 行は対応する試行を**返還**する — 429はサーバーがリクエストを処理していないことが確実で、時間をおけば成功しうるため、不可逆事故に備えた試行予算を消費しない（旧形式では `http_status: 429` の行を数えない）。
+
+重複検査からattempt行の追記までは台帳ファイルの排他ロック（`<ledger>.lock` への `flock`）の下で行い、並行実行の片方だけが送信できる。ロックが使えないプラットフォームではstderrへ警告を出す。
 
 `sent` は同じ本文または同じ `content_id` を拒否する。`unknown` はAPI側の公開状態を照合するまで再送しない。再試行は最大2回までとし、利用側の運用台帳とも照合する。
 

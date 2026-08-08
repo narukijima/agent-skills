@@ -12,6 +12,7 @@
 | ユーザーの投稿 | GET | `/2/users/:id/tweets` | App-onlyまたはUser context |
 | 直近検索 | GET | `/2/tweets/search/recent` | App-onlyまたはUser context |
 | 通常投稿 | POST | `/2/tweets` | User context |
+| OAuth 2.0トークン更新 | POST | `/2/oauth2/token` | client credentials（Skill内部でのみ使用） |
 
 既定のホストは `https://api.x.com` に固定する。`X_API_BASE_URL` による差し替えは、認証ヘッダーが指定先へ送られるため**loopback（localhost / 127.0.0.1 / ::1）のテストサーバーだけ**を受け付け、それ以外のホストはエラーで拒否する。差し替え使用時はstderrへ注記が出る。
 
@@ -19,7 +20,8 @@
 
 - App-only読み取り: `Authorization: Bearer $X_BEARER_TOKEN`
 - User context（第一経路）: **OAuth 1.0a** HMAC-SHA1署名。`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数がすべて揃ったときに使う。Developer Portalで発行するAccess Token/Secretは失効しないため、長期運用エージェントはこちらを既定にする。
-- User context（代替）: OAuth 2.0 userトークン。`X_ACCESS_TOKEN` だけが設定されているとき `Bearer` で送る。既定で約2時間で失効するため、refresh基盤を持つ利用側だけが使う。
+- User context（代替1・OAuth 2.0 refresh）: `X_OAUTH2_CLIENT_ID` と `X_OAUTH2_TOKEN_STORE`（confidential clientは `X_OAUTH2_CLIENT_SECRET` も、初回は `X_OAUTH2_REFRESH_TOKEN` も）を設定すると、Skillがアクセストークンを発行・キャッシュする。Xはリフレッシュトークンを使用のたびにローテーションするため、新しい値は `X_OAUTH2_TOKEN_STORE` のファイルへアトミックに保存する（0600）。`X_OAUTH2_TOKEN_STORE` は必須で、これが無い場合はエラーで停止する — ローテーション後のトークンを標準出力・stderr・台帳へ出す経路は存在しない。
+- User context（代替2・静的トークン）: OAuth 2.0 userトークン。`X_ACCESS_TOKEN` だけが設定されているとき `Bearer` で送る。既定で約2時間で失効するため、refresh基盤を持つ利用側だけが使う。
 - OAuth 1.0aの4変数のうち一部だけが設定されている場合はエラーで停止する。OAuth 2.0へ黙って降格しない。
 - OAuthのトークン発行、refresh、PKCEフローはこのSkillの責務ではない。既存の認証基盤を使い、トークンの保存・更新をこのSkillへ持ち込まない。
 - OAuth 1.0aの署名対象はクエリパラメータとOAuthパラメータだけで、v2のJSONボディは署名に含めない。実装は公式ドキュメントの署名例（`docs.x.com`）とテストで照合済み。

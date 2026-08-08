@@ -3,7 +3,7 @@ name: x-api
 description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
 status: active
 aliases: [x api, twitter-api]
-version: 0.3.0
+version: 0.4.0
 ---
 
 # x-api — X API v2 の取得と安全な投稿
@@ -42,7 +42,7 @@ version: 0.3.0
 
 - 秘密値は環境変数だけで受け取る。トークンをコマンド引数、原稿、ログ、Gitへ書かない。
 - 公開データの読み取りは `X_BEARER_TOKEN` を使う。
-- ユーザーコンテキストの第一経路は**OAuth 1.0a**（`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数、トークンは失効しない）。`X_ACCESS_TOKEN` だけが設定されている場合はOAuth 2.0 userトークン（約2時間で失効、refreshは利用側の責務）として扱う。詳細は `references/api-surface.md`。
+- ユーザーコンテキストの第一経路は**OAuth 1.0a**（`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数、トークンは失効しない）。OAuth 2.0運用の利用側は `X_OAUTH2_CLIENT_ID` + `X_OAUTH2_TOKEN_STORE` でSkillにrefreshを任せられる（ローテーションされたトークンは指定ファイルへ0600で保存、出力へは出さない）。`X_ACCESS_TOKEN` だけの静的トークンも使える（約2時間で失効）。詳細は `references/api-surface.md`。
 - `me` と投稿はユーザーコンテキストを必須とする。`X_BEARER_TOKEN`だけで代用しない。
 - APIの料金、利用可能なEndpoint、Rate Limitは実行時の公式情報を優先し、Skill内に固定値を作らない。
 
@@ -89,7 +89,7 @@ python3 skills/x-api/scripts/x_api.py post --live \
 - 成功した読み取りはAPIのJSONを標準出力へ返す。
 - dry-runは送信しないことが分かるJSONを返す。
 - 成功した投稿は投稿ID、URL、本文SHA-256、台帳パスを返す。トークンやAuthorizationヘッダーは返さない。
-- 失敗は標準エラーへ短い原因を返し、非0終了する。429では待機または利用側の再実行判断を返し、自動ループしない。
+- 失敗は標準エラーへ短い原因を返し、非0終了する。429では `retry_after` / `rate_limit_reset` をエラー出力へ含め、待機の判断材料を利用側へ返す。429は試行予算を消費しない。自動ループしない。
 
 ## 決定的な実行コード
 
