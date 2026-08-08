@@ -13,7 +13,7 @@
 | 直近検索 | GET | `/2/tweets/search/recent` | App-onlyまたはUser context |
 | 通常投稿 | POST | `/2/tweets` | User context |
 
-既定のホストは `https://api.x.com`。テスト時だけ `X_API_BASE_URL` でローカルHTTPサーバーへ差し替えられる。
+既定のホストは `https://api.x.com` に固定する。`X_API_BASE_URL` による差し替えは、認証ヘッダーが指定先へ送られるため**loopback（localhost / 127.0.0.1 / ::1）のテストサーバーだけ**を受け付け、それ以外のホストはエラーで拒否する。差し替え使用時はstderrへ注記が出る。
 
 ## 認証
 

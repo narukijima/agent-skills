@@ -3,7 +3,7 @@ name: x-api
 description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
 status: active
 aliases: [x api, twitter-api]
-version: 0.2.0
+version: 0.3.0
 ---
 
 # x-api — X API v2 の取得と安全な投稿
@@ -17,6 +17,8 @@ version: 0.2.0
 - 読み取り: 自分のユーザー情報、ユーザー検索、投稿取得、ユーザーの投稿、直近検索
 - 書き込み: 通常投稿（単独のテキスト投稿）
 - 対象外: 返信、引用、いいね、フォロー、DM、削除、画像・動画アップロード、ブラウザ操作、Analytics画面の読み取り
+
+対象外は未実装ではなく設計上の境界である（詳細は `references/posting-safety.md` の "Do not do"）。範囲を広げる場合は契約変更としてversionを上げて行う。
 
 ## 使用するKnowledge
 
@@ -68,7 +70,7 @@ python3 skills/x-api/scripts/x_api.py --pretty search-recent --query 'from:XDeve
 2. まず `--dry-run` で本文のSHA-256、文字数、重み付き文字数（X基準の推定値。全角・絵文字は2、URLは23換算、上限280）を確認する。dry-runは既定動作である。
 3. 実送信が明示された場合だけ、`--live`、`X_POSTING_ENABLED=true`、`--content-id`、`--ledger <path>` の4条件を確認する。
 4. 台帳に同じ `content_id` または本文の `content_sha256` の `sent` があれば拒否する。ネットワーク結果が `unknown` の本文は、自動再送しない。再試行は利用者が `--retry-unknown` を明示した場合だけ許可し、試行上限は2回である。
-5. 送信後はレスポンスの投稿IDを確認し、台帳に結果を書き込む。結果不明のときは `unknown` として残す。
+5. 台帳は自動で2行書かれる。送信直前に `attempt` 行（`unknown`）、結果判明後に `result` 行。送信中にプロセスが落ちても `attempt` 行が残り、次回は `--retry-unknown` のゲートにかかる。結果不明のときは `unknown` のまま残す。
 
 例:
 

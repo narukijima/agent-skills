@@ -16,14 +16,22 @@
 
 ## Ledger rules
 
-台帳はJSON Linesで、本文そのものではなく `content_sha256` を重複判定の主キーにする。最低限、次を1回の試行ごとに記録する。
+台帳はJSON Linesで、本文そのものではなく `content_sha256` を重複判定の主キーにする。1回の試行は**2行**で記録する（write-ahead方式）。
+
+1. `event: "attempt"` — API呼び出しの**直前**に `status: "unknown"` で追記する。送信中にプロセスが落ちてもこの行が残り、次回実行は `--retry-unknown` のゲートにかかる。
+2. `event: "result"` — 結果が判明した後に確定値で追記する。
+
+各行は最低限、次を含む。
 
 - `attempted_at`
+- `event`: `attempt`, `result`（無い行は旧形式で、1行=1試行として数える）
 - `content_sha256`
 - `content_id`
 - `status`: `sent`, `failed`, `unknown`
 - `post_id`（取得できた場合）
 - `http_status`（取得できた場合）
+
+現在の状態は同一 `content_id` / `content_sha256` の**最新行**で判定する。試行回数は `attempt` 行（と旧形式の行）の数で数え、上限は2回のまま変わらない。
 
 `sent` は同じ本文または同じ `content_id` を拒否する。`unknown` はAPI側の公開状態を照合するまで再送しない。再試行は最大2回までとし、利用側の運用台帳とも照合する。
 
@@ -39,3 +47,4 @@
 - XのWeb画面を投稿経路にしない。
 - APIの料金やRate Limitを固定の成功条件にしない。
 - このSkillの範囲へ返信、引用、いいね、フォロー、DM、削除を追加しない。
+- 画像・動画アップロードは0.x系では**設計上の境界**として範囲外（未実装ではない）。必要な利用側が独自経路を持つ場合も、台帳・重複拒否・unknown再送拒否と同等の防御を必ず備える。将来対応する場合は契約変更としてminor versionを上げて行う。

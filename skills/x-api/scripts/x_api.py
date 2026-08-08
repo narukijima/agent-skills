@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -28,8 +28,13 @@ OAUTH1_VARIABLES = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOK
 
 # twitter-text v3 weighting: these code point ranges count 1, everything else 2.
 LIGHT_RANGES = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
-URL_PATTERN = re.compile(r"https?://\S+")
+# URL characters are limited to the RFC 3986 ASCII set so that CJK text written
+# directly after a URL (no space, the normal Japanese style) is not swallowed.
+URL_PATTERN = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
 WEIGHTED_LIMIT = 280
+
+DEFAULT_BASE_URL = "https://api.x.com"
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class ApiFailure(RuntimeError):
@@ -133,6 +138,20 @@ def choose_auth(operation: str, requested: str) -> str:
     return "user"
 
 
+def resolve_base_url() -> str:
+    override = os.environ.get("X_API_BASE_URL", "").rstrip("/")
+    if not override or override == DEFAULT_BASE_URL:
+        return DEFAULT_BASE_URL
+    host = urlsplit(override).hostname or ""
+    if host not in LOOPBACK_HOSTS:
+        raise ApiFailure(
+            "X_API_BASE_URL override is limited to loopback test servers "
+            "(credentials would be sent to that host); refusing: " + override
+        )
+    print("note: sending requests to test base URL " + override, file=sys.stderr)
+    return override
+
+
 def api_request(
     method: str,
     path: str,
@@ -140,8 +159,7 @@ def api_request(
     params: Optional[Dict[str, str]] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, Any]:
-    base_url = os.environ.get("X_API_BASE_URL", "https://api.x.com").rstrip("/")
-    url = base_url + path
+    url = resolve_base_url() + path
     query = ("?" + urlencode(params)) if params else ""
     request = Request(url + query, method=method)
     request.add_header("Authorization", authorization_for(auth_kind, method, url, params))
@@ -246,36 +264,44 @@ def post_text(args: argparse.Namespace) -> Any:
     require_user_credentials()
 
     ledger_path = Path(args.ledger)
-    attempts = 0
-    for record in read_ledger(ledger_path):
-        if record.get("content_sha256") != digest and record.get("content_id") != args.content_id:
-            continue
-        attempts += 1
-        if record.get("status") == "sent":
-            raise ApiFailure("duplicate post refused: content is already marked sent")
-        if record.get("status") == "unknown" and not args.retry_unknown:
-            raise ApiFailure("unknown post result refused: inspect and explicitly use --retry-unknown")
+    matching = [
+        record
+        for record in read_ledger(ledger_path)
+        if record.get("content_sha256") == digest or record.get("content_id") == args.content_id
+    ]
+    if any(record.get("status") == "sent" for record in matching):
+        raise ApiFailure("duplicate post refused: content is already marked sent")
+    if matching and matching[-1].get("status") == "unknown" and not args.retry_unknown:
+        raise ApiFailure("unknown post result refused: inspect and explicitly use --retry-unknown")
+    # Each attempt writes an "attempt" row before sending and a "result" row
+    # after; rows without an event field come from older ledgers where one row
+    # was one attempt.
+    attempts = sum(1 for record in matching if record.get("event") != "result")
     if attempts >= 2:
         raise ApiFailure("post attempt limit reached: maximum 2 attempts per content_id or content_sha256")
 
-    record: Dict[str, Any] = {"attempted_at": utc_now(), "content_id": args.content_id, "content_sha256": digest, "status": "unknown"}
+    base_record = {"content_id": args.content_id, "content_sha256": digest}
+    # Write-ahead: if the process dies mid-send, this row survives and gates
+    # the next run behind --retry-unknown.
+    append_ledger(ledger_path, {"attempted_at": utc_now(), "event": "attempt", "status": "unknown", **base_record})
+    result: Dict[str, Any] = {"attempted_at": utc_now(), "event": "result", "status": "unknown", **base_record}
     try:
         status, payload = api_request("POST", "/2/tweets", "user", body={"text": text})
     except ApiFailure as exc:
         # 4xx means the request was rejected before processing; 5xx and network
         # failures may have published the post, so they stay "unknown".
-        record["status"] = "failed" if (exc.status is not None and exc.status < 500) else "unknown"
+        result["status"] = "failed" if (exc.status is not None and exc.status < 500) else "unknown"
         if exc.status is not None:
-            record["http_status"] = exc.status
-        append_ledger(ledger_path, record)
+            result["http_status"] = exc.status
+        append_ledger(ledger_path, result)
         raise
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict) or not payload["data"].get("id"):
-        record["http_status"] = status
-        append_ledger(ledger_path, record)
+        result["http_status"] = status
+        append_ledger(ledger_path, result)
         raise ApiFailure("post response did not contain a post id")
     post_id = str(payload["data"]["id"])
-    record.update({"status": "sent", "post_id": post_id, "http_status": status})
-    append_ledger(ledger_path, record)
+    result.update({"status": "sent", "post_id": post_id, "http_status": status})
+    append_ledger(ledger_path, result)
     return {"content_sha256": digest, "ledger": str(ledger_path), "post_id": post_id, "url": "https://x.com/i/web/status/" + post_id}
 
 

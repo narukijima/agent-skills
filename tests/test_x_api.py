@@ -62,8 +62,25 @@ class XApiTests(unittest.TestCase):
             ledger = Path(directory) / "ledger.jsonl"
             with patch.dict(os.environ, OAUTH2_ENV, clear=False), patch.object(x_api, "urlopen", return_value=FakeResponse(status=200)):
                 x_api.post_text(live_args(ledger))
-            record = json.loads(ledger.read_text(encoding="utf-8"))
+            record = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(record["http_status"], 200)
+
+    def test_crash_mid_send_leaves_an_unknown_attempt_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.jsonl"
+            with patch.dict(os.environ, OAUTH2_ENV, clear=False):
+                with patch.object(x_api, "api_request", side_effect=SystemExit("killed")):
+                    with self.assertRaises(SystemExit):
+                        x_api.post_text(live_args(ledger))
+                lines = ledger.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 1)
+                record = json.loads(lines[0])
+                self.assertEqual(record["status"], "unknown")
+                self.assertEqual(record["event"], "attempt")
+                # The next run must be gated behind --retry-unknown.
+                with self.assertRaises(x_api.ApiFailure) as raised:
+                    x_api.post_text(live_args(ledger))
+                self.assertIn("retry-unknown", str(raised.exception))
 
     def test_unknown_result_is_not_retried_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -84,7 +101,7 @@ class XApiTests(unittest.TestCase):
                 with patch.object(x_api, "urlopen", side_effect=gateway_timeout):
                     with self.assertRaises(x_api.ApiFailure):
                         x_api.post_text(live_args(ledger))
-                record = json.loads(ledger.read_text(encoding="utf-8"))
+                record = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
                 self.assertEqual(record["status"], "unknown")
                 self.assertEqual(record["http_status"], 504)
                 # A retry without --retry-unknown must be refused.
@@ -102,8 +119,12 @@ class XApiTests(unittest.TestCase):
             with patch.dict(os.environ, OAUTH2_ENV, clear=False), patch.object(x_api, "urlopen", side_effect=forbidden):
                 with self.assertRaises(x_api.ApiFailure):
                     x_api.post_text(live_args(ledger))
-            record = json.loads(ledger.read_text(encoding="utf-8"))
+            record = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(record["status"], "failed")
+            # A "failed" outcome may be retried without --retry-unknown.
+            with patch.dict(os.environ, OAUTH2_ENV, clear=False), patch.object(x_api, "urlopen", return_value=FakeResponse()):
+                result = x_api.post_text(live_args(ledger))
+            self.assertEqual(result["post_id"], "123")
 
     def test_credential_errors_never_reach_the_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -148,6 +169,21 @@ class XApiTests(unittest.TestCase):
         self.assertEqual(x_api.weighted_length("test"), 4)
         self.assertEqual(x_api.weighted_length("あ" * 10), 20)
         self.assertEqual(x_api.weighted_length("check https://example.com/x"), 6 + 23)
+
+    def test_weighted_length_does_not_swallow_cjk_after_a_url(self):
+        # Japanese text is normally written with no space after a URL.
+        self.assertEqual(x_api.weighted_length("https://example.com/a" + "あ" * 130), 23 + 260)
+        self.assertEqual(x_api.weighted_length("https://example.com/aです。"), 23 + 6)
+
+    def test_base_url_override_is_limited_to_loopback(self):
+        with patch.dict(os.environ, {"X_API_BASE_URL": "https://evil.example"}, clear=False):
+            with self.assertRaises(x_api.ApiFailure) as raised:
+                x_api.resolve_base_url()
+            self.assertIn("loopback", str(raised.exception))
+        with patch.dict(os.environ, {"X_API_BASE_URL": "http://127.0.0.1:8943"}, clear=False):
+            self.assertEqual(x_api.resolve_base_url(), "http://127.0.0.1:8943")
+        with patch.dict(os.environ, {"X_API_BASE_URL": "https://api.x.com/"}, clear=False):
+            self.assertEqual(x_api.resolve_base_url(), "https://api.x.com")
 
 
 if __name__ == "__main__":
