@@ -1,0 +1,7 @@
+interface:
+  display_name: "X API"
+  short_description: "安全なX APIの取得と投稿を共通化する"
+  default_prompt: "Use $x-api to inspect X data or prepare a guarded post."
+
+policy:
+  allow_implicit_invocation: true
