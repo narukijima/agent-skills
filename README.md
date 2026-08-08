@@ -27,9 +27,15 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 インポートは変換なしのvendored copyです。既存の同名Skillは自動上書きせず、コピー元のrepository、commit SHA、Skill version、インポート時刻を `skills/x-api/agents/upstream.yaml` に記録します。更新は利用側で差分を確認してから、明示的に再インポートします。
 
-## x-api
+## 公式Skill
 
-最初の公式Skillは、X API v2の読み取りと、dry-runを標準にした通常投稿です。返信・引用・いいね・フォロー・DM・削除・ブラウザ操作は含めません。投稿の実行には、ユーザーコンテキスト、`X_POSTING_ENABLED=true`、送信台帳、`--live` が必要です。ユーザーコンテキストの第一経路は失効しないOAuth 1.0a（長期運用エージェント向け）で、OAuth 2.0 userトークンも利用できます。
+### logic-pro
+
+Logic Pro専用MCPまたは互換アダプタを利用し、状態確認、transport、track、内蔵音源、MIDI取込、保存、bounceをProject境界と独立読戻し付きで扱います。特定MCPのtool名には依存せず、実行時capabilityを意味操作へ対応付けます。
+
+### x-api
+
+X API v2の読み取りと、dry-runを標準にした通常投稿です。返信・引用・いいね・フォロー・DM・削除・ブラウザ操作は含めません。投稿の実行には、ユーザーコンテキスト、`X_POSTING_ENABLED=true`、送信台帳、`--live` が必要です。ユーザーコンテキストの第一経路は失効しないOAuth 1.0a（長期運用エージェント向け）で、OAuth 2.0 userトークンも利用できます。
 
 ```bash
 python3 skills/x-api/scripts/x_api.py --pretty me

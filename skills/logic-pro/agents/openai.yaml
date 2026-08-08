@@ -1,0 +1,4 @@
+interface:
+  display_name: "Logic Pro"
+  short_description: "Logic Proの安全な状態確認・操作・読戻し検証"
+  default_prompt: "Use $logic-pro to inspect the current Logic Pro project and perform only verified, reversible production operations."
