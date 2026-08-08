@@ -3,7 +3,7 @@ name: x-api
 description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
 status: active
 aliases: [x api, twitter-api]
-version: 0.1.0
+version: 0.2.0
 ---
 
 # x-api — X API v2 の取得と安全な投稿
@@ -39,7 +39,8 @@ version: 0.1.0
 ## 認証と費用の扱い
 
 - 秘密値は環境変数だけで受け取る。トークンをコマンド引数、原稿、ログ、Gitへ書かない。
-- 公開データの読み取りは `X_BEARER_TOKEN`、ユーザーコンテキストが必要な操作は `X_ACCESS_TOKEN` を使う。
+- 公開データの読み取りは `X_BEARER_TOKEN` を使う。
+- ユーザーコンテキストの第一経路は**OAuth 1.0a**（`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数、トークンは失効しない）。`X_ACCESS_TOKEN` だけが設定されている場合はOAuth 2.0 userトークン（約2時間で失効、refreshは利用側の責務）として扱う。詳細は `references/api-surface.md`。
 - `me` と投稿はユーザーコンテキストを必須とする。`X_BEARER_TOKEN`だけで代用しない。
 - APIの料金、利用可能なEndpoint、Rate Limitは実行時の公式情報を優先し、Skill内に固定値を作らない。
 
@@ -64,7 +65,7 @@ python3 skills/x-api/scripts/x_api.py --pretty search-recent --query 'from:XDeve
 投稿は常に次の順序で扱う。
 
 1. 利用側のProjectが本文、宛先アカウント、投稿目的、送信許可を確定する。
-2. まず `--dry-run` で本文のSHA-256、文字数、リクエスト概要を確認する。dry-runは既定動作である。
+2. まず `--dry-run` で本文のSHA-256、文字数、重み付き文字数（X基準の推定値。全角・絵文字は2、URLは23換算、上限280）を確認する。dry-runは既定動作である。
 3. 実送信が明示された場合だけ、`--live`、`X_POSTING_ENABLED=true`、`--content-id`、`--ledger <path>` の4条件を確認する。
 4. 台帳に同じ `content_id` または本文の `content_sha256` の `sent` があれば拒否する。ネットワーク結果が `unknown` の本文は、自動再送しない。再試行は利用者が `--retry-unknown` を明示した場合だけ許可し、試行上限は2回である。
 5. 送信後はレスポンスの投稿IDを確認し、台帳に結果を書き込む。結果不明のときは `unknown` として残す。

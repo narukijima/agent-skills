@@ -18,8 +18,11 @@
 ## 認証
 
 - App-only読み取り: `Authorization: Bearer $X_BEARER_TOKEN`
-- User context読み取り・投稿: `Authorization: Bearer $X_ACCESS_TOKEN`
+- User context（第一経路）: **OAuth 1.0a** HMAC-SHA1署名。`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数がすべて揃ったときに使う。Developer Portalで発行するAccess Token/Secretは失効しないため、長期運用エージェントはこちらを既定にする。
+- User context（代替）: OAuth 2.0 userトークン。`X_ACCESS_TOKEN` だけが設定されているとき `Bearer` で送る。既定で約2時間で失効するため、refresh基盤を持つ利用側だけが使う。
+- OAuth 1.0aの4変数のうち一部だけが設定されている場合はエラーで停止する。OAuth 2.0へ黙って降格しない。
 - OAuthのトークン発行、refresh、PKCEフローはこのSkillの責務ではない。既存の認証基盤を使い、トークンの保存・更新をこのSkillへ持ち込まない。
+- OAuth 1.0aの署名対象はクエリパラメータとOAuthパラメータだけで、v2のJSONボディは署名に含めない。実装は公式ドキュメントの署名例（`docs.x.com`）とテストで照合済み。
 
 ## フィールドの既定値
 

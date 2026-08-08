@@ -29,7 +29,7 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 ## x-api
 
-最初の公式Skillは、X API v2の読み取りと、dry-runを標準にした通常投稿です。返信・引用・いいね・フォロー・DM・削除・ブラウザ操作は含めません。投稿の実行には、ユーザーコンテキスト、`X_POSTING_ENABLED=true`、送信台帳、`--live` が必要です。
+最初の公式Skillは、X API v2の読み取りと、dry-runを標準にした通常投稿です。返信・引用・いいね・フォロー・DM・削除・ブラウザ操作は含めません。投稿の実行には、ユーザーコンテキスト、`X_POSTING_ENABLED=true`、送信台帳、`--live` が必要です。ユーザーコンテキストの第一経路は失効しないOAuth 1.0a（長期運用エージェント向け）で、OAuth 2.0 userトークンも利用できます。
 
 ```bash
 python3 skills/x-api/scripts/x_api.py --pretty me

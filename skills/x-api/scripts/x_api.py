@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -18,6 +23,13 @@ from urllib.request import Request, urlopen
 
 USER_FIELDS = "created_at,description,location,public_metrics,profile_image_url,protected,url,verified"
 POST_FIELDS = "created_at,conversation_id,lang,possibly_sensitive,public_metrics"
+
+OAUTH1_VARIABLES = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")
+
+# twitter-text v3 weighting: these code point ranges count 1, everything else 2.
+LIGHT_RANGES = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
+URL_PATTERN = re.compile(r"https?://\S+")
+WEIGHTED_LIMIT = 280
 
 
 class ApiFailure(RuntimeError):
@@ -36,16 +48,77 @@ def json_loads(raw: bytes) -> Any:
         return {"raw_response": raw.decode("utf-8", errors="replace")[:2000]}
 
 
-def token_for(kind: str) -> str:
-    if kind == "user":
-        value = os.environ.get("X_ACCESS_TOKEN", "")
-        variable = "X_ACCESS_TOKEN"
-    else:
-        value = os.environ.get("X_BEARER_TOKEN", "")
-        variable = "X_BEARER_TOKEN"
+def percent_encode(value: str) -> str:
+    return quote(value, safe="")
+
+
+def oauth1_credentials() -> Optional[Dict[str, str]]:
+    values = {name: os.environ.get(name, "") for name in OAUTH1_VARIABLES}
+    oauth1_only = [name for name in OAUTH1_VARIABLES if name != "X_ACCESS_TOKEN"]
+    if not any(values[name] for name in oauth1_only):
+        return None
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise ApiFailure("OAuth 1.0a requires all of " + ", ".join(OAUTH1_VARIABLES) + "; missing: " + ", ".join(missing))
+    return values
+
+
+def require_user_credentials() -> Tuple[str, Dict[str, str]]:
+    credentials = oauth1_credentials()
+    if credentials is not None:
+        return "oauth1", credentials
+    token = os.environ.get("X_ACCESS_TOKEN", "")
+    if token:
+        return "oauth2", {"X_ACCESS_TOKEN": token}
+    raise ApiFailure(
+        "user-context auth requires either the OAuth 1.0a variables "
+        + ", ".join(OAUTH1_VARIABLES)
+        + " (non-expiring; preferred for long-running agents) or an OAuth 2.0 user token in X_ACCESS_TOKEN"
+    )
+
+
+def oauth1_authorization(
+    method: str,
+    url: str,
+    params: Optional[Dict[str, str]],
+    credentials: Dict[str, str],
+    nonce: Optional[str] = None,
+    timestamp: Optional[str] = None,
+) -> str:
+    oauth_params = {
+        "oauth_consumer_key": credentials["X_API_KEY"],
+        "oauth_nonce": nonce or secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": timestamp or str(int(time.time())),
+        "oauth_token": credentials["X_ACCESS_TOKEN"],
+        "oauth_version": "1.0",
+    }
+    signature_params = dict(params or {})
+    signature_params.update(oauth_params)
+    encoded_pairs = sorted((percent_encode(key), percent_encode(value)) for key, value in signature_params.items())
+    parameter_string = "&".join(key + "=" + value for key, value in encoded_pairs)
+    base_string = "&".join([method.upper(), percent_encode(url), percent_encode(parameter_string)])
+    signing_key = percent_encode(credentials["X_API_SECRET"]) + "&" + percent_encode(credentials["X_ACCESS_TOKEN_SECRET"])
+    digest = hmac.new(signing_key.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha1).digest()
+    oauth_params["oauth_signature"] = base64.b64encode(digest).decode("ascii")
+    header_pairs = sorted(oauth_params.items())
+    return "OAuth " + ", ".join(percent_encode(key) + '="' + percent_encode(value) + '"' for key, value in header_pairs)
+
+
+def bearer_token() -> str:
+    value = os.environ.get("X_BEARER_TOKEN", "")
     if not value:
-        raise ApiFailure("missing required environment variable: " + variable)
+        raise ApiFailure("missing required environment variable: X_BEARER_TOKEN")
     return value
+
+
+def authorization_for(auth_kind: str, method: str, url: str, params: Optional[Dict[str, str]]) -> str:
+    if auth_kind == "app":
+        return "Bearer " + bearer_token()
+    mode, credentials = require_user_credentials()
+    if mode == "oauth1":
+        return oauth1_authorization(method, url, params, credentials)
+    return "Bearer " + credentials["X_ACCESS_TOKEN"]
 
 
 def choose_auth(operation: str, requested: str) -> str:
@@ -66,13 +139,14 @@ def api_request(
     auth_kind: str,
     params: Optional[Dict[str, str]] = None,
     body: Optional[Dict[str, Any]] = None,
-) -> Any:
+) -> Tuple[int, Any]:
     base_url = os.environ.get("X_API_BASE_URL", "https://api.x.com").rstrip("/")
+    url = base_url + path
     query = ("?" + urlencode(params)) if params else ""
-    request = Request(base_url + path + query, method=method)
-    request.add_header("Authorization", "Bearer " + token_for(auth_kind))
+    request = Request(url + query, method=method)
+    request.add_header("Authorization", authorization_for(auth_kind, method, url, params))
     request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "agent-sills-x-api/0.1")
+    request.add_header("User-Agent", "agent-sills-x-api/0.2")
     if body is not None:
         request.add_header("Content-Type", "application/json")
         request.data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -81,7 +155,7 @@ def api_request(
             payload = json_loads(response.read())
             if not 200 <= response.status < 300:
                 raise ApiFailure("X API returned an error", response.status, payload)
-            return payload
+            return response.status, payload
     except HTTPError as exc:
         payload = json_loads(exc.read())
         raise ApiFailure("X API returned an HTTP error", exc.code, payload) from exc
@@ -91,12 +165,25 @@ def api_request(
         raise ApiFailure("X API request result is unknown: timeout") from exc
 
 
-def print_json(value: Any, pretty: bool) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2 if pretty else None, sort_keys=pretty))
+def fetch(method: str, path: str, auth_kind: str, params: Optional[Dict[str, str]] = None) -> Any:
+    return api_request(method, path, auth_kind, params)[1]
+
+
+def print_json(value: Any, pretty: bool, stream: Any = None) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2 if pretty else None, sort_keys=pretty), file=stream or sys.stdout)
 
 
 def content_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def weighted_length(text: str) -> int:
+    """Estimate X's weighted character count (twitter-text v3): URLs count 23, CJK and emoji count 2."""
+    total = 23 * len(URL_PATTERN.findall(text))
+    for char in URL_PATTERN.sub("", text):
+        code = ord(char)
+        total += 1 if any(low <= code <= high for low, high in LIGHT_RANGES) else 2
+    return total
 
 
 def utc_now() -> str:
@@ -135,10 +222,18 @@ def post_text(args: argparse.Namespace) -> Any:
     if not text:
         raise ApiFailure("post text must not be empty")
     digest = content_sha256(text)
+    weight = weighted_length(text)
     if args.live and args.dry_run:
         raise ApiFailure("use either --live or --dry-run, not both")
     if not args.live or args.dry_run:
-        result = {"dry_run": True, "content_sha256": digest, "text_length": len(text), "text": text}
+        result = {
+            "dry_run": True,
+            "content_sha256": digest,
+            "text_length": len(text),
+            "weighted_length": weight,
+            "weighted_limit": WEIGHTED_LIMIT,
+            "text": text,
+        }
         if args.content_id:
             result["content_id"] = args.content_id
         return result
@@ -146,6 +241,9 @@ def post_text(args: argparse.Namespace) -> Any:
         raise ApiFailure("live posting requires X_POSTING_ENABLED=true")
     if not args.ledger or not args.content_id:
         raise ApiFailure("live posting requires --ledger and --content-id")
+    # Resolve credentials before touching the ledger so that a configuration
+    # error can never be recorded as an attempt.
+    require_user_credentials()
 
     ledger_path = Path(args.ledger)
     attempts = 0
@@ -162,20 +260,30 @@ def post_text(args: argparse.Namespace) -> Any:
 
     record: Dict[str, Any] = {"attempted_at": utc_now(), "content_id": args.content_id, "content_sha256": digest, "status": "unknown"}
     try:
-        payload = api_request("POST", "/2/tweets", "user", body={"text": text})
+        status, payload = api_request("POST", "/2/tweets", "user", body={"text": text})
     except ApiFailure as exc:
-        record["status"] = "unknown" if "unknown" in str(exc) else "failed"
+        # 4xx means the request was rejected before processing; 5xx and network
+        # failures may have published the post, so they stay "unknown".
+        record["status"] = "failed" if (exc.status is not None and exc.status < 500) else "unknown"
         if exc.status is not None:
             record["http_status"] = exc.status
         append_ledger(ledger_path, record)
         raise
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict) or not payload["data"].get("id"):
+        record["http_status"] = status
         append_ledger(ledger_path, record)
         raise ApiFailure("post response did not contain a post id")
     post_id = str(payload["data"]["id"])
-    record.update({"status": "sent", "post_id": post_id, "http_status": 201})
+    record.update({"status": "sent", "post_id": post_id, "http_status": status})
     append_ledger(ledger_path, record)
     return {"content_sha256": digest, "ledger": str(ledger_path), "post_id": post_id, "url": "https://x.com/i/web/status/" + post_id}
+
+
+def clamp_max_results(requested: int, minimum: int, maximum: int) -> str:
+    value = max(minimum, min(requested, maximum))
+    if value != requested:
+        print("note: max_results adjusted to %d (API range %d-%d)" % (value, minimum, maximum), file=sys.stderr)
+    return str(value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -191,13 +299,13 @@ def build_parser() -> argparse.ArgumentParser:
     by_id.add_argument("--user-id", required=True)
     posts = sub.add_parser("posts", help="get posts by user id")
     posts.add_argument("--user-id", required=True)
-    posts.add_argument("--max-results", type=int, default=10)
+    posts.add_argument("--max-results", type=int, default=10, help="5-100; out-of-range values are clamped")
     posts.add_argument("--pagination-token")
     tweet = sub.add_parser("post-by-id", help="get posts by comma-separated ids")
     tweet.add_argument("--ids", required=True)
     search = sub.add_parser("search-recent", help="search recent posts")
     search.add_argument("--query", required=True)
-    search.add_argument("--max-results", type=int, default=10)
+    search.add_argument("--max-results", type=int, default=10, help="10-100; out-of-range values are clamped")
     search.add_argument("--next-token")
     post = sub.add_parser("post", help="dry-run by default; optionally send one text post")
     group = post.add_mutually_exclusive_group()
@@ -214,23 +322,23 @@ def build_parser() -> argparse.ArgumentParser:
 def dispatch(args: argparse.Namespace) -> Any:
     auth = choose_auth(args.command, args.auth)
     if args.command == "me":
-        return api_request("GET", "/2/users/me", auth, {"user.fields": USER_FIELDS})
+        return fetch("GET", "/2/users/me", auth, {"user.fields": USER_FIELDS})
     if args.command == "user":
-        return api_request("GET", "/2/users/by/username/" + quote(args.username, safe=""), auth, {"user.fields": USER_FIELDS})
+        return fetch("GET", "/2/users/by/username/" + quote(args.username, safe=""), auth, {"user.fields": USER_FIELDS})
     if args.command == "user-by-id":
-        return api_request("GET", "/2/users/" + args.user_id, auth, {"user.fields": USER_FIELDS})
+        return fetch("GET", "/2/users/" + args.user_id, auth, {"user.fields": USER_FIELDS})
     if args.command == "posts":
-        params = {"max_results": str(max(5, min(args.max_results, 100))), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
+        params = {"max_results": clamp_max_results(args.max_results, 5, 100), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
         if args.pagination_token:
             params["pagination_token"] = args.pagination_token
-        return api_request("GET", "/2/users/" + args.user_id + "/tweets", auth, params)
+        return fetch("GET", "/2/users/" + args.user_id + "/tweets", auth, params)
     if args.command == "post-by-id":
-        return api_request("GET", "/2/tweets", auth, {"ids": args.ids, "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS})
+        return fetch("GET", "/2/tweets", auth, {"ids": args.ids, "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS})
     if args.command == "search-recent":
-        params = {"query": args.query, "max_results": str(max(10, min(args.max_results, 100))), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
+        params = {"query": args.query, "max_results": clamp_max_results(args.max_results, 10, 100), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
         if args.next_token:
             params["next_token"] = args.next_token
-        return api_request("GET", "/2/tweets/search/recent", auth, params)
+        return fetch("GET", "/2/tweets/search/recent", auth, params)
     if args.command == "post":
         return post_text(args)
     raise ApiFailure("unsupported command")
@@ -248,7 +356,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             detail["http_status"] = exc.status
         if exc.payload is not None:
             detail["response"] = exc.payload
-        print_json(detail, True)
+        print_json(detail, True, sys.stderr)
         return 1
 
 

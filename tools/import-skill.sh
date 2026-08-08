@@ -52,6 +52,8 @@ mkdir -p "$target_root/skills"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-skill-import.XXXXXX")"
 trap 'rm -rf "$temporary_dir"' EXIT
 cp -R "$source_dir" "$temporary_dir/$skill_name"
+find "$temporary_dir/$skill_name" \( -type d -name '__pycache__' \) -prune -exec rm -rf {} +
+find "$temporary_dir/$skill_name" -type f \( -name '*.pyc' -o -name '.DS_Store' \) -delete
 mkdir -p "$temporary_dir/$skill_name/agents"
 cat > "$temporary_dir/$skill_name/agents/upstream.yaml" <<EOF
 source_repository: "$source_repository"
