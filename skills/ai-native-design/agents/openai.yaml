@@ -1,0 +1,7 @@
+interface:
+  display_name: "AI-native Design"
+  short_description: "AI-native UIの探索・選定・統合・検証を導く"
+  default_prompt: "Use $ai-native-design to design and implement an AI-native interface that fits this project."
+
+policy:
+  allow_implicit_invocation: true
