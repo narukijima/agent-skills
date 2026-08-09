@@ -17,6 +17,7 @@ import os
 import platform
 import subprocess
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.3.0"
+ADAPTER_VERSION = "0.3.1"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -704,6 +705,22 @@ def ax_error_name(code: int) -> str:
     return AX_ERROR_NAMES.get(code, f"ax_error_{code}")
 
 
+def native_exception_diagnostic(exc: Exception) -> str:
+    if isinstance(exc, AdapterFailure):
+        return f"native_ax_bridge_error:{type(exc).__name__}:{exc.kind}"
+    location = next(
+        (
+            frame.name
+            for frame in reversed(traceback.extract_tb(exc.__traceback__))
+            if os.path.abspath(frame.filename) == os.path.abspath(__file__)
+            and frame.name.startswith("_")
+        ),
+        None,
+    )
+    suffix = f":{location}" if location else ""
+    return f"native_ax_bridge_error:{type(exc).__name__}{suffix}"
+
+
 class NativeAXBridge:
     """Bounded, dependency-free AXUIElement bridge for one application PID."""
 
@@ -1163,7 +1180,7 @@ class NativeAXBridge:
         selected_main = next(
             (
                 window
-                for window, row in zip(selected_windows, window_rows, strict=True)
+                for window, row in zip(selected_windows, window_rows)
                 if row["main"] is True
             ),
             None,
@@ -1384,14 +1401,17 @@ class MacOSAccessibilityBackend:
             try:
                 with self.native_bridge_factory(process_identifier, self.timeout_seconds) as bridge:
                     native = bridge.snapshot(include_controls=include_controls)
-            except (AdapterFailure, OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError) as exc:
-                native_error = f"native_ax_bridge_error:{type(exc).__name__}"
+            except Exception as exc:
+                native_error = native_exception_diagnostic(exc)
         legacy: dict[str, Any] | None = None
         use_native_without_fallback = native is not None and native.get("window_set_complete") is True
         if include_controls and native is not None and native.get("transport_controls_complete") is not True:
             use_native_without_fallback = False
         if not use_native_without_fallback:
-            legacy = self._run_jxa(render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": include_controls}))
+            legacy_include_controls = include_controls and native_error is None
+            legacy = self._run_jxa(
+                render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": legacy_include_controls})
+            )
         candidates = [candidate for candidate in (native, legacy) if isinstance(candidate, dict)]
         if not candidates:
             raise AdapterFailure("adapter_unavailable", "no Accessibility snapshot backend is available", definitive=True)
@@ -1409,6 +1429,8 @@ class MacOSAccessibilityBackend:
             native_error
             or (native.get("window_discovery_diagnostic") if isinstance(native, dict) else "native_ax_unavailable")
         )
+        if include_controls and native_error is not None:
+            snapshot["control_tree_diagnostic"] = native_error
         return snapshot
 
     def dispatch_transport(
@@ -1426,14 +1448,21 @@ class MacOSAccessibilityBackend:
             raise AdapterFailure("logic_not_running", "Logic Pro process disappeared before dispatch", definitive=True)
         if process_identifier is not None and current_process_identifier != process_identifier:
             raise AdapterFailure("logic_process_changed", "Logic Pro process changed after preflight snapshot", definitive=True)
+        native_dispatch_started = False
         try:
             with self.native_bridge_factory(current_process_identifier, self.timeout_seconds) as bridge:
                 if bridge.trusted():
+                    native_dispatch_started = True
                     return bridge.dispatch_transport(operation, expected_project)
         except AdapterFailure:
             raise
-        except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
-            pass
+        except Exception as exc:
+            raise AdapterFailure(
+                "native_ax_bridge_failed",
+                native_exception_diagnostic(exc),
+                definitive=not native_dispatch_started,
+                may_have_dispatched=native_dispatch_started,
+            ) from exc
         source = render_jxa(
             ACTION_JXA,
             {

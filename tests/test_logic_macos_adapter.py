@@ -95,10 +95,11 @@ class FakeBackend:
 
 
 class FakeNativeBridge:
-    def __init__(self, state: dict, *, trusted=True, action=None):
+    def __init__(self, state: dict, *, trusted=True, action=None, exit_error=None):
         self.state = state
         self.is_trusted = trusted
         self.action = action or {"ok": True, "performed": True, "already_satisfied": False}
+        self.exit_error = exit_error
         self.snapshot_calls = []
         self.dispatch_calls = []
         self.factory_calls = []
@@ -111,6 +112,8 @@ class FakeNativeBridge:
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        if self.exit_error is not None:
+            raise self.exit_error
         return None
 
     def trusted(self):
@@ -122,6 +125,8 @@ class FakeNativeBridge:
 
     def dispatch_transport(self, operation, expected_project):
         self.dispatch_calls.append((operation, expected_project))
+        if isinstance(self.action, Exception):
+            raise self.action
         return dict(self.action)
 
 
@@ -148,7 +153,12 @@ class StubMacOSBackend(adapter_module.MacOSAccessibilityBackend):
                 "frontmost": False,
             }
         if self.legacy_state is not None:
-            return json.loads(json.dumps(self.legacy_state))
+            state = json.loads(json.dumps(self.legacy_state))
+            if "const INCLUDE_CONTROLS = false;" in source:
+                state["controls"] = []
+                state["transport_controls_observed"] = False
+                state["transport_controls_complete"] = False
+            return state
         raise AssertionError("legacy JXA snapshot should not be called")
 
 
@@ -279,6 +289,11 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         observed = backend.snapshot(include_controls=True)
         self.assertEqual(observed["accessibility_backend"], "SystemEvents")
         self.assertEqual(observed["native_accessibility_diagnostic"], "native_ax_bridge_error:ValueError")
+        self.assertEqual(observed["control_tree_diagnostic"], "native_ax_bridge_error:ValueError")
+        self.assertFalse(observed["transport_controls_observed"])
+        self.assertFalse(observed["transport_controls_complete"])
+        self.assertNotIn("transport.state", adapter_module.runtime_capabilities(observed))
+        self.assertIn("const INCLUDE_CONTROLS = false;", backend.jxa_calls[1][0])
 
     def test_native_ax_dispatch_rebinds_the_same_process_before_action(self):
         native_state = snapshot(self.project, window_discovery_source="AXUIElement.AXWindows")
@@ -302,6 +317,65 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(native.dispatch_calls, [("transport.play", self.project)])
         self.assertEqual(native.factory_calls, [(4242, 10.0)])
 
+    def test_native_ax_dispatch_type_error_stops_before_legacy_action(self):
+        def invalid_bridge(process_identifier, timeout_seconds):
+            raise TypeError(f"invalid pointer for {process_identifier} within {timeout_seconds}")
+
+        backend = StubMacOSBackend(invalid_bridge, snapshot(self.project))
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            backend.dispatch_transport(
+                "transport.play",
+                self.project,
+                "com.apple.mobilelogic",
+                4242,
+            )
+        self.assertEqual(caught.exception.kind, "native_ax_bridge_failed")
+        self.assertTrue(caught.exception.definitive)
+        self.assertEqual(len(backend.jxa_calls), 1)
+
+    def test_native_ax_action_exception_is_unknown_and_never_retried(self):
+        for exception in (
+            AttributeError("native action response is unavailable"),
+            OSError("native action connection failed"),
+        ):
+            with self.subTest(exception=type(exception).__name__):
+                native = FakeNativeBridge(
+                    snapshot(self.project, window_discovery_source="AXUIElement.AXWindows"),
+                    action=exception,
+                )
+                backend = StubMacOSBackend(native, snapshot(self.project))
+                with self.assertRaises(adapter_module.AdapterFailure) as caught:
+                    backend.dispatch_transport(
+                        "transport.play",
+                        self.project,
+                        "com.apple.mobilelogic",
+                        4242,
+                    )
+                self.assertEqual(caught.exception.kind, "native_ax_bridge_failed")
+                self.assertFalse(caught.exception.definitive)
+                self.assertTrue(caught.exception.may_have_dispatched)
+                self.assertEqual(native.dispatch_calls, [("transport.play", self.project)])
+                self.assertEqual(len(backend.jxa_calls), 1)
+
+    def test_native_ax_context_exit_exception_after_action_is_unknown(self):
+        native = FakeNativeBridge(
+            snapshot(self.project, window_discovery_source="AXUIElement.AXWindows"),
+            exit_error=TypeError("native bridge cleanup failed"),
+        )
+        backend = StubMacOSBackend(native, snapshot(self.project))
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            backend.dispatch_transport(
+                "transport.play",
+                self.project,
+                "com.apple.mobilelogic",
+                4242,
+            )
+        self.assertEqual(caught.exception.kind, "native_ax_bridge_failed")
+        self.assertFalse(caught.exception.definitive)
+        self.assertTrue(caught.exception.may_have_dispatched)
+        self.assertEqual(native.dispatch_calls, [("transport.play", self.project)])
+        self.assertEqual(len(backend.jxa_calls), 1)
+
     def test_native_ax_source_is_bounded_and_does_not_activate_logic(self):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("AXUIElementSetMessagingTimeout", source)
@@ -310,6 +384,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertIn("MAX_CONTROLS = 4000", source)
         self.assertIn("MAX_DEPTH = 32", source)
         self.assertIn("native_ax_main_window_unavailable", source)
+        self.assertNotIn("strict=True", source)
         self.assertNotIn("process.frontmost = true", adapter_module.PROCESS_SNAPSHOT_JXA)
         self.assertEqual(adapter_module.ax_error_name(-25204), "cannot_complete")
 
