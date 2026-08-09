@@ -23,7 +23,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.1.4"
+ADAPTER_VERSION = "0.2.0"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -97,16 +97,16 @@ function asElementArray(value) {
   return [value];
 }
 
-function discoverProcessWindows(process) {
+function completeProcessWindows(process) {
   let directWindows = null;
   try { directWindows = process.windows(); } catch (_) { directWindows = null; }
   if (directWindows !== null && directWindows.length > 0) {
-    return {windows: directWindows, source: "process.windows", complete: true, accessibility_authorized: true};
+    return {windows: directWindows, source: "process.windows"};
   }
 
   const attributeWindows = asElementArray(axValue(process, "AXWindows"));
   if (attributeWindows.length > 0) {
-    return {windows: attributeWindows, source: "AXWindows", complete: true, accessibility_authorized: true};
+    return {windows: attributeWindows, source: "AXWindows"};
   }
 
   let directChildren = null;
@@ -116,26 +116,141 @@ function discoverProcessWindows(process) {
       try { return String(element.role()) === "AXWindow"; } catch (_) { return false; }
     });
     if (childWindows.length > 0) {
-      return {windows: childWindows, source: "process.uiElements.AXWindow", complete: true, accessibility_authorized: true};
+      return {windows: childWindows, source: "process.uiElements.AXWindow"};
     }
   }
 
-  const mainWindow = axValue(process, "AXMainWindow");
-  if (mainWindow !== null) {
-    return {windows: [mainWindow], source: "AXMainWindow", complete: false, accessibility_authorized: true};
-  }
-  const focusedWindow = axValue(process, "AXFocusedWindow");
-  if (focusedWindow !== null) {
-    return {windows: [focusedWindow], source: "AXFocusedWindow", complete: false, accessibility_authorized: true};
+  return {windows: [], source: null, accessibility_authorized: directWindows !== null || directChildren !== null};
+}
+
+function frontmostProcess(systemEvents) {
+  try {
+    const processes = systemEvents.applicationProcesses.whose({frontmost: true})();
+    if (processes && processes.length > 0) return processes[0];
+  } catch (_) {}
+  try {
+    const processes = systemEvents.applicationProcesses();
+    for (let i = 0; i < processes.length; i++) {
+      try { if (Boolean(processes[i].frontmost())) return processes[i]; } catch (_) {}
+    }
+  } catch (_) {}
+  return null;
+}
+
+function restoreWindowDiscoveryFocus(discovery) {
+  if (!discovery.focus_temporarily_changed || discovery.previous_frontmost_process === null) return;
+  try {
+    discovery.previous_frontmost_process.frontmost = true;
+    delay(0.05);
+  } catch (_) {}
+}
+
+function discoverProcessWindows(systemEvents, process) {
+  let frontmostBefore = null;
+  try { frontmostBefore = Boolean(process.frontmost()); } catch (_) {}
+  const passive = completeProcessWindows(process);
+  if (passive.windows.length > 0) {
+    return {
+      windows: passive.windows,
+      source: passive.source,
+      complete: true,
+      accessibility_authorized: true,
+      diagnostic: null,
+      frontmost_before: frontmostBefore,
+      focus_temporarily_changed: false,
+      previous_frontmost_process: null
+    };
   }
 
-  const authorized = directWindows !== null || directChildren !== null;
+  let mainWindow = axValue(process, "AXMainWindow");
+  let focusedWindow = axValue(process, "AXFocusedWindow");
+  const accessibilityAuthorized = passive.accessibility_authorized || mainWindow !== null || focusedWindow !== null;
+  let diagnostic = accessibilityAuthorized ? "complete_window_set_not_exposed" : "accessibility_not_authorized";
+  let previousFrontmost = null;
+  let focusChanged = false;
+  if (accessibilityAuthorized && frontmostBefore === false) {
+    previousFrontmost = frontmostProcess(systemEvents);
+    if (previousFrontmost === null) {
+      diagnostic = "frontmost_retry_skipped_no_restore_target";
+    } else {
+      let sameProcess = false;
+      try { sameProcess = Number(previousFrontmost.unixId()) === Number(process.unixId()); } catch (_) {}
+      if (sameProcess) {
+        previousFrontmost = null;
+        diagnostic = "frontmost_retry_skipped_no_distinct_restore_target";
+      } else {
+        try {
+          process.frontmost = true;
+          delay(0.2);
+          focusChanged = true;
+        } catch (_) {
+          diagnostic = "frontmost_retry_activation_failed";
+        }
+      }
+      if (focusChanged) {
+        const foreground = completeProcessWindows(process);
+        if (foreground.windows.length > 0) {
+          return {
+            windows: foreground.windows,
+            source: "frontmost-retry." + foreground.source,
+            complete: true,
+            accessibility_authorized: true,
+            diagnostic: null,
+            frontmost_before: frontmostBefore,
+            focus_temporarily_changed: true,
+            previous_frontmost_process: previousFrontmost
+          };
+        }
+        diagnostic = "frontmost_retry_no_complete_window_set";
+        mainWindow = axValue(process, "AXMainWindow");
+        focusedWindow = axValue(process, "AXFocusedWindow");
+      }
+    }
+  }
+
+  if (mainWindow !== null) {
+    return {
+      windows: [mainWindow], source: "AXMainWindow", complete: false, accessibility_authorized: true,
+      diagnostic: diagnostic, frontmost_before: frontmostBefore, focus_temporarily_changed: focusChanged,
+      previous_frontmost_process: previousFrontmost
+    };
+  }
+  if (focusedWindow !== null) {
+    return {
+      windows: [focusedWindow], source: "AXFocusedWindow", complete: false, accessibility_authorized: true,
+      diagnostic: diagnostic, frontmost_before: frontmostBefore, focus_temporarily_changed: focusChanged,
+      previous_frontmost_process: previousFrontmost
+    };
+  }
+
   return {
     windows: [],
-    source: authorized ? "process.windows" : null,
-    complete: authorized,
-    accessibility_authorized: authorized
+    source: passive.accessibility_authorized ? "process.windows" : null,
+    complete: passive.accessibility_authorized,
+    accessibility_authorized: accessibilityAuthorized,
+    diagnostic: diagnostic,
+    frontmost_before: frontmostBefore,
+    focus_temporarily_changed: focusChanged,
+    previous_frontmost_process: previousFrontmost
   };
+}
+
+function boundedDescendants(root, maxElements, maxDepth) {
+  const first = axValue(root, "AXChildren");
+  if (first === null) return {elements: [], observed: false, truncated: false};
+  const queue = asElementArray(first).map(element => ({element: element, depth: 1}));
+  const elements = [];
+  let truncated = false;
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (elements.length >= maxElements) { truncated = true; break; }
+    elements.push(item.element);
+    const children = asElementArray(axValue(item.element, "AXChildren"));
+    if (children.length === 0) continue;
+    if (item.depth >= maxDepth) { truncated = true; continue; }
+    for (let i = 0; i < children.length; i++) queue.push({element: children[i], depth: item.depth + 1});
+  }
+  return {elements: elements, observed: true, truncated: truncated || queue.length > 0};
 }
 '''
 
@@ -155,47 +270,46 @@ function run() {
   const systemEvents = Application("/System/Library/CoreServices/System Events.app");
   const discovered = findLogicProcess(systemEvents, null);
   if (discovered === null) {
-    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, transport_controls_observed: false, windows: [], controls: []});
+    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, window_discovery_source: null, window_discovery_diagnostic: "logic_process_not_found", window_set_complete: false, focus_temporarily_changed: false, transport_controls_observed: false, transport_controls_complete: false, windows: [], controls: []});
   }
   const process = discovered.process;
-  const windowDiscovery = discoverProcessWindows(process);
-  const windows = windowDiscovery.windows;
-  if (!windowDiscovery.accessibility_authorized) {
-    return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, transport_controls_observed: false, windows: [], controls: []});
-  }
-  let mainWindow = null;
-  for (let i = 0; i < windows.length; i++) {
-    if (safe(() => Boolean(attr(windows[i], "AXMain")), false)) { mainWindow = windows[i]; break; }
-  }
-  if (mainWindow === null && windows.length > 0) mainWindow = windows[0];
-  const windowRows = [];
-  let modal = false;
-  for (let i = 0; i < windows.length; i++) {
-    const subrole = text(safe(() => windows[i].subrole(), null));
-    const sheets = safe(() => windows[i].sheets(), []);
-    const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
-    if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) modal = true;
-    windowRows.push({
-      title: text(safe(() => windows[i].name(), null)),
-      role: text(safe(() => windows[i].role(), null)),
-      subrole: subrole,
-      document: text(attr(windows[i], "AXDocument")),
-      main: Boolean(attr(windows[i], "AXMain")),
-      modal: isModal,
-      sheet_count: sheets ? sheets.length : 0
-    });
-  }
-  const controls = [];
-  let controlCount = 0;
-  let controlsObserved = false;
-  if (mainWindow !== null && INCLUDE_CONTROLS) {
-    const contents = safe(() => mainWindow.entireContents(), null);
-    if (contents !== null) {
-      controlsObserved = true;
-      controlCount = contents.length;
-      const bounded = contents.slice(0, 4000);
-      for (let i = 0; i < bounded.length; i++) {
-        const element = bounded[i];
+  const windowDiscovery = discoverProcessWindows(systemEvents, process);
+  try {
+    const windows = windowDiscovery.windows;
+    if (!windowDiscovery.accessibility_authorized) {
+      return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, window_discovery_source: null, window_discovery_diagnostic: windowDiscovery.diagnostic, window_set_complete: false, focus_temporarily_changed: windowDiscovery.focus_temporarily_changed, transport_controls_observed: false, transport_controls_complete: false, windows: [], controls: []});
+    }
+    let mainWindow = null;
+    for (let i = 0; i < windows.length; i++) {
+      if (safe(() => Boolean(attr(windows[i], "AXMain")), false)) { mainWindow = windows[i]; break; }
+    }
+    if (mainWindow === null && windows.length > 0) mainWindow = windows[0];
+    const windowRows = [];
+    let modal = false;
+    for (let i = 0; i < windows.length; i++) {
+      const subrole = text(safe(() => windows[i].subrole(), null));
+      const sheets = safe(() => windows[i].sheets(), []);
+      const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
+      if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) modal = true;
+      windowRows.push({
+        title: text(safe(() => windows[i].name(), null)),
+        role: text(safe(() => windows[i].role(), null)),
+        subrole: subrole,
+        document: text(attr(windows[i], "AXDocument")),
+        main: Boolean(attr(windows[i], "AXMain")),
+        modal: isModal,
+        sheet_count: sheets ? sheets.length : 0
+      });
+    }
+    const controls = [];
+    let controlsObserved = false;
+    let controlsTruncated = false;
+    if (mainWindow !== null && INCLUDE_CONTROLS) {
+      const traversal = boundedDescendants(mainWindow, 4000, 32);
+      controlsObserved = traversal.observed;
+      controlsTruncated = traversal.truncated;
+      for (let i = 0; i < traversal.elements.length; i++) {
+        const element = traversal.elements[i];
         const role = text(safe(() => element.role(), null));
         if (!SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(role) && !["AXRadioButton", "AXTextField", "AXStaticText"].includes(role)) continue;
         const actions = safe(() => element.actions(), []);
@@ -211,21 +325,27 @@ function run() {
         });
       }
     }
+    return JSON.stringify({
+      ok: true,
+      logic_running: true,
+      bundle_identifier: discovered.bundle_identifier,
+      accessibility_authorized: true,
+      frontmost: windowDiscovery.frontmost_before,
+      modal_dialog: modal ? true : (windowDiscovery.complete ? false : null),
+      window_discovery_source: windowDiscovery.source,
+      window_discovery_diagnostic: windowDiscovery.diagnostic,
+      window_set_complete: windowDiscovery.complete,
+      focus_temporarily_changed: windowDiscovery.focus_temporarily_changed,
+      transport_controls_observed: controlsObserved,
+      transport_controls_complete: controlsObserved && !controlsTruncated,
+      control_tree_source: controlsObserved ? "bounded-AXChildren" : null,
+      windows: windowRows,
+      controls: controls,
+      controls_truncated: controlsTruncated
+    });
+  } finally {
+    restoreWindowDiscoveryFocus(windowDiscovery);
   }
-  return JSON.stringify({
-    ok: true,
-    logic_running: true,
-    bundle_identifier: discovered.bundle_identifier,
-    accessibility_authorized: true,
-    frontmost: safe(() => Boolean(process.frontmost()), null),
-    modal_dialog: modal ? true : (windowDiscovery.complete ? false : null),
-    window_discovery_source: windowDiscovery.source,
-    window_set_complete: windowDiscovery.complete,
-    transport_controls_observed: controlsObserved,
-    windows: windowRows,
-    controls: controls,
-    controls_truncated: controlsObserved && controlCount > 4000
-  });
 }
 '''
 
@@ -267,57 +387,65 @@ function run() {
   const discovered = findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID);
   if (discovered === null) return JSON.stringify({ok: false, definitive: true, reason: "logic_not_running"});
   const process = discovered.process;
-  const windowDiscovery = discoverProcessWindows(process);
-  const windows = windowDiscovery.windows;
-  if (!windowDiscovery.accessibility_authorized) return JSON.stringify({ok: false, definitive: true, reason: "accessibility_not_authorized"});
-  let mainWindow = null;
-  for (let i = 0; i < windows.length; i++) {
-    const sheets = safe(() => windows[i].sheets(), []);
-    const subrole = text(safe(() => windows[i].subrole(), null));
-    const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
-    if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) return JSON.stringify({ok: false, definitive: true, reason: "modal_dialog_present"});
-    if (mainWindow === null && Boolean(attr(windows[i], "AXMain"))) mainWindow = windows[i];
+  const windowDiscovery = discoverProcessWindows(systemEvents, process);
+  try {
+    const windows = windowDiscovery.windows;
+    if (!windowDiscovery.accessibility_authorized) return JSON.stringify({ok: false, definitive: true, reason: "accessibility_not_authorized"});
+    let mainWindow = null;
+    for (let i = 0; i < windows.length; i++) {
+      const sheets = safe(() => windows[i].sheets(), []);
+      const subrole = text(safe(() => windows[i].subrole(), null));
+      const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
+      if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) return JSON.stringify({ok: false, definitive: true, reason: "modal_dialog_present"});
+      if (mainWindow === null && Boolean(attr(windows[i], "AXMain"))) mainWindow = windows[i];
+    }
+    if (!windowDiscovery.complete) return JSON.stringify({ok: false, definitive: true, reason: "window_set_incomplete", diagnostic: windowDiscovery.diagnostic});
+    if (mainWindow === null && windows.length > 0) mainWindow = windows[0];
+    if (mainWindow === null) return JSON.stringify({ok: false, definitive: true, reason: "project_window_not_found"});
+    const expectedName = basename(EXPECTED_PROJECT);
+    const documentValue = text(attr(mainWindow, "AXDocument"));
+    const windowTitle = text(safe(() => mainWindow.name(), null));
+    if (documentValue) {
+      if (basename(documentValue) !== expectedName) return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
+    } else if (windowTitle === null) {
+      return JSON.stringify({ok: false, definitive: true, reason: "project_identity_unavailable", diagnostic: "main_window_has_no_document_or_title"});
+    } else if (windowTitle !== expectedName) {
+      return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
+    }
+    const traversal = boundedDescendants(mainWindow, 4000, 32);
+    if (!traversal.observed) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_unavailable"});
+    if (traversal.truncated) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_truncated"});
+    const transportControls = traversal.elements.filter(element => SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(text(safe(() => element.role(), null))));
+    const playLabels = ["play", "再生"];
+    const stopLabels = ["stop", "停止"];
+    const beginningLabels = ["go to beginning", "先頭へ移動", "先頭に移動"];
+    const playControls = transportControls.filter(element => matches(element, playLabels));
+    const stopControls = transportControls.filter(element => matches(element, stopLabels));
+    const beginningControls = transportControls.filter(element => matches(element, beginningLabels));
+    const play = playControls.length > 0 ? playControls[0] : null;
+    const stop = stopControls.length > 0 ? stopControls[0] : null;
+    const beginning = beginningControls.length > 0 ? beginningControls[0] : null;
+    let playing = play ? truth(safe(() => play.value(), null)) : null;
+    if (playing === null && stop && !beginning) playing = true;
+    if (playing === null && beginning && !stop) playing = false;
+    if (playing === null) return JSON.stringify({ok: false, definitive: true, reason: "transport_state_not_observable"});
+    const wantsPlaying = REQUESTED_OPERATION === "transport.play";
+    if (playing === wantsPlaying) return JSON.stringify({ok: true, performed: false, already_satisfied: true, window_discovery_source: windowDiscovery.source, before: {is_playing: playing}});
+    const targetCandidates = wantsPlaying ? playControls : stopControls;
+    if (targetCandidates.length === 0) return JSON.stringify({ok: false, definitive: true, reason: wantsPlaying ? "play_control_not_found" : "stop_control_not_found"});
+    const target = targetCandidates.find(element => {
+      const candidateActions = safe(() => element.actions(), []);
+      return candidateActions.some(action => text(safe(() => action.name(), null)) === "AXPress");
+    });
+    if (!target) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
+    const actions = safe(() => target.actions(), []);
+    const press = actions.find(action => text(safe(() => action.name(), null)) === "AXPress");
+    if (!press) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
+    press.perform();
+    return JSON.stringify({ok: true, performed: true, already_satisfied: false, bundle_identifier: discovered.bundle_identifier, window_discovery_source: windowDiscovery.source, before: {is_playing: playing}});
+  } finally {
+    restoreWindowDiscoveryFocus(windowDiscovery);
   }
-  if (!windowDiscovery.complete) return JSON.stringify({ok: false, definitive: true, reason: "window_set_incomplete"});
-  if (mainWindow === null && windows.length > 0) mainWindow = windows[0];
-  if (mainWindow === null) return JSON.stringify({ok: false, definitive: true, reason: "project_window_not_found"});
-  const expectedName = basename(EXPECTED_PROJECT);
-  const documentValue = text(attr(mainWindow, "AXDocument"));
-  const windowTitle = text(safe(() => mainWindow.name(), null));
-  if (documentValue) {
-    if (basename(documentValue) !== expectedName) return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
-  } else if (windowTitle !== expectedName) {
-    return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
-  }
-  const contents = safe(() => mainWindow.entireContents(), []).slice(0, 4000);
-  const transportControls = contents.filter(element => SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(text(safe(() => element.role(), null))));
-  const playLabels = ["play", "再生"];
-  const stopLabels = ["stop", "停止"];
-  const beginningLabels = ["go to beginning", "先頭へ移動", "先頭に移動"];
-  const playControls = transportControls.filter(element => matches(element, playLabels));
-  const stopControls = transportControls.filter(element => matches(element, stopLabels));
-  const beginningControls = transportControls.filter(element => matches(element, beginningLabels));
-  const play = playControls.length > 0 ? playControls[0] : null;
-  const stop = stopControls.length > 0 ? stopControls[0] : null;
-  const beginning = beginningControls.length > 0 ? beginningControls[0] : null;
-  let playing = play ? truth(safe(() => play.value(), null)) : null;
-  if (playing === null && stop && !beginning) playing = true;
-  if (playing === null && beginning && !stop) playing = false;
-  if (playing === null) return JSON.stringify({ok: false, definitive: true, reason: "transport_state_not_observable"});
-  const wantsPlaying = REQUESTED_OPERATION === "transport.play";
-  if (playing === wantsPlaying) return JSON.stringify({ok: true, performed: false, already_satisfied: true, window_discovery_source: windowDiscovery.source, before: {is_playing: playing}});
-  const targetCandidates = wantsPlaying ? playControls : stopControls;
-  if (targetCandidates.length === 0) return JSON.stringify({ok: false, definitive: true, reason: wantsPlaying ? "play_control_not_found" : "stop_control_not_found"});
-  const target = targetCandidates.find(element => {
-    const candidateActions = safe(() => element.actions(), []);
-    return candidateActions.some(action => text(safe(() => action.name(), null)) === "AXPress");
-  });
-  if (!target) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
-  const actions = safe(() => target.actions(), []);
-  const press = actions.find(action => text(safe(() => action.name(), null)) === "AXPress");
-  if (!press) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
-  press.perform();
-  return JSON.stringify({ok: true, performed: true, already_satisfied: false, bundle_identifier: discovered.bundle_identifier, window_discovery_source: windowDiscovery.source, before: {is_playing: playing}});
 }
 '''
 
@@ -434,12 +562,23 @@ def main_window(snapshot: dict[str, Any]) -> dict[str, Any] | None:
 def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     window = main_window(snapshot)
     if window is None:
-        return {"current_project": None, "current_project_unavailable": True, "window_project_name": None}
+        return {
+            "current_project": None,
+            "current_project_unavailable": True,
+            "current_project_unavailable_reason": "project_window_not_found",
+            "window_project_name": None,
+            "project_identity_source": None,
+        }
     current = normalize_document_path(window.get("document"))
+    title = window.get("title") if isinstance(window.get("title"), str) else None
     return {
         "current_project": current,
         "current_project_unavailable": current is None,
-        "window_project_name": window.get("title") if isinstance(window.get("title"), str) else None,
+        "current_project_unavailable_reason": (
+            None if current is not None else "document_path_not_exposed" if title else "main_window_has_no_document_or_title"
+        ),
+        "window_project_name": title,
+        "project_identity_source": "AXDocument" if current is not None else "AXTitle" if title else None,
     }
 
 
@@ -450,7 +589,11 @@ def runtime_capabilities(snapshot: dict[str, Any]) -> list[str]:
     if main_window(snapshot) is not None:
         capabilities.append("project.current")
     transport = transport_from_controls(snapshot.get("controls"))
-    if snapshot.get("transport_controls_observed") is True and transport["is_playing"] is not None:
+    if (
+        snapshot.get("transport_controls_observed") is True
+        and snapshot.get("transport_controls_complete") is True
+        and transport["is_playing"] is not None
+    ):
         capabilities.append("transport.state")
         if snapshot.get("window_set_complete") is True:
             if transport["is_playing"] is True or transport["play_control_available"]:
@@ -492,6 +635,13 @@ def assert_project_binding(snapshot: dict[str, Any], expected_project: str) -> N
         if current != expected:
             raise AdapterFailure("project_mismatch", "current Logic project does not match preflight", definitive=True)
         return
+    if project["window_project_name"] is None:
+        reason = project["current_project_unavailable_reason"]
+        raise AdapterFailure(
+            "project_identity_unavailable",
+            f"Logic main window does not expose a project document or title: {reason}",
+            definitive=True,
+        )
     if project["window_project_name"] != Path(expected).name:
         raise AdapterFailure("project_mismatch", "Logic window title does not exactly match expected .logicx name", definitive=True)
 
@@ -585,9 +735,12 @@ class MacOSAccessibilityBackend:
         result = self._run_jxa(source, may_dispatch=True)
         if result.get("ok") is not True:
             definitive = result.get("definitive") is True
+            reason = str(result.get("reason") or "dispatch_failed")
+            diagnostic = result.get("diagnostic")
+            message = f"{reason}: {diagnostic}" if isinstance(diagnostic, str) and diagnostic else reason
             raise AdapterFailure(
-                str(result.get("reason") or "dispatch_failed"),
-                str(result.get("reason") or "Logic rejected the operation"),
+                reason,
+                message,
                 definitive=definitive,
                 may_have_dispatched=not definitive,
             )
@@ -643,24 +796,33 @@ class ReferenceAdapter:
                 "modal_dialog": snapshot.get("modal_dialog") if snapshot.get("logic_running") is True else None,
                 "frontmost": snapshot.get("frontmost"),
                 "window_discovery_source": snapshot.get("window_discovery_source"),
+                "window_discovery_diagnostic": snapshot.get("window_discovery_diagnostic"),
                 "window_set_complete": snapshot.get("window_set_complete") is True,
+                "focus_temporarily_changed": snapshot.get("focus_temporarily_changed") is True,
                 "transport_controls_observed": snapshot.get("transport_controls_observed") is True,
+                "transport_controls_complete": snapshot.get("transport_controls_complete") is True,
                 "capabilities": runtime_capabilities(snapshot),
             }
         elif operation == "project.current":
             data = project
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
+            data["window_discovery_diagnostic"] = snapshot.get("window_discovery_diagnostic")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
+            data["focus_temporarily_changed"] = snapshot.get("focus_temporarily_changed") is True
             data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True
+            data["transport_controls_complete"] = snapshot.get("transport_controls_complete") is True
             data["capabilities"] = runtime_capabilities(snapshot)
         else:
             data = transport
             data.update(project)
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
+            data["window_discovery_diagnostic"] = snapshot.get("window_discovery_diagnostic")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
+            data["focus_temporarily_changed"] = snapshot.get("focus_temporarily_changed") is True
             data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True
+            data["transport_controls_complete"] = snapshot.get("transport_controls_complete") is True
             data["capabilities"] = runtime_capabilities(snapshot)
         return {"ok": True, **common, "data": data}
 
@@ -677,7 +839,12 @@ class ReferenceAdapter:
             if snapshot.get("accessibility_authorized") is not True:
                 raise AdapterFailure("accessibility_not_authorized", "Accessibility permission is not confirmed", definitive=True)
             if snapshot.get("window_set_complete") is not True:
-                raise AdapterFailure("window_set_incomplete", "complete Logic window set is not confirmed", definitive=True)
+                diagnostic = snapshot.get("window_discovery_diagnostic") or "cause_unavailable"
+                raise AdapterFailure(
+                    "window_set_incomplete",
+                    f"complete Logic window set is not confirmed: {diagnostic}",
+                    definitive=True,
+                )
             if snapshot.get("modal_dialog") is not False:
                 raise AdapterFailure("modal_dialog_present", "Logic modal state is unsafe or unknown", definitive=True)
             bundle_identifier = snapshot.get("bundle_identifier")
@@ -685,6 +852,18 @@ class ReferenceAdapter:
                 raise AdapterFailure("unsupported_logic_bundle", "running Logic bundle identifier is unsupported", definitive=True)
             expected_project = request["expected_project"]
             assert_project_binding(snapshot, expected_project)
+            if snapshot.get("transport_controls_observed") is not True:
+                raise AdapterFailure(
+                    "transport_control_tree_unavailable",
+                    "Logic main window does not expose a transport control tree",
+                    definitive=True,
+                )
+            if snapshot.get("transport_controls_complete") is not True:
+                raise AdapterFailure(
+                    "transport_control_tree_truncated",
+                    "Logic transport control tree exceeded the bounded traversal limit",
+                    definitive=True,
+                )
             capabilities = runtime_capabilities(snapshot)
             if operation not in capabilities or "transport.state" not in capabilities:
                 raise AdapterFailure("capability_unavailable", "operation or independent readback is unavailable", definitive=True)

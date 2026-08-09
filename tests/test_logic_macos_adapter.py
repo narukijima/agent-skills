@@ -59,8 +59,11 @@ def snapshot(
         "modal_dialog": False,
         "frontmost": True,
         "window_discovery_source": window_discovery_source,
+        "window_discovery_diagnostic": None,
         "window_set_complete": window_set_complete,
+        "focus_temporarily_changed": False,
         "transport_controls_observed": True,
+        "transport_controls_complete": True,
         "windows": [{"title": Path(project).name, "document": project, "main": True}],
         "controls": controls,
     }
@@ -79,6 +82,7 @@ class FakeBackend:
         if not include_controls:
             state["controls"] = []
             state["transport_controls_observed"] = False
+            state["transport_controls_complete"] = False
         return state
 
     def dispatch_transport(self, operation, expected_project, bundle_identifier):
@@ -123,8 +127,11 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertFalse(result["data"]["is_playing"])
         self.assertEqual(result["data"]["bundle_identifier"], "com.apple.mobilelogic")
         self.assertEqual(result["data"]["window_discovery_source"], "process.windows")
+        self.assertIsNone(result["data"]["window_discovery_diagnostic"])
         self.assertTrue(result["data"]["window_set_complete"])
+        self.assertFalse(result["data"]["focus_temporarily_changed"])
         self.assertTrue(result["data"]["transport_controls_observed"])
+        self.assertTrue(result["data"]["transport_controls_complete"])
         self.assertIn("transport.play", result["data"]["capabilities"])
         self.assertIn("transport.stop", result["data"]["capabilities"])
 
@@ -133,6 +140,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         result = adapter_module.ReferenceAdapter(backend).observe("app.status")
         self.assertEqual(backend.snapshot_calls, [False])
         self.assertFalse(result["data"]["transport_controls_observed"])
+        self.assertFalse(result["data"]["transport_controls_complete"])
         self.assertEqual(result["data"]["capabilities"], ["app.status", "project.current"])
 
     def test_project_current_defers_transport_control_traversal(self):
@@ -150,6 +158,9 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertIn("const INCLUDE_CONTROLS = false;", lightweight_source)
         self.assertIn("mainWindow !== null && INCLUDE_CONTROLS", lightweight_source)
         self.assertIn("transport_controls_observed: controlsObserved", lightweight_source)
+        self.assertIn("boundedDescendants(mainWindow, 4000, 32)", lightweight_source)
+        self.assertIn("transport_controls_complete: controlsObserved && !controlsTruncated", lightweight_source)
+        self.assertNotIn("entireContents()", lightweight_source)
 
     def test_foreground_empty_window_snapshot_fails_closed(self):
         state = snapshot(self.project)
@@ -161,7 +172,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertIsNone(observed["data"]["current_project"])
         self.assertEqual(observed["data"]["capabilities"], ["app.status"])
         dispatched = adapter.dispatch(preflight("transport.play", self.project))
-        self.assertEqual(dispatched["error"]["kind"], "project_mismatch")
+        self.assertEqual(dispatched["error"]["kind"], "project_identity_unavailable")
 
     def test_complete_axwindows_fallback_restores_project_transport_and_dispatch(self):
         state = snapshot(self.project, window_discovery_source="AXWindows")
@@ -191,6 +202,67 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertNotIn("transport.play", observed["data"]["capabilities"])
         dispatched = adapter.dispatch(preflight("transport.play", self.project))
         self.assertEqual(dispatched["error"]["kind"], "window_set_incomplete")
+        self.assertEqual(backend.dispatch_calls, [])
+
+    def test_frontmost_retry_complete_snapshot_restores_full_runtime_capabilities(self):
+        state = snapshot(
+            self.project,
+            window_discovery_source="frontmost-retry.process.windows",
+            window_set_complete=True,
+        )
+        state["frontmost"] = False
+        state["focus_temporarily_changed"] = True
+        adapter = adapter_module.ReferenceAdapter(FakeBackend(state))
+        observed = adapter.observe("transport.state")
+        self.assertFalse(observed["data"]["window_discovery_diagnostic"])
+        self.assertTrue(observed["data"]["focus_temporarily_changed"])
+        self.assertTrue(observed["data"]["window_set_complete"])
+        self.assertEqual(observed["data"]["current_project"], str(Path(self.project).resolve()))
+        self.assertIn("transport.play", observed["data"]["capabilities"])
+
+    def test_incomplete_control_tree_withholds_state_and_writes(self):
+        state = snapshot(self.project)
+        state["controls_truncated"] = True
+        state["transport_controls_complete"] = False
+        backend = FakeBackend(state)
+        adapter = adapter_module.ReferenceAdapter(backend)
+        observed = adapter.observe("transport.state")
+        self.assertTrue(observed["data"]["transport_controls_observed"])
+        self.assertFalse(observed["data"]["transport_controls_complete"])
+        self.assertNotIn("transport.state", observed["data"]["capabilities"])
+        dispatched = adapter.dispatch(preflight("transport.play", self.project))
+        self.assertEqual(dispatched["error"]["kind"], "transport_control_tree_truncated")
+        self.assertEqual(backend.dispatch_calls, [])
+
+    def test_missing_main_window_identity_reports_actionable_cause(self):
+        state = snapshot(
+            self.project,
+            window_discovery_source="AXMainWindow",
+            window_set_complete=False,
+        )
+        state["window_discovery_diagnostic"] = "frontmost_retry_no_complete_window_set"
+        state["windows"][0]["title"] = None
+        state["windows"][0]["document"] = None
+        observed = adapter_module.ReferenceAdapter(FakeBackend(state)).observe("project.current")
+        self.assertTrue(observed["data"]["current_project_unavailable"])
+        self.assertEqual(
+            observed["data"]["current_project_unavailable_reason"],
+            "main_window_has_no_document_or_title",
+        )
+        self.assertIsNone(observed["data"]["project_identity_source"])
+        self.assertEqual(
+            observed["data"]["window_discovery_diagnostic"],
+            "frontmost_retry_no_complete_window_set",
+        )
+
+    def test_complete_window_without_project_identity_has_specific_dispatch_failure(self):
+        state = snapshot(self.project)
+        state["windows"][0]["title"] = None
+        state["windows"][0]["document"] = None
+        backend = FakeBackend(state)
+        dispatched = adapter_module.ReferenceAdapter(backend).dispatch(preflight("transport.play", self.project))
+        self.assertEqual(dispatched["error"]["kind"], "project_identity_unavailable")
+        self.assertIn("main_window_has_no_document_or_title", dispatched["error"]["message"])
         self.assertEqual(backend.dispatch_calls, [])
 
     def test_japanese_control_labels_are_mapped_without_coordinates(self):
@@ -295,15 +367,21 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             "process.windows",
             "AXWindows",
             "process.uiElements.AXWindow",
+            "frontmost-retry.",
             "AXMainWindow",
             "AXFocusedWindow",
         ):
             self.assertIn(source, snapshot_source)
             self.assertIn(source, action_source)
-        self.assertIn("discoverProcessWindows(process)", snapshot_source)
-        self.assertIn("discoverProcessWindows(process)", action_source)
-        self.assertNotIn("process.entireContents()", adapter_module.WINDOW_DISCOVERY_JXA)
+        self.assertIn("discoverProcessWindows(systemEvents, process)", snapshot_source)
+        self.assertIn("discoverProcessWindows(systemEvents, process)", action_source)
+        self.assertIn("restoreWindowDiscoveryFocus(windowDiscovery)", snapshot_source)
+        self.assertIn("restoreWindowDiscoveryFocus(windowDiscovery)", action_source)
+        self.assertIn("process.frontmost = true", adapter_module.WINDOW_DISCOVERY_JXA)
+        self.assertNotIn("entireContents()", snapshot_source)
+        self.assertNotIn("entireContents()", action_source)
         self.assertIn('reason: "window_set_incomplete"', action_source)
+        self.assertIn('reason: "transport_control_tree_truncated"', action_source)
 
     def test_snapshot_and_action_jxa_share_supported_transport_control_roles(self):
         snapshot_source = adapter_module.render_jxa(adapter_module.SNAPSHOT_JXA)
