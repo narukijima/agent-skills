@@ -13,7 +13,7 @@
 
 ## 1. 位置づけ
 
-`scripts/logic_macos_adapter.py` は、このSkillに同梱する標準macOS Accessibilityアダプタである。外部package、座標、画像一致、Space keyのtoggleに依存せず、対応するLogic ProプロセスのAccessibility treeから状態と対象controlを特定する。
+`scripts/logic_macos_adapter.py` は、このSkillに同梱する標準macOS Accessibilityアダプタである。外部package、座標、画像一致、Space keyのtoggleに依存せず、対応するLogic ProプロセスのAccessibility treeから状態と対象controlを特定する。Control Barのtransport controlは、現行Logic Proで使われる `AXCheckBox` と従来layoutの `AXButton` を同じ意味境界で扱う。
 
 対応bundle identifierは `com.apple.mobilelogic`（Logic Pro 12系）と `com.apple.logic10`（従来版）である。静的capabilityとfresh observationへ対応一覧および実際に検出したidentifierを含める。observeで選んだidentifierはdispatch直前にも固定し、別のLogicプロセスへ切り替えない。
 
@@ -40,19 +40,19 @@ python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --opera
 python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --operation project.current
 ```
 
-`capabilities` は静的な実装表と `supported_bundle_identifiers`、`observe` の `data.capabilities` はその時点で実測できた操作一覧、`data.bundle_identifier` は実際に選んだLogic Proプロセスを返す。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport状態不明の場合、runtime一覧は安全側に縮小する。
+`capabilities` は静的な実装表、`supported_bundle_identifiers`、`supported_transport_control_roles` を返す。`observe` の `data.capabilities` はその時点で実測できた操作一覧、`data.bundle_identifier` は実際に選んだLogic Proプロセスを返す。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport状態不明、または意味labelに一致するcontrolが `AXPress` を持たない場合、runtime一覧は安全側に縮小する。
 
 ## 4. 対応表
 
-reference profile `logic-pro-macos-accessibility` version `0.1.1` の対応は次のとおり。
+reference profile `logic-pro-macos-accessibility` version `0.1.2` の対応は次のとおり。
 
 | 意味操作 | 対応 | 操作または独立読戻し |
 | --- | --- | --- |
 | `app.status` | 対応 | Logic起動、unlock、Accessibility、modal、frontmost、runtime capability |
 | `project.current` | 対応 | main windowの`AXDocument`。取得不能時はwindow titleを明示 |
-| `transport.state` | 対応 | Play controlのvalue、またはStop/Go to Beginning controlの排他的表示 |
-| `transport.play` | 対応 | 状態を再確認し、Play controlへ`AXPress`を一回 |
-| `transport.stop` | 対応 | 状態を再確認し、Stop controlへ`AXPress`を一回 |
+| `transport.state` | 対応 | `AXButton` / `AXCheckBox` Play controlのvalue、またはStop/Go to Beginning controlの排他的表示 |
+| `transport.play` | 対応 | 状態を再確認し、完全一致labelと`AXPress`を持つPlay controlへ一回 |
+| `transport.stop` | 対応 | 状態を再確認し、完全一致labelと`AXPress`を持つStop controlへ一回 |
 | `tracks.list` | 未対応 | 安定ID付きの全track読戻しを標準AX layoutで保証できない |
 | `track.selected` | 未対応 | 安定IDまたはindexの独立読戻しを保証できない |
 | `regions.list` | 未対応 | region一覧の安定した構造化AX表現を保証できない |
@@ -125,11 +125,11 @@ version名だけで互換を推測せず、更新後は実機で次をsmoke test
 3. Logic Pro 12系では `bundle_identifier` が `com.apple.mobilelogic`、従来版では `com.apple.logic10` になる。
 4. `project.current` のpath、またはfallback window titleが対象Projectと一致する。
 5. 停止中の `transport.state.data.is_playing` がfalse、再生中がtrueになる。
-6. `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
+6. `AXButton` と `AXCheckBox` の対応layoutで `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
 7. modal表示中、lock中、別Project、Control Bar非表示でdispatchが行われない。
 8. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
 
-repository testはLogicを動かさず、AX snapshot fixtureを使って全allowlistのsupport表、日英label、Project binding、fingerprint、timeout区別、独立readback境界を検証する。実機smokeはmacOS TCCとLogic UI状態を変更するため、利用者の明示的な実行環境で行う。
+repository testはLogicを動かさず、AX snapshot fixtureを使って全allowlistのsupport表、`AXButton` / `AXCheckBox`、日英label、`AXPress`、Project binding、fingerprint、timeout区別、独立readback境界を検証する。実機smokeはmacOS TCCとLogic UI状態を変更するため、利用者の明示的な実行環境で行う。
 
 ## 8. 設計上の境界
 

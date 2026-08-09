@@ -23,8 +23,9 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.1.1"
+ADAPTER_VERSION = "0.1.2"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
+SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
 
 READ_OPERATIONS = (
@@ -120,7 +121,7 @@ function run() {
     for (let i = 0; i < bounded.length; i++) {
       const element = bounded[i];
       const role = text(safe(() => element.role(), null));
-      if (!["AXButton", "AXCheckBox", "AXRadioButton", "AXTextField", "AXStaticText"].includes(role)) continue;
+      if (!SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(role) && !["AXRadioButton", "AXTextField", "AXStaticText"].includes(role)) continue;
       const actions = safe(() => element.actions(), []);
       controls.push({
         role: role,
@@ -206,21 +207,29 @@ function run() {
     return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
   }
   const contents = safe(() => mainWindow.entireContents(), []).slice(0, 4000);
-  const buttons = contents.filter(element => text(safe(() => element.role(), null)) === "AXButton");
+  const transportControls = contents.filter(element => SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(text(safe(() => element.role(), null))));
   const playLabels = ["play", "再生"];
   const stopLabels = ["stop", "停止"];
   const beginningLabels = ["go to beginning", "先頭へ移動", "先頭に移動"];
-  const play = buttons.find(element => matches(element, playLabels));
-  const stop = buttons.find(element => matches(element, stopLabels));
-  const beginning = buttons.find(element => matches(element, beginningLabels));
+  const playControls = transportControls.filter(element => matches(element, playLabels));
+  const stopControls = transportControls.filter(element => matches(element, stopLabels));
+  const beginningControls = transportControls.filter(element => matches(element, beginningLabels));
+  const play = playControls.length > 0 ? playControls[0] : null;
+  const stop = stopControls.length > 0 ? stopControls[0] : null;
+  const beginning = beginningControls.length > 0 ? beginningControls[0] : null;
   let playing = play ? truth(safe(() => play.value(), null)) : null;
   if (playing === null && stop && !beginning) playing = true;
   if (playing === null && beginning && !stop) playing = false;
   if (playing === null) return JSON.stringify({ok: false, definitive: true, reason: "transport_state_not_observable"});
   const wantsPlaying = REQUESTED_OPERATION === "transport.play";
   if (playing === wantsPlaying) return JSON.stringify({ok: true, performed: false, already_satisfied: true, before: {is_playing: playing}});
-  const target = wantsPlaying ? play : stop;
-  if (!target) return JSON.stringify({ok: false, definitive: true, reason: wantsPlaying ? "play_control_not_found" : "stop_control_not_found"});
+  const targetCandidates = wantsPlaying ? playControls : stopControls;
+  if (targetCandidates.length === 0) return JSON.stringify({ok: false, definitive: true, reason: wantsPlaying ? "play_control_not_found" : "stop_control_not_found"});
+  const target = targetCandidates.find(element => {
+    const candidateActions = safe(() => element.actions(), []);
+    return candidateActions.some(action => text(safe(() => action.name(), null)) === "AXPress");
+  });
+  if (!target) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
   const actions = safe(() => target.actions(), []);
   const press = actions.find(action => text(safe(() => action.name(), null)) === "AXPress");
   if (!press) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
@@ -249,6 +258,7 @@ def canonical_json(value: dict[str, Any]) -> bytes:
 def render_jxa(source: str, constants: dict[str, Any] | None = None) -> str:
     assignments = {
         "SUPPORTED_LOGIC_BUNDLE_IDS": list(SUPPORTED_LOGIC_BUNDLE_IDS),
+        "SUPPORTED_TRANSPORT_CONTROL_ROLES": list(SUPPORTED_TRANSPORT_CONTROL_ROLES),
         **(constants or {}),
     }
     prefix = "".join(f"const {name} = {json.dumps(value)};\n" for name, value in assignments.items())
@@ -300,10 +310,17 @@ def boolean_value(value: Any) -> bool | None:
 def transport_from_controls(controls: Any) -> dict[str, Any]:
     if not isinstance(controls, list):
         controls = []
-    buttons = [control for control in controls if isinstance(control, dict) and control.get("role") == "AXButton"]
-    play = next((control for control in buttons if matches_label(control, PLAY_LABELS)), None)
-    stop = next((control for control in buttons if matches_label(control, STOP_LABELS)), None)
-    beginning = next((control for control in buttons if matches_label(control, BEGINNING_LABELS)), None)
+    transport_controls = [
+        control
+        for control in controls
+        if isinstance(control, dict) and control.get("role") in SUPPORTED_TRANSPORT_CONTROL_ROLES
+    ]
+    play_controls = [control for control in transport_controls if matches_label(control, PLAY_LABELS)]
+    stop_controls = [control for control in transport_controls if matches_label(control, STOP_LABELS)]
+    beginning_controls = [control for control in transport_controls if matches_label(control, BEGINNING_LABELS)]
+    play = next(iter(play_controls), None)
+    stop = next(iter(stop_controls), None)
+    beginning = next(iter(beginning_controls), None)
     playing = boolean_value(play.get("value")) if play else None
     state_basis = "play-control-value" if playing is not None else None
     if playing is None and stop is not None and beginning is None:
@@ -315,8 +332,8 @@ def transport_from_controls(controls: Any) -> dict[str, Any]:
     return {
         "is_playing": playing,
         "state_basis": state_basis,
-        "play_control_available": play is not None and "AXPress" in play.get("actions", []),
-        "stop_control_available": stop is not None and "AXPress" in stop.get("actions", []),
+        "play_control_available": any("AXPress" in control.get("actions", []) for control in play_controls),
+        "stop_control_available": any("AXPress" in control.get("actions", []) for control in stop_controls),
     }
 
 
@@ -512,6 +529,7 @@ class ReferenceAdapter:
             "adapter": {"name": ADAPTER_NAME, "version": ADAPTER_VERSION},
             "platform": {"required": "macOS", "current": platform.system()},
             "supported_bundle_identifiers": list(SUPPORTED_LOGIC_BUNDLE_IDS),
+            "supported_transport_control_roles": list(SUPPORTED_TRANSPORT_CONTROL_ROLES),
             "capabilities": list(IMPLEMENTED_READS + IMPLEMENTED_WRITES),
             "operations": operations,
             "ui_languages": ["en", "ja"],

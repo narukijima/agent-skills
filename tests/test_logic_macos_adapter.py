@@ -27,9 +27,9 @@ def preflight(operation: str, project: str) -> dict:
     }
 
 
-def control(title: str, *, value=None, press=True) -> dict:
+def control(title: str, *, role="AXButton", value=None, press=True) -> dict:
     return {
-        "role": "AXButton",
+        "role": role,
         "title": title,
         "description": None,
         "help": None,
@@ -92,6 +92,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             document["supported_bundle_identifiers"],
             ["com.apple.mobilelogic", "com.apple.logic10"],
         )
+        self.assertEqual(document["supported_transport_control_roles"], ["AXButton", "AXCheckBox"])
         unsupported = [row for row in document["operations"] if row["support"] == "not-implemented"]
         self.assertTrue(unsupported)
         self.assertTrue(all(row["reason"] for row in unsupported))
@@ -114,6 +115,33 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         transport = adapter_module.transport_from_controls(state["controls"])
         self.assertFalse(transport["is_playing"])
         self.assertTrue(transport["play_control_available"])
+
+    def test_japanese_checkbox_play_control_is_observable_and_dispatchable(self):
+        state = snapshot(self.project)
+        state["controls"] = [
+            control("再生", role="AXCheckBox", value=False),
+            control("先頭へ移動"),
+        ]
+        transport = adapter_module.transport_from_controls(state["controls"])
+        self.assertFalse(transport["is_playing"])
+        self.assertEqual(transport["state_basis"], "play-control-value")
+        self.assertTrue(transport["play_control_available"])
+        self.assertIn("transport.play", adapter_module.runtime_capabilities(state))
+        backend = FakeBackend(state)
+        result = adapter_module.ReferenceAdapter(backend).dispatch(preflight("transport.play", self.project))
+        self.assertTrue(result["ok"])
+        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, "com.apple.mobilelogic")])
+
+    def test_checkbox_without_axpress_does_not_expose_play_dispatch(self):
+        state = snapshot(self.project)
+        state["controls"] = [
+            control("再生", role="AXCheckBox", value=False, press=False),
+            control("先頭へ移動"),
+        ]
+        transport = adapter_module.transport_from_controls(state["controls"])
+        self.assertFalse(transport["is_playing"])
+        self.assertFalse(transport["play_control_available"])
+        self.assertNotIn("transport.play", adapter_module.runtime_capabilities(state))
 
     def test_dispatch_rechecks_safety_and_project_before_action(self):
         state = snapshot(self.project)
@@ -168,6 +196,24 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             self.assertIn(bundle_identifier, action_source)
         self.assertIn("findLogicProcess(systemEvents, null)", snapshot_source)
         self.assertIn("findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID)", action_source)
+
+    def test_snapshot_and_action_jxa_share_supported_transport_control_roles(self):
+        snapshot_source = adapter_module.render_jxa(adapter_module.SNAPSHOT_JXA)
+        action_source = adapter_module.render_jxa(
+            adapter_module.ACTION_JXA,
+            {
+                "REQUESTED_OPERATION": "transport.play",
+                "EXPECTED_PROJECT": self.project,
+                "EXPECTED_BUNDLE_ID": "com.apple.mobilelogic",
+            },
+        )
+        for role in adapter_module.SUPPORTED_TRANSPORT_CONTROL_ROLES:
+            self.assertIn(role, snapshot_source)
+            self.assertIn(role, action_source)
+        self.assertIn("SUPPORTED_TRANSPORT_CONTROL_ROLES.includes", snapshot_source)
+        self.assertIn("SUPPORTED_TRANSPORT_CONTROL_ROLES.includes", action_source)
+        self.assertNotIn('role(), null)) === "AXButton"', action_source)
+        self.assertIn('reason: "ax_press_not_supported"', action_source)
 
     def test_unrecognized_observed_bundle_is_rejected_before_action(self):
         backend = FakeBackend(snapshot(self.project, bundle_identifier="com.example.logic"))
