@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -596,6 +597,37 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertEqual(diagnostic, "native_axcontents_cannot_complete")
 
+    def test_optional_child_illegal_argument_does_not_invalidate_primary_tree(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        bridge._element_array = lambda element, attribute, limit: {
+            "AXChildren": (0, [101], False),
+            "AXContents": (-25205, [], False),
+            "AXChildrenInNavigationOrder": (-25201, [], False),
+        }[attribute]
+        children, observed, truncated, diagnostic = bridge._child_elements(100, 20)
+        self.assertEqual(children, [101])
+        self.assertTrue(observed)
+        self.assertFalse(truncated)
+        self.assertIsNone(diagnostic)
+
+    def test_trusted_incomplete_native_tree_never_restarts_legacy_control_scan(self):
+        native_state = snapshot(self.project, window_discovery_source="AXUIElement.AXWindows")
+        native_state["transport_controls_complete"] = False
+        native_state["controls_truncated"] = True
+        native_state["control_tree_diagnostic"] = "native_axchildren_element_limit"
+        legacy = snapshot(self.project, window_discovery_source="process.windows")
+        native = FakeNativeBridge(native_state, trusted=True)
+        backend = StubMacOSBackend(native, legacy)
+        observed = backend.snapshot(include_controls=True)
+        self.assertEqual(observed["accessibility_backend"], "AXUIElement")
+        self.assertFalse(observed["transport_controls_complete"])
+        self.assertEqual(
+            observed["control_tree_diagnostic"],
+            "native_axchildren_element_limit",
+        )
+        self.assertEqual(len(backend.jxa_calls), 2)
+        self.assertIn("const INCLUDE_CONTROLS = false;", backend.jxa_calls[1][0])
+
     def test_native_child_attributes_share_one_element_budget(self):
         bridge = object.__new__(adapter_module.NativeAXBridge)
         calls = []
@@ -776,6 +808,25 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         dispatched = adapter_module.ReferenceAdapter(backend).dispatch(preflight("transport.play", self.project))
         self.assertEqual(dispatched["error"]["kind"], "project_identity_unavailable")
         self.assertIn("project_window_has_no_document_or_title", dispatched["error"]["message"])
+        self.assertEqual(backend.dispatch_calls, [])
+
+    def test_project_chooser_title_is_not_reported_as_project_identity(self):
+        state = snapshot(self.project)
+        state["windows"][0]["title"] = "プロジェクトを選択"
+        state["windows"][0]["document"] = None
+        backend = FakeBackend(state)
+        observed = adapter_module.ReferenceAdapter(backend).observe("project.current")
+        self.assertTrue(observed["data"]["current_project_unavailable"])
+        self.assertEqual(
+            observed["data"]["current_project_unavailable_reason"],
+            "non_project_window_title",
+        )
+        self.assertIsNone(observed["data"]["window_project_name"])
+        self.assertIsNone(observed["data"]["project_identity_source"])
+        dispatched = adapter_module.ReferenceAdapter(backend).dispatch(
+            preflight("transport.play", self.project)
+        )
+        self.assertEqual(dispatched["error"]["kind"], "project_identity_unavailable")
         self.assertEqual(backend.dispatch_calls, [])
 
     def test_japanese_control_labels_are_mapped_without_coordinates(self):
@@ -959,6 +1010,59 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertIn("SUPPORTED_TRANSPORT_CONTROL_ROLES.includes", action_source)
         self.assertNotIn('role(), null)) === "AXButton"', action_source)
         self.assertIn('reason: "ax_press_not_supported"', action_source)
+
+    def test_legacy_action_rejects_ambiguous_controls_before_state_or_press(self):
+        action_source = adapter_module.render_jxa(
+            adapter_module.ACTION_JXA,
+            {
+                "REQUESTED_OPERATION": "transport.play",
+                "EXPECTED_PROJECT": self.project,
+                "EXPECTED_BUNDLE_ID": "com.apple.mobilelogic",
+            },
+        )
+        ambiguity_guard = (
+            "[playControls, stopControls, beginningControls]"
+            ".some(candidates => candidates.length > 1)"
+        )
+        guard_index = action_source.index(ambiguity_guard)
+        state_index = action_source.index("const play = playControls")
+        press_index = action_source.index("press.perform()")
+        self.assertLess(guard_index, state_index)
+        self.assertLess(guard_index, press_index)
+        self.assertIn(
+            'return JSON.stringify({ok: false, definitive: true, reason: "transport_control_ambiguous"})',
+            action_source,
+        )
+        self.assertIn("for (let i = 0; i < windows.length; i++)", action_source)
+        self.assertIn("boundedDescendants(windows[i], remainingElements, 32)", action_source)
+        self.assertIn('reason: "project_identity_ambiguous"', action_source)
+        self.assertIn('"transport " + candidate', action_source)
+        self.assertNotIn("boundedDescendants(mainWindow, 4000, 32)", action_source)
+
+    @unittest.skipUnless(Path("/usr/bin/osascript").exists(), "JXA compiler is macOS-only")
+    def test_rendered_legacy_action_has_valid_jxa_syntax(self):
+        action_source = adapter_module.render_jxa(
+            adapter_module.ACTION_JXA,
+            {
+                "REQUESTED_OPERATION": "transport.play",
+                "EXPECTED_PROJECT": self.project,
+                "EXPECTED_BUNDLE_ID": "com.apple.mobilelogic",
+            },
+        )
+        compile_only_source = action_source.replace(
+            "function run()",
+            "function disabledRun()",
+            1,
+        ) + '\nfunction run(){ return "syntax-ok"; }\n'
+        completed = subprocess.run(
+            ["/usr/bin/osascript", "-l", "JavaScript"],
+            input=compile_only_source,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "syntax-ok")
 
     def test_unrecognized_observed_bundle_is_rejected_before_action(self):
         backend = FakeBackend(snapshot(self.project, bundle_identifier="com.example.logic"))

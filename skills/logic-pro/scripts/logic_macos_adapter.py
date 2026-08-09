@@ -25,7 +25,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.4.0"
+ADAPTER_VERSION = "0.4.1"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -383,13 +383,22 @@ function run() {
     return safe(() => attrs[0].value(), null);
   }
   function normalized(value) { return text(value) === null ? "" : text(value).trim().toLocaleLowerCase(); }
+  function semantic(value) { return normalized(value).replace(/[\s_-]+/g, ""); }
   function labels(element) {
     return [safe(() => element.name(), null), safe(() => element.description(), null), safe(() => element.help(), null), attr(element, "AXIdentifier")]
       .map(normalized).filter(value => value.length > 0);
   }
   function matches(element, candidates) {
     const values = labels(element);
-    return values.some(value => candidates.some(candidate => value === candidate || value === candidate + " button" || value === candidate + "ボタン"));
+    const semanticCandidates = [];
+    candidates.forEach(candidate => {
+      [candidate, candidate + " button", candidate + "ボタン", "transport " + candidate, "transport " + candidate + " button"]
+        .forEach(form => semanticCandidates.push(semantic(form)));
+    });
+    return values.some(value =>
+      candidates.some(candidate => value === candidate || value === candidate + " button" || value === candidate + "ボタン")
+      || semanticCandidates.includes(semantic(value))
+    );
   }
   function truth(value) {
     if (value === true || value === 1) return true;
@@ -406,6 +415,12 @@ function run() {
     const parts = value.split("/");
     return parts[parts.length - 1];
   }
+  function documentPath(value) {
+    if (!value) return null;
+    let path = String(value);
+    try { path = decodeURIComponent(path); } catch (_) {}
+    return path.replace(/^file:\/\/localhost/, "").replace(/^file:\/\//, "").replace(/\/$/, "");
+  }
   const systemEvents = Application("/System/Library/CoreServices/System Events.app");
   const discovered = findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID);
   if (discovered === null) return JSON.stringify({ok: false, definitive: true, reason: "logic_not_running"});
@@ -414,37 +429,51 @@ function run() {
   try {
     const windows = windowDiscovery.windows;
     if (!windowDiscovery.accessibility_authorized) return JSON.stringify({ok: false, definitive: true, reason: "accessibility_not_authorized"});
-    let mainWindow = null;
+    const projectDocuments = [];
+    const preciseProjectTitles = [];
     for (let i = 0; i < windows.length; i++) {
       const sheets = safe(() => windows[i].sheets(), []);
       const subrole = text(safe(() => windows[i].subrole(), null));
       const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
       if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) return JSON.stringify({ok: false, definitive: true, reason: "modal_dialog_present"});
-      if (mainWindow === null && Boolean(attr(windows[i], "AXMain"))) mainWindow = windows[i];
+      const document = documentPath(attr(windows[i], "AXDocument"));
+      const title = text(safe(() => windows[i].name(), null));
+      if (document && basename(document).toLocaleLowerCase().endsWith(".logicx") && !projectDocuments.includes(document)) projectDocuments.push(document);
+      if (title && title.toLocaleLowerCase().endsWith(".logicx") && !preciseProjectTitles.includes(title)) preciseProjectTitles.push(title);
     }
     if (!windowDiscovery.complete) return JSON.stringify({ok: false, definitive: true, reason: "window_set_incomplete", diagnostic: windowDiscovery.diagnostic});
-    if (mainWindow === null && windows.length > 0) mainWindow = windows[0];
-    if (mainWindow === null) return JSON.stringify({ok: false, definitive: true, reason: "project_window_not_found"});
     const expectedName = basename(EXPECTED_PROJECT);
-    const documentValue = text(attr(mainWindow, "AXDocument"));
-    const windowTitle = text(safe(() => mainWindow.name(), null));
-    if (documentValue) {
-      if (basename(documentValue) !== expectedName) return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
-    } else if (windowTitle === null) {
-      return JSON.stringify({ok: false, definitive: true, reason: "project_identity_unavailable", diagnostic: "main_window_has_no_document_or_title"});
-    } else if (windowTitle !== expectedName) {
-      return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
+    const expectedDocument = documentPath(EXPECTED_PROJECT);
+    if (projectDocuments.length > 1) return JSON.stringify({ok: false, definitive: true, reason: "project_identity_ambiguous"});
+    if (projectDocuments.length === 1) {
+      if (projectDocuments[0] !== expectedDocument) return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
+      if (preciseProjectTitles.some(title => title !== expectedName)) return JSON.stringify({ok: false, definitive: true, reason: "project_identity_ambiguous"});
+    } else {
+      if (preciseProjectTitles.length > 1) return JSON.stringify({ok: false, definitive: true, reason: "project_identity_ambiguous"});
+      if (preciseProjectTitles.length === 0) return JSON.stringify({ok: false, definitive: true, reason: "project_identity_unavailable", diagnostic: "window_set_has_no_project_document_or_precise_title"});
+      if (preciseProjectTitles[0] !== expectedName) return JSON.stringify({ok: false, definitive: true, reason: "project_mismatch"});
     }
-    const traversal = boundedDescendants(mainWindow, 4000, 32);
-    if (!traversal.observed) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_unavailable"});
-    if (traversal.truncated) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_truncated"});
-    const transportControls = traversal.elements.filter(element => SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(text(safe(() => element.role(), null))));
+    const transportControls = [];
+    let remainingElements = 4000;
+    for (let i = 0; i < windows.length; i++) {
+      if (remainingElements <= 0) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_truncated"});
+      const traversal = boundedDescendants(windows[i], remainingElements, 32);
+      if (!traversal.observed) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_unavailable"});
+      if (traversal.truncated) return JSON.stringify({ok: false, definitive: true, reason: "transport_control_tree_truncated"});
+      remainingElements -= traversal.elements.length;
+      traversal.elements.forEach(element => {
+        if (SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(text(safe(() => element.role(), null)))) transportControls.push(element);
+      });
+    }
     const playLabels = ["play", "再生"];
     const stopLabels = ["stop", "停止"];
     const beginningLabels = ["go to beginning", "先頭へ移動", "先頭に移動"];
     const playControls = transportControls.filter(element => matches(element, playLabels));
     const stopControls = transportControls.filter(element => matches(element, stopLabels));
     const beginningControls = transportControls.filter(element => matches(element, beginningLabels));
+    if ([playControls, stopControls, beginningControls].some(candidates => candidates.length > 1)) {
+      return JSON.stringify({ok: false, definitive: true, reason: "transport_control_ambiguous"});
+    }
     const play = playControls.length > 0 ? playControls[0] : null;
     const stop = stopControls.length > 0 ? stopControls[0] : null;
     const beginning = beginningControls.length > 0 ? beginningControls[0] : null;
@@ -635,10 +664,18 @@ def generic_logic_window_title(title: Any) -> bool:
     return isinstance(title, str) and title.strip().casefold() in GENERIC_LOGIC_WINDOW_TITLES
 
 
+def precise_project_window_title(title: Any) -> bool:
+    return (
+        isinstance(title, str)
+        and not generic_logic_window_title(title)
+        and title.casefold().endswith(".logicx")
+    )
+
+
 def project_window_rank(window: dict[str, Any]) -> tuple[int, int, int]:
     document = normalize_project_document(window.get("document"))
     title = window.get("title") if isinstance(window.get("title"), str) else None
-    precise_title = bool(title and not generic_logic_window_title(title) and title.casefold().endswith(".logicx"))
+    precise_title = precise_project_window_title(title)
     return (
         1 if document is not None else 0,
         1 if precise_title else 0,
@@ -677,9 +714,7 @@ def precise_project_titles(snapshot: dict[str, Any]) -> list[str]:
     return [
         window["title"]
         for window in snapshot_windows(snapshot)
-        if isinstance(window.get("title"), str)
-        and not generic_logic_window_title(window["title"])
-        and window["title"].casefold().endswith(".logicx")
+        if precise_project_window_title(window.get("title"))
     ]
 
 
@@ -726,9 +761,8 @@ def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             "project_identity_source": None,
         }
     current = normalize_project_document(window.get("document"))
-    title = window.get("title") if isinstance(window.get("title"), str) else None
-    if generic_logic_window_title(title):
-        title = None
+    observed_title = window.get("title") if isinstance(window.get("title"), str) else None
+    title = observed_title if precise_project_window_title(observed_title) else None
     return {
         "current_project": current,
         "current_project_unavailable": current is None,
@@ -738,7 +772,9 @@ def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             else "document_path_not_exposed"
             if title
             else "generic_application_title_only"
-            if generic_logic_window_title(window.get("title"))
+            if generic_logic_window_title(observed_title)
+            else "non_project_window_title"
+            if observed_title
             else "project_window_has_no_document_or_title"
         ),
         "window_project_name": title,
@@ -875,6 +911,7 @@ AX_ERROR_NAMES = {
     -25214: "not_enough_precision",
 }
 AX_LEAF_ERRORS = {-25205, -25212}
+OPTIONAL_CHILD_LEAF_ERRORS = AX_LEAF_ERRORS | {-25201}
 
 
 def ax_error_name(code: int) -> str:
@@ -1246,7 +1283,11 @@ class NativeAXBridge:
                 truncated = truncated or attribute_truncated
                 if attribute_truncated:
                     diagnostic = diagnostic or f"native_{attribute.casefold()}_element_limit"
-            elif code not in AX_LEAF_ERRORS:
+            elif code not in (
+                AX_LEAF_ERRORS
+                if attribute == "AXChildren"
+                else OPTIONAL_CHILD_LEAF_ERRORS
+            ):
                 truncated = True
                 diagnostic = diagnostic or f"native_{attribute.casefold()}_{ax_error_name(code)}"
         if not saw_supported_attribute and diagnostic is not None:
@@ -1809,7 +1850,11 @@ class MacOSAccessibilityBackend:
         if include_controls and native is not None and native.get("transport_controls_complete") is not True:
             use_native_without_fallback = False
         if not use_native_without_fallback:
-            legacy_include_controls = include_controls and native_error is None
+            legacy_include_controls = (
+                include_controls
+                and native_error is None
+                and (native is None or native.get("accessibility_authorized") is not True)
+            )
             legacy = self._run_jxa(
                 render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": legacy_include_controls})
             )
