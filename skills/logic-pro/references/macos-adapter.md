@@ -17,9 +17,11 @@
 
 対応bundle identifierは `com.apple.mobilelogic`（Logic Pro 12系）と `com.apple.logic10`（従来版）である。静的capabilityとfresh observationへ対応一覧および実際に検出したidentifierを含める。observeで選んだidentifierはdispatch直前にも固定し、別のLogicプロセスへ切り替えない。
 
-window探索は `process.windows()`、application-level `AXWindows`属性、直下`uiElements`の`AXWindow` roleの順に完全な集合を探す。Logic 12がbackgroundにあるとこれらが空になり、`AXMainWindow`だけを公開するlayoutがある。その場合に限り、現在のfrontmost processを保存してLogicを一時的にfrontmostへし、0.2秒後に同じ完全集合経路を一度だけ再試行する。snapshotまたはdispatchの終了時は`finally`で元のprocessへfocusを戻す。元のfrontmost processを特定できない場合はfocusを変更しない。
+標準経路はLogicのPIDを再取得して [`AXUIElementCreateApplication`](https://developer.apple.com/documentation/applicationservices/1459374-axuielementcreateapplication) で対象processへ直接接続する。window集合はapplication elementの`AXWindows`を [`AXUIElementCopyAttributeValues`](https://developer.apple.com/documentation/applicationservices/1462060-axuielementcopyattributevalues) で最大64件まで取得し、`AXMainWindow`と照合する。この経路はLogicをfrontmostへせず、backgroundのLogic 12でもSystem Eventsのwindow wrapperに依存しない。Project identityはmain windowの`AXDocument`と`AXTitle`に加え、application-level `AXDocument`と`AXTitleUIElement`を順に読み、実際の取得元を`project_identity_source`へ返す。
 
-process全体およびwindowの `entireContents()` はLogic 12で無制限に待つ可能性があるため使わない。Control Barはmain windowの`AXChildren`を最大4000要素・深さ32まで幅優先で探索する。上限へ達したtreeは不完全としてtransport capabilityとdispatchを止める。frontmost再試行でも完全な集合が得られない場合、`AXMainWindow` または `AXFocusedWindow` はread-only観測へ使うが、他windowやmodalの不在を証明できないためdispatchしない。観測は `window_discovery_source`、`window_discovery_diagnostic`、`window_set_complete`、`focus_temporarily_changed`、`transport_controls_observed`、`transport_controls_complete` を返す。Appleはapplication-level objectの [AXWindows](https://developer.apple.com/documentation/applicationservices/kaxwindowsattribute)、[AXMainWindow](https://developer.apple.com/documentation/applicationservices/kaxmainwindowattribute)、[AXFocusedWindow](https://developer.apple.com/documentation/applicationservices/kaxfocusedwindowattribute) をそれぞれwindow取得属性として定義している。
+直接AX経路が権限・API応答・完全性の条件を満たさない場合だけ、互換用のSystem Events経路へfallbackする。互換経路は `process.windows()`、application-level `AXWindows`属性、直下`uiElements`の`AXWindow` roleの順に完全な集合を探す。Logicがbackgroundで空集合になる場合に限り、元のfrontmost processを保存できるときだけ一度frontmost再試行し、`finally`でfocusを戻す。直接AXの成功時はこのforeground処理を実行しない。
+
+process全体およびwindowの `entireContents()` はLogic 12で無制限に待つ可能性があるため使わない。直接AXのmessaging timeoutは [`AXUIElementSetMessagingTimeout`](https://developer.apple.com/documentation/applicationservices/1459345-axuielementsetmessagingtimeout) でsystem-wide elementと対象applicationへ最大2秒を設定する。Control Barはmain windowの`AXChildren`を最大4000要素・深さ32まで幅優先で探索する。上限へ達したtreeは不完全としてtransport capabilityとdispatchを止める。完全なwindow集合が得られない場合、`AXMainWindow` または `AXFocusedWindow` はread-only観測へ使うが、他windowやmodalの不在を証明できないためdispatchしない。観測は `accessibility_backend`、`process_identifier`、`native_accessibility_diagnostic`、`window_discovery_source`、`window_discovery_diagnostic`、`window_set_complete`、`focus_temporarily_changed`、`transport_controls_observed`、`transport_controls_complete`、`control_tree_diagnostic` を返す。Appleはapplication-level objectの [AXWindows](https://developer.apple.com/documentation/applicationservices/kaxwindowsattribute)、[AXMainWindow](https://developer.apple.com/documentation/applicationservices/kaxmainwindowattribute)、[AXFocusedWindow](https://developer.apple.com/documentation/applicationservices/kaxfocusedwindowattribute) をそれぞれwindow取得属性として定義している。
 
 `app.status` と `project.current` はtransport control treeを走査しない。`transport.state` とdispatch前snapshotだけがmain windowのcontrolを収集し、`transport_controls_observed`でtree取得の成否、`transport_controls_complete`で探索上限内に完了したかを示す。これにより軽量な安全ゲートをControl Bar探索から分離し、部分treeの「control不在」を状態証拠に使わない。
 
@@ -46,11 +48,11 @@ python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --opera
 python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --operation project.current
 ```
 
-`capabilities` は静的な実装表、`supported_bundle_identifiers`、`supported_transport_control_roles` を返す。`observe` の `data.capabilities` はそのcallで実測できた操作一覧、`data.bundle_identifier` は実際に選んだLogic Proプロセス、`window_discovery_source` と `window_set_complete` はwindow探索証拠、`window_discovery_diagnostic` はfallback原因、`focus_temporarily_changed` はbackground recoveryの実行有無を返す。Project pathが取れない場合は`current_project_unavailable_reason`と`project_identity_source`で、Projectが存在しない場合と現在layoutがidentityを公開しない場合を区別する。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport tree未観測・不完全・状態不明、window集合不完全、または意味labelに一致するcontrolが `AXPress` を持たない場合、runtime一覧は安全側に縮小する。
+`capabilities` は静的な実装表、`supported_bundle_identifiers`、`supported_transport_control_roles` を返す。`observe` の `data.capabilities` はそのcallで実測できた操作一覧、`data.bundle_identifier` と `data.process_identifier` は実際に選んだLogic Proプロセス、`accessibility_backend` は `AXUIElement` または互換用 `SystemEvents` を返す。`window_discovery_source` と `window_set_complete` はwindow探索証拠、`window_discovery_diagnostic` と `native_accessibility_diagnostic` は直接AXまたはfallbackの原因、`focus_temporarily_changed` は互換経路でのbackground recovery実行有無を返す。Project pathが取れない場合は`current_project_unavailable_reason`と`project_identity_source`で、Projectが存在しない場合と現在layoutがidentityを公開しない場合を区別する。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport tree未観測・不完全・状態不明、window集合不完全、または意味labelに一致するcontrolが `AXPress` を持たない場合、runtime一覧は安全側に縮小する。
 
 ## 4. 対応表
 
-reference profile `logic-pro-macos-accessibility` version `0.2.0` の対応は次のとおり。
+reference profile `logic-pro-macos-accessibility` version `0.3.0` の対応は次のとおり。
 
 | 意味操作 | 対応 | 操作または独立読戻し |
 | --- | --- | --- |
@@ -84,7 +86,7 @@ python3 skills/logic-pro/scripts/logic_guard.py preflight --request request.json
 python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty dispatch --preflight preflight.json > dispatch.json
 ```
 
-`dispatch` は次を操作直前に再確認する。
+`dispatch` はpreflight時に観測したbundle identifierとPIDを固定し、操作直前に同じPIDのLogicが存在することを再確認する。直接AX経路では新しいapplication elementとwindow/control snapshotを作り、次を再確認する。
 
 1. preflightのauthorizationとfingerprint
 2. Logic起動
@@ -121,7 +123,7 @@ python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --opera
 | `2` | 未対応、権限なし、Project違い、引数不正など操作前に確定した失敗 | `failed` / definitive | 禁止。原因を直して新規preflight |
 | `3` | timeout、Accessibility bridge異常など操作済みか断定不能 | `unknown` / non-definitive | 禁止。read-onlyで再観測 |
 
-`osascript`がdispatch中にtimeoutまたは不正応答になった場合、操作が届いた可能性を捨てず`unknown`にする。未対応operationはUIへ触れる前に`failed`へする。
+`AXUIElementPerformAction`または互換用`osascript`がdispatch中にtimeoutや応答不能になった場合、操作が届いた可能性を捨てず`unknown`にする。未対応operationはUIへ触れる前に`failed`へする。直接AXのaction一覧は [`AXUIElementCopyActionNames`](https://developer.apple.com/documentation/applicationservices/1462053-axuielementcopyactionnames) で読み、`AXPress`が実際に公開されたcontrolだけを対象にする。
 
 ## 7. 互換性確認
 
@@ -131,13 +133,14 @@ version名だけで互換を推測せず、更新後は実機で次をsmoke test
 2. `app.status` が現在のunlock、Accessibility、modalを返す。
 3. Logic Pro 12系では `bundle_identifier` が `com.apple.mobilelogic`、従来版では `com.apple.logic10` になる。
 4. `project.current` のpath、またはfallback window titleが対象Projectと一致する。
-5. backgroundのLogic 12で `frontmost-retry.*` が完全window集合を回復し、観測後に元のfrontmost processへfocusが戻る。
-6. `window_discovery_source`、`window_discovery_diagnostic`、`window_set_complete` がwindow取得経路とdispatch可否を説明する。
+5. backgroundのLogic 12で `accessibility_backend` が `AXUIElement`、`window_discovery_source` が `AXUIElement.AXWindows` となり、`focus_temporarily_changed` がfalseのままProject identityと完全window集合を取得できる。
+6. `process_identifier`、`native_accessibility_diagnostic`、`window_discovery_source`、`window_discovery_diagnostic`、`window_set_complete` がprocess binding、window取得経路、fallback理由、dispatch可否を説明する。
 7. `app.status` と `project.current` の `transport_controls_observed` / `transport_controls_complete` がfalseで、main window control treeを走査しない。
 8. 停止中の `transport.state.data.is_playing` がfalse、再生中がtrueになり、両transport control証拠がtrueになる。
 9. `AXButton` と `AXCheckBox` の対応layoutで `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
 10. modal表示中、lock中、window集合不完全、control tree上限到達、別Project、Control Bar非表示でdispatchが行われない。
-11. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
+11. 直接AXが利用不能なfixtureではSystem Eventsへfallbackし、直接AXが完全なfixtureではSystem Eventsとforeground処理を呼ばない。
+12. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
 
 repository testはLogicを動かさず、AX snapshot fixtureを使って全allowlistのsupport表、empty-window、完全・不完全window fallback、`AXButton` / `AXCheckBox`、日英label、`AXPress`、Project binding、fingerprint、timeout区別、独立readback境界を検証する。実機smokeはmacOS TCCとLogic UI状態を変更するため、利用者の明示的な実行環境で行う。
 
@@ -145,9 +148,9 @@ repository testはLogicを動かさず、AX snapshot fixtureを使って全allow
 
 - Project固有root、MIDI/bounce出力policy、音楽的品質規則をadapterへ埋め込まない。
 - coordinate click、画像認識、Space toggle、任意key sequenceを使わない。
-- `AXPress`対象はLogic所有のmain window内、日英の意味label、対応actionの三条件で特定する。
+- `AXPress`対象はLogicの同じPIDに属するmain window内、日英の意味label、対応actionの三条件で特定する。
 - `AXMainWindow` / `AXFocusedWindow`だけのfallbackで変更操作を許可しない。
-- background recoveryは元のfrontmost processを特定できる場合だけ一度行い、観測・操作の終了時にfocusを戻す。
+- 直接AX経路でLogicをforegroundへ変更しない。互換経路のbackground recoveryは元のfrontmost processを特定できる場合だけ一度行い、観測・操作の終了時にfocusを戻す。
 - process全体またはwindowの無制限な `entireContents()` を使わない。
 - 上限へ達したcontrol treeの不在証拠からtransport状態を推測しない。
 - 表示layoutやUI言語が互換表外ならcapabilityを返さず停止する。

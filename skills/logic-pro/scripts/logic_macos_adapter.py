@@ -10,6 +10,7 @@ key commands. Dispatch never includes readback: callers must issue a new
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -23,7 +24,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.2.0"
+ADAPTER_VERSION = "0.3.0"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -68,6 +69,25 @@ function findLogicProcess(systemEvents, preferredBundleId) {
     if (processes && processes.length > 0) return {process: processes[0], bundle_identifier: bundleIds[i]};
   }
   return null;
+}
+'''
+
+
+PROCESS_SNAPSHOT_JXA = r'''
+function run() {
+  function safe(fn, fallback) { try { const value = fn(); return value === undefined ? fallback : value; } catch (_) { return fallback; } }
+  const systemEvents = Application("/System/Library/CoreServices/System Events.app");
+  const discovered = findLogicProcess(systemEvents, PREFERRED_BUNDLE_ID);
+  if (discovered === null) {
+    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, process_identifier: null, frontmost: null});
+  }
+  return JSON.stringify({
+    ok: true,
+    logic_running: true,
+    bundle_identifier: discovered.bundle_identifier,
+    process_identifier: safe(() => Number(discovered.process.unixId()), null),
+    frontmost: safe(() => Boolean(discovered.process.frontmost()), null)
+  });
 }
 '''
 
@@ -477,6 +497,15 @@ def render_jxa(source: str, constants: dict[str, Any] | None = None) -> str:
     return prefix + BUNDLE_DISCOVERY_JXA + WINDOW_DISCOVERY_JXA + source
 
 
+def render_process_jxa(preferred_bundle_id: str | None = None) -> str:
+    assignments = {
+        "SUPPORTED_LOGIC_BUNDLE_IDS": list(SUPPORTED_LOGIC_BUNDLE_IDS),
+        "PREFERRED_BUNDLE_ID": preferred_bundle_id,
+    }
+    prefix = "".join(f"const {name} = {json.dumps(value)};\n" for name, value in assignments.items())
+    return prefix + BUNDLE_DISCOVERY_JXA + PROCESS_SNAPSHOT_JXA
+
+
 def normalize_document_path(value: Any) -> str | None:
     if not isinstance(value, str) or not value:
         return None
@@ -578,7 +607,11 @@ def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             None if current is not None else "document_path_not_exposed" if title else "main_window_has_no_document_or_title"
         ),
         "window_project_name": title,
-        "project_identity_source": "AXDocument" if current is not None else "AXTitle" if title else None,
+        "project_identity_source": (
+            window.get("document_source", "AXDocument")
+            if current is not None
+            else window.get("title_source", "AXTitle") if title else None
+        ),
     }
 
 
@@ -646,9 +679,595 @@ def assert_project_binding(snapshot: dict[str, Any], expected_project: str) -> N
         raise AdapterFailure("project_mismatch", "Logic window title does not exactly match expected .logicx name", definitive=True)
 
 
+AX_ERROR_NAMES = {
+    0: "success",
+    -25200: "failure",
+    -25201: "illegal_argument",
+    -25202: "invalid_ui_element",
+    -25203: "invalid_observer",
+    -25204: "cannot_complete",
+    -25205: "attribute_unsupported",
+    -25206: "action_unsupported",
+    -25207: "notification_unsupported",
+    -25208: "not_implemented",
+    -25209: "notification_already_registered",
+    -25210: "notification_not_registered",
+    -25211: "api_disabled",
+    -25212: "no_value",
+    -25213: "parameterized_attribute_unsupported",
+    -25214: "not_enough_precision",
+}
+AX_LEAF_ERRORS = {-25205, -25212}
+
+
+def ax_error_name(code: int) -> str:
+    return AX_ERROR_NAMES.get(code, f"ax_error_{code}")
+
+
+class NativeAXBridge:
+    """Bounded, dependency-free AXUIElement bridge for one application PID."""
+
+    UTF8_ENCODING = 0x08000100
+    MAX_WINDOWS = 64
+    MAX_CONTROLS = 4000
+    MAX_DEPTH = 32
+
+    def __init__(self, process_identifier: int, timeout_seconds: float):
+        if not isinstance(process_identifier, int) or process_identifier <= 0:
+            raise AdapterFailure("invalid_process_identifier", "Logic process identifier is invalid", definitive=True)
+        self.process_identifier = process_identifier
+        self.timeout_seconds = max(0.1, min(float(timeout_seconds), 2.0))
+        self._application_services = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        self._core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        self._keys: dict[str, int] = {}
+        self._owned_elements: list[int] = []
+        self._configure_functions()
+        system_wide = self._application_services.AXUIElementCreateSystemWide()
+        self.system_wide = int(system_wide) if system_wide else None
+        if self.system_wide:
+            self._owned_elements.append(self.system_wide)
+        application = self._application_services.AXUIElementCreateApplication(process_identifier)
+        if not application:
+            while self._owned_elements:
+                self._core_foundation.CFRelease(ctypes.c_void_p(self._owned_elements.pop()))
+            raise AdapterFailure("native_ax_unavailable", "AXUIElementCreateApplication returned null", definitive=True)
+        self.application = int(application)
+        self._owned_elements.append(self.application)
+        global_timeout_code = (
+            int(
+                self._application_services.AXUIElementSetMessagingTimeout(
+                    ctypes.c_void_p(self.system_wide), ctypes.c_float(self.timeout_seconds)
+                )
+            )
+            if self.system_wide
+            else -25200
+        )
+        application_timeout_code = int(self._application_services.AXUIElementSetMessagingTimeout(
+            ctypes.c_void_p(self.application), ctypes.c_float(self.timeout_seconds)
+        ))
+        self.timeout_configured = global_timeout_code == 0 and application_timeout_code == 0
+
+    def _configure_functions(self) -> None:
+        ax = self._application_services
+        cf = self._core_foundation
+        ax.AXIsProcessTrusted.restype = ctypes.c_bool
+        ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+        ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+        ax.AXUIElementCreateSystemWide.restype = ctypes.c_void_p
+        ax.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
+        ax.AXUIElementSetMessagingTimeout.restype = ctypes.c_int32
+        ax.AXUIElementCopyAttributeValue.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        ax.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+        ax.AXUIElementGetAttributeValueCount.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_long),
+        ]
+        ax.AXUIElementGetAttributeValueCount.restype = ctypes.c_int32
+        ax.AXUIElementCopyAttributeValues.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.c_long,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        ax.AXUIElementCopyAttributeValues.restype = ctypes.c_int32
+        ax.AXUIElementCopyActionNames.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        ax.AXUIElementCopyActionNames.restype = ctypes.c_int32
+        ax.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ax.AXUIElementPerformAction.restype = ctypes.c_int32
+        ax.AXUIElementGetTypeID.restype = ctypes.c_ulong
+
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+        cf.CFStringGetLength.restype = ctypes.c_long
+        cf.CFStringGetMaximumSizeForEncoding.argtypes = [ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetMaximumSizeForEncoding.restype = ctypes.c_long
+        cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_long,
+            ctypes.c_uint32,
+        ]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetTypeID.restype = ctypes.c_ulong
+        cf.CFBooleanGetTypeID.restype = ctypes.c_ulong
+        cf.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+        cf.CFBooleanGetValue.restype = ctypes.c_bool
+        cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFArrayGetTypeID.restype = ctypes.c_ulong
+        cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        cf.CFURLGetTypeID.restype = ctypes.c_ulong
+        cf.CFURLGetString.argtypes = [ctypes.c_void_p]
+        cf.CFURLGetString.restype = ctypes.c_void_p
+        cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+        cf.CFGetTypeID.restype = ctypes.c_ulong
+        cf.CFEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFEqual.restype = ctypes.c_bool
+        cf.CFHash.argtypes = [ctypes.c_void_p]
+        cf.CFHash.restype = ctypes.c_ulong
+        cf.CFRetain.argtypes = [ctypes.c_void_p]
+        cf.CFRetain.restype = ctypes.c_void_p
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+    def __enter__(self) -> NativeAXBridge:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        cf = self._core_foundation
+        if self.system_wide:
+            self._application_services.AXUIElementSetMessagingTimeout(
+                ctypes.c_void_p(self.system_wide), ctypes.c_float(0.0)
+            )
+        while self._owned_elements:
+            cf.CFRelease(ctypes.c_void_p(self._owned_elements.pop()))
+        for value in self._keys.values():
+            cf.CFRelease(ctypes.c_void_p(value))
+        self._keys.clear()
+
+    def trusted(self) -> bool:
+        return bool(self._application_services.AXIsProcessTrusted()) and self.timeout_configured
+
+    def _key(self, name: str) -> int:
+        if name not in self._keys:
+            value = self._core_foundation.CFStringCreateWithCString(
+                None, name.encode("utf-8"), self.UTF8_ENCODING
+            )
+            if not value:
+                raise AdapterFailure("native_ax_unavailable", f"cannot create AX key: {name}", definitive=True)
+            self._keys[name] = int(value)
+        return self._keys[name]
+
+    def _release(self, value: int | None) -> None:
+        if value:
+            self._core_foundation.CFRelease(ctypes.c_void_p(value))
+
+    def _retain_element(self, value: int) -> int:
+        self._core_foundation.CFRetain(ctypes.c_void_p(value))
+        self._owned_elements.append(value)
+        return value
+
+    def _copy_raw(self, element: int, attribute: str) -> tuple[int, int | None]:
+        output = ctypes.c_void_p()
+        code = int(
+            self._application_services.AXUIElementCopyAttributeValue(
+                ctypes.c_void_p(element), ctypes.c_void_p(self._key(attribute)), ctypes.byref(output)
+            )
+        )
+        return code, int(output.value) if output.value else None
+
+    def _cf_string(self, value: int) -> str | None:
+        cf = self._core_foundation
+        length = cf.CFStringGetLength(ctypes.c_void_p(value))
+        size = cf.CFStringGetMaximumSizeForEncoding(length, self.UTF8_ENCODING) + 1
+        buffer = ctypes.create_string_buffer(max(size, 1))
+        if not cf.CFStringGetCString(
+            ctypes.c_void_p(value), buffer, len(buffer), self.UTF8_ENCODING
+        ):
+            return None
+        return buffer.value.decode("utf-8", errors="replace")
+
+    def _python_value(self, value: int) -> Any:
+        cf = self._core_foundation
+        type_id = cf.CFGetTypeID(ctypes.c_void_p(value))
+        if type_id == cf.CFStringGetTypeID():
+            return self._cf_string(value)
+        if type_id == cf.CFBooleanGetTypeID():
+            return bool(cf.CFBooleanGetValue(ctypes.c_void_p(value)))
+        if type_id == cf.CFNumberGetTypeID():
+            number = ctypes.c_double()
+            if cf.CFNumberGetValue(ctypes.c_void_p(value), 13, ctypes.byref(number)):
+                return int(number.value) if number.value.is_integer() else number.value
+            return None
+        if type_id == cf.CFURLGetTypeID():
+            string_value = cf.CFURLGetString(ctypes.c_void_p(value))
+            return self._cf_string(int(string_value)) if string_value else None
+        return None
+
+    def _scalar(self, element: int, attribute: str) -> tuple[int, Any]:
+        code, value = self._copy_raw(element, attribute)
+        if code != 0 or value is None:
+            return code, None
+        try:
+            return code, self._python_value(value)
+        finally:
+            self._release(value)
+
+    def _element(self, element: int, attribute: str) -> tuple[int, int | None]:
+        code, value = self._copy_raw(element, attribute)
+        if code != 0 or value is None:
+            return code, None
+        if self._core_foundation.CFGetTypeID(ctypes.c_void_p(value)) != self._application_services.AXUIElementGetTypeID():
+            self._release(value)
+            return -25201, None
+        self._owned_elements.append(value)
+        return code, value
+
+    def _element_array(
+        self, element: int, attribute: str, limit: int
+    ) -> tuple[int, list[int], bool]:
+        count = ctypes.c_long()
+        code = int(
+            self._application_services.AXUIElementGetAttributeValueCount(
+                ctypes.c_void_p(element), ctypes.c_void_p(self._key(attribute)), ctypes.byref(count)
+            )
+        )
+        if code != 0:
+            return code, [], False
+        if count.value <= 0:
+            return 0, [], False
+        requested = min(count.value, limit + 1)
+        output = ctypes.c_void_p()
+        code = int(
+            self._application_services.AXUIElementCopyAttributeValues(
+                ctypes.c_void_p(element),
+                ctypes.c_void_p(self._key(attribute)),
+                0,
+                requested,
+                ctypes.byref(output),
+            )
+        )
+        if code != 0 or not output.value:
+            return code, [], False
+        array = int(output.value)
+        elements: list[int] = []
+        try:
+            array_count = self._core_foundation.CFArrayGetCount(ctypes.c_void_p(array))
+            for index in range(min(array_count, limit)):
+                value = self._core_foundation.CFArrayGetValueAtIndex(ctypes.c_void_p(array), index)
+                if not value:
+                    continue
+                pointer = int(value)
+                if (
+                    self._core_foundation.CFGetTypeID(ctypes.c_void_p(pointer))
+                    == self._application_services.AXUIElementGetTypeID()
+                ):
+                    elements.append(self._retain_element(pointer))
+            return 0, elements, count.value > limit or array_count > limit
+        finally:
+            self._release(array)
+
+    def _action_names(self, element: int) -> tuple[int, list[str]]:
+        output = ctypes.c_void_p()
+        code = int(
+            self._application_services.AXUIElementCopyActionNames(
+                ctypes.c_void_p(element), ctypes.byref(output)
+            )
+        )
+        if code != 0 or not output.value:
+            return code, []
+        array = int(output.value)
+        try:
+            names = []
+            count = self._core_foundation.CFArrayGetCount(ctypes.c_void_p(array))
+            for index in range(count):
+                value = self._core_foundation.CFArrayGetValueAtIndex(ctypes.c_void_p(array), index)
+                if value:
+                    converted = self._python_value(int(value))
+                    if isinstance(converted, str):
+                        names.append(converted)
+            return 0, names
+        finally:
+            self._release(array)
+
+    def _same_element(self, left: int | None, right: int | None) -> bool:
+        return bool(
+            left
+            and right
+            and self._core_foundation.CFEqual(ctypes.c_void_p(left), ctypes.c_void_p(right))
+        )
+
+    def _window_row(self, window: int, main_window: int | None) -> tuple[dict[str, Any], bool]:
+        _, title = self._scalar(window, "AXTitle")
+        title_source = "AXTitle" if isinstance(title, str) and title else None
+        if not title_source:
+            _, title_element = self._element(window, "AXTitleUIElement")
+            if title_element is not None:
+                _, title = self._scalar(title_element, "AXValue")
+                if not isinstance(title, str) or not title:
+                    _, title = self._scalar(title_element, "AXTitle")
+                if isinstance(title, str) and title:
+                    title_source = "AXTitleUIElement"
+        _, role = self._scalar(window, "AXRole")
+        _, subrole = self._scalar(window, "AXSubrole")
+        _, document = self._scalar(window, "AXDocument")
+        modal_code, modal_value = self._scalar(window, "AXModal")
+        sheet_code, sheets, sheet_truncated = self._element_array(window, "AXSheets", self.MAX_WINDOWS)
+        modal_unknown = modal_code not in ({0} | AX_LEAF_ERRORS) or sheet_code not in ({0} | AX_LEAF_ERRORS)
+        main_code, main_value = self._scalar(window, "AXMain")
+        is_main = self._same_element(window, main_window) or (main_code == 0 and main_value is True)
+        return (
+            {
+                "title": title if isinstance(title, str) else None,
+                "title_source": title_source,
+                "role": role if isinstance(role, str) else None,
+                "subrole": subrole if isinstance(subrole, str) else None,
+                "document": document if isinstance(document, str) else None,
+                "document_source": "AXDocument" if isinstance(document, str) and document else None,
+                "main": is_main,
+                "modal": modal_value is True,
+                "sheet_count": len(sheets),
+                "sheets_truncated": sheet_truncated,
+            },
+            modal_unknown or sheet_truncated,
+        )
+
+    def _controls(self, main_window: int) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], int]], bool, bool, str | None]:
+        code, initial, initial_truncated = self._element_array(
+            main_window, "AXChildren", self.MAX_CONTROLS
+        )
+        if code not in ({0} | AX_LEAF_ERRORS):
+            return [], [], False, False, f"native_axchildren_{ax_error_name(code)}"
+        if code in AX_LEAF_ERRORS:
+            return [], [], False, False, "native_axchildren_unavailable"
+        queue = [(element, 1) for element in initial]
+        visited: list[int] = []
+        visited_hashes: dict[int, list[int]] = {}
+        controls: list[dict[str, Any]] = []
+        control_elements: list[tuple[dict[str, Any], int]] = []
+        truncated = initial_truncated
+        diagnostic = None
+        index = 0
+        while index < len(queue):
+            element, depth = queue[index]
+            index += 1
+            element_hash = int(self._core_foundation.CFHash(ctypes.c_void_p(element)))
+            bucket = visited_hashes.setdefault(element_hash, [])
+            if any(self._same_element(element, previous) for previous in bucket):
+                continue
+            bucket.append(element)
+            if len(visited) >= self.MAX_CONTROLS:
+                truncated = True
+                break
+            visited.append(element)
+            _, role = self._scalar(element, "AXRole")
+            if role in SUPPORTED_TRANSPORT_CONTROL_ROLES or role in {
+                "AXRadioButton",
+                "AXTextField",
+                "AXStaticText",
+            }:
+                _, title = self._scalar(element, "AXTitle")
+                _, description = self._scalar(element, "AXDescription")
+                _, help_text = self._scalar(element, "AXHelp")
+                _, identifier = self._scalar(element, "AXIdentifier")
+                _, value = self._scalar(element, "AXValue")
+                _, enabled = self._scalar(element, "AXEnabled")
+                _, actions = self._action_names(element)
+                row = {
+                    "role": role,
+                    "title": title,
+                    "description": description,
+                    "help": help_text,
+                    "identifier": identifier,
+                    "value": value,
+                    "enabled": enabled,
+                    "actions": actions,
+                }
+                controls.append(row)
+                control_elements.append((row, element))
+            remaining = self.MAX_CONTROLS - len(visited)
+            child_code, children, child_truncated = self._element_array(
+                element, "AXChildren", max(remaining, 0)
+            )
+            if child_code in AX_LEAF_ERRORS:
+                continue
+            if child_code != 0:
+                truncated = True
+                diagnostic = f"native_axchildren_{ax_error_name(child_code)}"
+                continue
+            if children and depth >= self.MAX_DEPTH:
+                truncated = True
+                diagnostic = "native_axchildren_depth_limit"
+                continue
+            if child_truncated:
+                truncated = True
+                diagnostic = "native_axchildren_element_limit"
+            queue.extend((child, depth + 1) for child in children)
+        if truncated and diagnostic is None:
+            diagnostic = "native_axchildren_element_limit"
+        return controls, control_elements, True, not truncated, diagnostic
+
+    def snapshot(self, *, include_controls: bool, include_elements: bool = False) -> dict[str, Any]:
+        if not self.trusted():
+            return {
+                "accessibility_authorized": False,
+                "window_discovery_source": "AXUIElement",
+                "window_discovery_diagnostic": (
+                    "native_ax_client_not_trusted"
+                    if not self._application_services.AXIsProcessTrusted()
+                    else "native_ax_timeout_configuration_failed"
+                ),
+                "window_set_complete": False,
+                "transport_controls_observed": False,
+                "transport_controls_complete": False,
+                "windows": [],
+                "controls": [],
+            }
+        windows_code, windows, windows_truncated = self._element_array(
+            self.application, "AXWindows", self.MAX_WINDOWS
+        )
+        _, main_window = self._element(self.application, "AXMainWindow")
+        _, focused_window = self._element(self.application, "AXFocusedWindow")
+        complete = windows_code == 0 and not windows_truncated
+        diagnostic = None
+        if windows_code != 0:
+            diagnostic = f"native_axwindows_{ax_error_name(windows_code)}"
+        elif windows_truncated:
+            diagnostic = "native_axwindows_limit"
+        if main_window is not None and not any(self._same_element(main_window, window) for window in windows):
+            complete = False
+            diagnostic = "native_axwindows_omits_main_window"
+        selected_windows = windows
+        source = "AXUIElement.AXWindows"
+        if not selected_windows and main_window is not None:
+            selected_windows = [main_window]
+            source = "AXUIElement.AXMainWindow"
+            complete = False
+            diagnostic = diagnostic or "native_axwindows_omits_main_window"
+        elif not selected_windows and focused_window is not None:
+            selected_windows = [focused_window]
+            source = "AXUIElement.AXFocusedWindow"
+            complete = False
+            diagnostic = diagnostic or "native_axwindows_omits_focused_window"
+        window_rows = []
+        modal = False
+        modal_unknown = False
+        for window in selected_windows:
+            row, unknown = self._window_row(window, main_window)
+            window_rows.append(row)
+            modal = modal or row["subrole"] == "AXDialog" or row["modal"] or row["sheet_count"] > 0
+            modal_unknown = modal_unknown or unknown
+        application_document_code, application_document = self._scalar(self.application, "AXDocument")
+        if application_document_code == 0 and isinstance(application_document, str):
+            for row in window_rows:
+                if row["main"] and not row["document"]:
+                    row["document"] = application_document
+                    row["document_source"] = "application.AXDocument"
+        selected_main = next(
+            (
+                window
+                for window, row in zip(selected_windows, window_rows, strict=True)
+                if row["main"] is True
+            ),
+            None,
+        )
+        if selected_windows and selected_main is None:
+            complete = False
+            diagnostic = diagnostic or "native_ax_main_window_unavailable"
+        controls: list[dict[str, Any]] = []
+        control_elements: list[tuple[dict[str, Any], int]] = []
+        controls_observed = False
+        controls_complete = False
+        control_diagnostic = None
+        if include_controls and selected_main is not None:
+            controls, control_elements, controls_observed, controls_complete, control_diagnostic = self._controls(
+                selected_main
+            )
+        result = {
+            "accessibility_authorized": True,
+            "modal_dialog": True if modal else False if complete and not modal_unknown else None,
+            "window_discovery_source": source,
+            "window_discovery_diagnostic": diagnostic,
+            "window_set_complete": complete,
+            "focus_temporarily_changed": False,
+            "transport_controls_observed": controls_observed,
+            "transport_controls_complete": controls_complete,
+            "control_tree_source": "AXUIElement.AXChildren" if controls_observed else None,
+            "control_tree_diagnostic": control_diagnostic,
+            "windows": window_rows,
+            "controls": controls,
+            "controls_truncated": controls_observed and not controls_complete,
+        }
+        if include_elements:
+            result["_control_elements"] = control_elements
+        return result
+
+    def dispatch_transport(self, operation: str, expected_project: str) -> dict[str, Any]:
+        snapshot = self.snapshot(include_controls=True, include_elements=True)
+        if snapshot.get("accessibility_authorized") is not True:
+            raise AdapterFailure("accessibility_not_authorized", "native AX client is not trusted", definitive=True)
+        if snapshot.get("window_set_complete") is not True:
+            raise AdapterFailure(
+                "window_set_incomplete",
+                str(snapshot.get("window_discovery_diagnostic") or "native AX window set is incomplete"),
+                definitive=True,
+            )
+        if snapshot.get("modal_dialog") is not False:
+            raise AdapterFailure("modal_dialog_present", "Logic modal state is unsafe or unknown", definitive=True)
+        assert_project_binding(snapshot, expected_project)
+        if snapshot.get("transport_controls_observed") is not True:
+            raise AdapterFailure("transport_control_tree_unavailable", "native AX control tree is unavailable", definitive=True)
+        if snapshot.get("transport_controls_complete") is not True:
+            raise AdapterFailure("transport_control_tree_truncated", "native AX control tree is incomplete", definitive=True)
+        transport = transport_from_controls(snapshot.get("controls"))
+        if transport["is_playing"] is None:
+            raise AdapterFailure("transport_state_not_observable", "native AX transport state is unavailable", definitive=True)
+        wants_playing = operation == "transport.play"
+        if transport["is_playing"] is wants_playing:
+            return {
+                "ok": True,
+                "performed": False,
+                "already_satisfied": True,
+                "window_discovery_source": snapshot.get("window_discovery_source"),
+                "before": {"is_playing": transport["is_playing"]},
+            }
+        labels = PLAY_LABELS if wants_playing else STOP_LABELS
+        candidates = [
+            (row, element)
+            for row, element in snapshot.get("_control_elements", [])
+            if row.get("role") in SUPPORTED_TRANSPORT_CONTROL_ROLES
+            and matches_label(row, labels)
+            and "AXPress" in row.get("actions", [])
+        ]
+        if not candidates:
+            raise AdapterFailure(
+                "play_control_not_found" if wants_playing else "stop_control_not_found",
+                "matching native AX transport control with AXPress was not found",
+                definitive=True,
+            )
+        code = int(
+            self._application_services.AXUIElementPerformAction(
+                ctypes.c_void_p(candidates[0][1]), ctypes.c_void_p(self._key("AXPress"))
+            )
+        )
+        if code != 0:
+            definitive = code in {-25202, -25205, -25206, -25208, -25211, -25212}
+            raise AdapterFailure(
+                "ax_press_failed",
+                f"AXUIElementPerformAction failed: {ax_error_name(code)}",
+                definitive=definitive,
+                may_have_dispatched=not definitive,
+            )
+        return {
+            "ok": True,
+            "performed": True,
+            "already_satisfied": False,
+            "window_discovery_source": snapshot.get("window_discovery_source"),
+            "before": {"is_playing": transport["is_playing"]},
+        }
+
+
 class MacOSAccessibilityBackend:
-    def __init__(self, timeout_seconds: float = 10.0):
+    def __init__(self, timeout_seconds: float = 10.0, native_bridge_factory: Any = NativeAXBridge):
         self.timeout_seconds = timeout_seconds
+        self.native_bridge_factory = native_bridge_factory
 
     def _require_macos(self) -> None:
         if platform.system() != "Darwin":
@@ -716,14 +1335,105 @@ class MacOSAccessibilityBackend:
             return True
         return None
 
+    def _process_snapshot(self, preferred_bundle_id: str | None = None) -> dict[str, Any]:
+        return self._run_jxa(render_process_jxa(preferred_bundle_id))
+
+    @staticmethod
+    def _snapshot_score(snapshot: dict[str, Any], include_controls: bool) -> int:
+        score = 0
+        if snapshot.get("accessibility_authorized") is True:
+            score += 1
+        if main_window(snapshot) is not None:
+            score += 2
+        if snapshot.get("window_set_complete") is True:
+            score += 8
+        project = project_from_snapshot(snapshot)
+        if project["current_project"] is not None or project["window_project_name"] is not None:
+            score += 4
+        if include_controls and snapshot.get("transport_controls_complete") is True:
+            score += 8
+        return score
+
     def snapshot(self, *, include_controls: bool = True) -> dict[str, Any]:
-        snapshot = self._run_jxa(render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": include_controls}))
-        snapshot["screen_unlocked"] = self._screen_unlocked()
+        process = self._process_snapshot()
+        unlocked = self._screen_unlocked()
+        if process.get("logic_running") is not True:
+            return {
+                "ok": True,
+                "logic_running": False,
+                "bundle_identifier": None,
+                "process_identifier": None,
+                "screen_unlocked": unlocked,
+                "accessibility_authorized": False,
+                "accessibility_backend": None,
+                "frontmost": None,
+                "modal_dialog": None,
+                "window_discovery_source": None,
+                "window_discovery_diagnostic": "logic_process_not_found",
+                "window_set_complete": False,
+                "focus_temporarily_changed": False,
+                "transport_controls_observed": False,
+                "transport_controls_complete": False,
+                "windows": [],
+                "controls": [],
+            }
+        process_identifier = process.get("process_identifier")
+        native: dict[str, Any] | None = None
+        native_error: str | None = None
+        if isinstance(process_identifier, int) and process_identifier > 0:
+            try:
+                with self.native_bridge_factory(process_identifier, self.timeout_seconds) as bridge:
+                    native = bridge.snapshot(include_controls=include_controls)
+            except (AdapterFailure, OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError) as exc:
+                native_error = f"native_ax_bridge_error:{type(exc).__name__}"
+        legacy: dict[str, Any] | None = None
+        use_native_without_fallback = native is not None and native.get("window_set_complete") is True
+        if include_controls and native is not None and native.get("transport_controls_complete") is not True:
+            use_native_without_fallback = False
+        if not use_native_without_fallback:
+            legacy = self._run_jxa(render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": include_controls}))
+        candidates = [candidate for candidate in (native, legacy) if isinstance(candidate, dict)]
+        if not candidates:
+            raise AdapterFailure("adapter_unavailable", "no Accessibility snapshot backend is available", definitive=True)
+        snapshot = max(candidates, key=lambda candidate: self._snapshot_score(candidate, include_controls))
+        snapshot["ok"] = True
+        snapshot["logic_running"] = True
+        snapshot["bundle_identifier"] = process.get("bundle_identifier")
+        snapshot["process_identifier"] = process_identifier
+        snapshot["screen_unlocked"] = unlocked
+        snapshot["frontmost"] = process.get("frontmost")
+        snapshot["accessibility_backend"] = (
+            "AXUIElement" if snapshot is native else "SystemEvents"
+        )
+        snapshot["native_accessibility_diagnostic"] = (
+            native_error
+            or (native.get("window_discovery_diagnostic") if isinstance(native, dict) else "native_ax_unavailable")
+        )
         return snapshot
 
-    def dispatch_transport(self, operation: str, expected_project: str, bundle_identifier: str) -> dict[str, Any]:
+    def dispatch_transport(
+        self,
+        operation: str,
+        expected_project: str,
+        bundle_identifier: str,
+        process_identifier: int | None = None,
+    ) -> dict[str, Any]:
         if bundle_identifier not in SUPPORTED_LOGIC_BUNDLE_IDS:
             raise AdapterFailure("unsupported_logic_bundle", "observed Logic bundle identifier is unsupported", definitive=True)
+        process = self._process_snapshot(bundle_identifier)
+        current_process_identifier = process.get("process_identifier")
+        if process.get("logic_running") is not True or not isinstance(current_process_identifier, int):
+            raise AdapterFailure("logic_not_running", "Logic Pro process disappeared before dispatch", definitive=True)
+        if process_identifier is not None and current_process_identifier != process_identifier:
+            raise AdapterFailure("logic_process_changed", "Logic Pro process changed after preflight snapshot", definitive=True)
+        try:
+            with self.native_bridge_factory(current_process_identifier, self.timeout_seconds) as bridge:
+                if bridge.trusted():
+                    return bridge.dispatch_transport(operation, expected_project)
+        except AdapterFailure:
+            raise
+        except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
+            pass
         source = render_jxa(
             ACTION_JXA,
             {
@@ -791,12 +1501,15 @@ class ReferenceAdapter:
             data = {
                 "logic_running": snapshot.get("logic_running") is True,
                 "bundle_identifier": snapshot.get("bundle_identifier"),
+                "process_identifier": snapshot.get("process_identifier"),
+                "accessibility_backend": snapshot.get("accessibility_backend"),
                 "screen_unlocked": snapshot.get("screen_unlocked"),
                 "accessibility_authorized": snapshot.get("accessibility_authorized") is True,
                 "modal_dialog": snapshot.get("modal_dialog") if snapshot.get("logic_running") is True else None,
                 "frontmost": snapshot.get("frontmost"),
                 "window_discovery_source": snapshot.get("window_discovery_source"),
                 "window_discovery_diagnostic": snapshot.get("window_discovery_diagnostic"),
+                "native_accessibility_diagnostic": snapshot.get("native_accessibility_diagnostic"),
                 "window_set_complete": snapshot.get("window_set_complete") is True,
                 "focus_temporarily_changed": snapshot.get("focus_temporarily_changed") is True,
                 "transport_controls_observed": snapshot.get("transport_controls_observed") is True,
@@ -806,8 +1519,12 @@ class ReferenceAdapter:
         elif operation == "project.current":
             data = project
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
+            data["process_identifier"] = snapshot.get("process_identifier")
+            data["accessibility_backend"] = snapshot.get("accessibility_backend")
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
             data["window_discovery_diagnostic"] = snapshot.get("window_discovery_diagnostic")
+            data["native_accessibility_diagnostic"] = snapshot.get("native_accessibility_diagnostic")
+            data["control_tree_diagnostic"] = snapshot.get("control_tree_diagnostic")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
             data["focus_temporarily_changed"] = snapshot.get("focus_temporarily_changed") is True
             data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True
@@ -817,8 +1534,12 @@ class ReferenceAdapter:
             data = transport
             data.update(project)
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
+            data["process_identifier"] = snapshot.get("process_identifier")
+            data["accessibility_backend"] = snapshot.get("accessibility_backend")
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
             data["window_discovery_diagnostic"] = snapshot.get("window_discovery_diagnostic")
+            data["native_accessibility_diagnostic"] = snapshot.get("native_accessibility_diagnostic")
+            data["control_tree_diagnostic"] = snapshot.get("control_tree_diagnostic")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
             data["focus_temporarily_changed"] = snapshot.get("focus_temporarily_changed") is True
             data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True
@@ -867,7 +1588,12 @@ class ReferenceAdapter:
             capabilities = runtime_capabilities(snapshot)
             if operation not in capabilities or "transport.state" not in capabilities:
                 raise AdapterFailure("capability_unavailable", "operation or independent readback is unavailable", definitive=True)
-            action = self.backend.dispatch_transport(operation, expected_project, bundle_identifier)
+            action = self.backend.dispatch_transport(
+                operation,
+                expected_project,
+                bundle_identifier,
+                snapshot.get("process_identifier"),
+            )
             return {
                 "ok": True,
                 "operation": operation,

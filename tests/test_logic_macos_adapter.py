@@ -54,6 +54,8 @@ def snapshot(
         "ok": True,
         "logic_running": True,
         "bundle_identifier": bundle_identifier,
+        "process_identifier": 4242,
+        "accessibility_backend": "SystemEvents",
         "screen_unlocked": True,
         "accessibility_authorized": True,
         "modal_dialog": False,
@@ -85,11 +87,69 @@ class FakeBackend:
             state["transport_controls_complete"] = False
         return state
 
-    def dispatch_transport(self, operation, expected_project, bundle_identifier):
-        self.dispatch_calls.append((operation, expected_project, bundle_identifier))
+    def dispatch_transport(self, operation, expected_project, bundle_identifier, process_identifier=None):
+        self.dispatch_calls.append((operation, expected_project, bundle_identifier, process_identifier))
         if isinstance(self.action, Exception):
             raise self.action
         return dict(self.action)
+
+
+class FakeNativeBridge:
+    def __init__(self, state: dict, *, trusted=True, action=None):
+        self.state = state
+        self.is_trusted = trusted
+        self.action = action or {"ok": True, "performed": True, "already_satisfied": False}
+        self.snapshot_calls = []
+        self.dispatch_calls = []
+        self.factory_calls = []
+
+    def __call__(self, process_identifier, timeout_seconds):
+        self.factory_calls.append((process_identifier, timeout_seconds))
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return None
+
+    def trusted(self):
+        return self.is_trusted
+
+    def snapshot(self, *, include_controls, include_elements=False):
+        self.snapshot_calls.append((include_controls, include_elements))
+        return json.loads(json.dumps(self.state))
+
+    def dispatch_transport(self, operation, expected_project):
+        self.dispatch_calls.append((operation, expected_project))
+        return dict(self.action)
+
+
+class StubMacOSBackend(adapter_module.MacOSAccessibilityBackend):
+    def __init__(self, native_bridge, legacy_state=None):
+        super().__init__(10.0, native_bridge_factory=native_bridge)
+        self.legacy_state = legacy_state
+        self.jxa_calls = []
+
+    def _require_macos(self):
+        return None
+
+    def _screen_unlocked(self):
+        return True
+
+    def _run_jxa(self, source, *, may_dispatch=False):
+        self.jxa_calls.append((source, may_dispatch))
+        if "process_identifier" in source and "discoverProcessWindows" not in source:
+            return {
+                "ok": True,
+                "logic_running": True,
+                "bundle_identifier": "com.apple.mobilelogic",
+                "process_identifier": 4242,
+                "frontmost": False,
+            }
+        if self.legacy_state is not None:
+            return json.loads(json.dumps(self.legacy_state))
+        raise AssertionError("legacy JXA snapshot should not be called")
 
 
 class LogicMacOSAdapterTests(unittest.TestCase):
@@ -150,6 +210,17 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertFalse(result["data"]["transport_controls_observed"])
         self.assertEqual(result["data"]["current_project"], str(Path(self.project).resolve()))
 
+    def test_project_identity_reports_direct_ax_fallback_source(self):
+        state = snapshot(self.project)
+        state["windows"][0]["document_source"] = "application.AXDocument"
+        state["windows"][0]["title_source"] = "AXTitleUIElement"
+        observed = adapter_module.ReferenceAdapter(FakeBackend(state)).observe("project.current")
+        self.assertEqual(observed["data"]["project_identity_source"], "application.AXDocument")
+
+        state["windows"][0]["document"] = None
+        observed = adapter_module.ReferenceAdapter(FakeBackend(state)).observe("project.current")
+        self.assertEqual(observed["data"]["project_identity_source"], "AXTitleUIElement")
+
     def test_snapshot_jxa_gates_control_traversal(self):
         lightweight_source = adapter_module.render_jxa(
             adapter_module.SNAPSHOT_JXA,
@@ -161,6 +232,86 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertIn("boundedDescendants(mainWindow, 4000, 32)", lightweight_source)
         self.assertIn("transport_controls_complete: controlsObserved && !controlsTruncated", lightweight_source)
         self.assertNotIn("entireContents()", lightweight_source)
+
+    def test_native_ax_snapshot_is_primary_and_does_not_foreground_logic(self):
+        native_state = snapshot(
+            self.project,
+            window_discovery_source="AXUIElement.AXWindows",
+        )
+        native_state["focus_temporarily_changed"] = False
+        native = FakeNativeBridge(native_state)
+        backend = StubMacOSBackend(native)
+        observed = backend.snapshot(include_controls=True)
+        self.assertEqual(observed["accessibility_backend"], "AXUIElement")
+        self.assertEqual(observed["process_identifier"], 4242)
+        self.assertFalse(observed["frontmost"])
+        self.assertFalse(observed["focus_temporarily_changed"])
+        self.assertEqual(native.snapshot_calls, [(True, False)])
+        self.assertEqual(len(backend.jxa_calls), 1)
+        self.assertNotIn("discoverProcessWindows", backend.jxa_calls[0][0])
+
+    def test_untrusted_native_ax_falls_back_to_system_events(self):
+        native_state = {
+            "accessibility_authorized": False,
+            "window_discovery_source": "AXUIElement",
+            "window_discovery_diagnostic": "native_ax_client_not_trusted",
+            "window_set_complete": False,
+            "transport_controls_observed": False,
+            "transport_controls_complete": False,
+            "windows": [],
+            "controls": [],
+        }
+        legacy = snapshot(self.project, window_discovery_source="process.windows")
+        native = FakeNativeBridge(native_state, trusted=False)
+        backend = StubMacOSBackend(native, legacy)
+        observed = backend.snapshot(include_controls=True)
+        self.assertEqual(observed["accessibility_backend"], "SystemEvents")
+        self.assertEqual(observed["window_discovery_source"], "process.windows")
+        self.assertEqual(observed["native_accessibility_diagnostic"], "native_ax_client_not_trusted")
+        self.assertEqual(len(backend.jxa_calls), 2)
+
+    def test_native_ax_bridge_error_falls_back_with_diagnostic(self):
+        def unavailable_bridge(process_identifier, timeout_seconds):
+            raise ValueError(f"cannot bind {process_identifier} within {timeout_seconds}")
+
+        legacy = snapshot(self.project, window_discovery_source="process.windows")
+        backend = StubMacOSBackend(unavailable_bridge, legacy)
+        observed = backend.snapshot(include_controls=True)
+        self.assertEqual(observed["accessibility_backend"], "SystemEvents")
+        self.assertEqual(observed["native_accessibility_diagnostic"], "native_ax_bridge_error:ValueError")
+
+    def test_native_ax_dispatch_rebinds_the_same_process_before_action(self):
+        native_state = snapshot(self.project, window_discovery_source="AXUIElement.AXWindows")
+        native = FakeNativeBridge(
+            native_state,
+            action={
+                "ok": True,
+                "performed": True,
+                "already_satisfied": False,
+                "window_discovery_source": "AXUIElement.AXWindows",
+            },
+        )
+        backend = StubMacOSBackend(native)
+        result = backend.dispatch_transport(
+            "transport.play",
+            self.project,
+            "com.apple.mobilelogic",
+            4242,
+        )
+        self.assertTrue(result["performed"])
+        self.assertEqual(native.dispatch_calls, [("transport.play", self.project)])
+        self.assertEqual(native.factory_calls, [(4242, 10.0)])
+
+    def test_native_ax_source_is_bounded_and_does_not_activate_logic(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("AXUIElementSetMessagingTimeout", source)
+        self.assertIn("AXUIElementCopyAttributeValues", source)
+        self.assertIn("MAX_WINDOWS = 64", source)
+        self.assertIn("MAX_CONTROLS = 4000", source)
+        self.assertIn("MAX_DEPTH = 32", source)
+        self.assertIn("native_ax_main_window_unavailable", source)
+        self.assertNotIn("process.frontmost = true", adapter_module.PROCESS_SNAPSHOT_JXA)
+        self.assertEqual(adapter_module.ax_error_name(-25204), "cannot_complete")
 
     def test_foreground_empty_window_snapshot_fails_closed(self):
         state = snapshot(self.project)
@@ -286,7 +437,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         backend = FakeBackend(state)
         result = adapter_module.ReferenceAdapter(backend).dispatch(preflight("transport.play", self.project))
         self.assertTrue(result["ok"])
-        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, "com.apple.mobilelogic")])
+        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, "com.apple.mobilelogic", 4242)])
 
     def test_checkbox_without_axpress_does_not_expose_play_dispatch(self):
         state = snapshot(self.project)
@@ -322,7 +473,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(result["dispatch"]["status"], "success")
         self.assertTrue(result["readback_required"])
         self.assertNotIn("readback", result)
-        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, "com.apple.mobilelogic")])
+        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, "com.apple.mobilelogic", 4242)])
 
     def test_current_and_legacy_bundle_identifiers_use_the_same_contract(self):
         for bundle_identifier in adapter_module.SUPPORTED_LOGIC_BUNDLE_IDS:
@@ -335,7 +486,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
                 dispatched = adapter.dispatch(preflight("transport.play", self.project))
                 self.assertTrue(dispatched["ok"])
                 self.assertEqual(dispatched["dispatch"]["bundle_identifier"], bundle_identifier)
-                self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, bundle_identifier)])
+                self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, bundle_identifier, 4242)])
 
     def test_snapshot_and_action_share_central_bundle_discovery(self):
         snapshot_source = adapter_module.render_jxa(adapter_module.SNAPSHOT_JXA)
