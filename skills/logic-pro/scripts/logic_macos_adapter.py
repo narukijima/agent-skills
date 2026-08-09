@@ -25,7 +25,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.3.1"
+ADAPTER_VERSION = "0.4.0"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -59,6 +59,8 @@ IMPLEMENTED_WRITES = ("transport.play", "transport.stop")
 PLAY_LABELS = ("play", "再生")
 STOP_LABELS = ("stop", "停止")
 BEGINNING_LABELS = ("go to beginning", "先頭へ移動", "先頭に移動")
+GENERIC_LOGIC_WINDOW_TITLES = ("logic pro",)
+NATIVE_CHILD_ATTRIBUTES = ("AXChildren", "AXContents", "AXChildrenInNavigationOrder")
 
 
 BUNDLE_DISCOVERY_JXA = r'''
@@ -518,6 +520,13 @@ def normalize_document_path(value: Any) -> str | None:
     return os.path.realpath(os.path.abspath(value))
 
 
+def normalize_project_document(value: Any) -> str | None:
+    document = normalize_document_path(value)
+    if document is None or not document.casefold().endswith(".logicx"):
+        return None
+    return document
+
+
 def element_text(control: dict[str, Any]) -> list[str]:
     values = []
     for key in ("title", "description", "help", "identifier"):
@@ -527,10 +536,26 @@ def element_text(control: dict[str, Any]) -> list[str]:
     return values
 
 
+def normalized_semantic_text(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
 def matches_label(control: dict[str, Any], labels: tuple[str, ...]) -> bool:
     candidates = tuple(label.casefold() for label in labels)
+    normalized_candidates = {
+        form
+        for label in candidates
+        for form in (
+            normalized_semantic_text(label),
+            normalized_semantic_text(label + " button"),
+            normalized_semantic_text("transport " + label),
+            normalized_semantic_text("transport " + label + " button"),
+        )
+    }
     for value in element_text(control):
         if any(value in {candidate, candidate + " button", candidate + "ボタン"} for candidate in candidates):
+            return True
+        if normalized_semantic_text(value) in normalized_candidates:
             return True
     return False
 
@@ -560,36 +585,137 @@ def transport_from_controls(controls: Any) -> dict[str, Any]:
     play_controls = [control for control in transport_controls if matches_label(control, PLAY_LABELS)]
     stop_controls = [control for control in transport_controls if matches_label(control, STOP_LABELS)]
     beginning_controls = [control for control in transport_controls if matches_label(control, BEGINNING_LABELS)]
-    play = next(iter(play_controls), None)
-    stop = next(iter(stop_controls), None)
-    beginning = next(iter(beginning_controls), None)
-    playing = boolean_value(play.get("value")) if play else None
+    play = play_controls[0] if len(play_controls) == 1 else None
+    stop = stop_controls[0] if len(stop_controls) == 1 else None
+    beginning = beginning_controls[0] if len(beginning_controls) == 1 else None
+    ambiguous = any(
+        len(candidates) > 1
+        for candidates in (play_controls, stop_controls, beginning_controls)
+    )
+    playing = boolean_value(play.get("value")) if play and not ambiguous else None
     state_basis = "play-control-value" if playing is not None else None
-    if playing is None and stop is not None and beginning is None:
+    if not ambiguous and playing is None and stop is not None and beginning is None:
         playing = True
         state_basis = "stop-control-present"
-    elif playing is None and beginning is not None and stop is None:
+    elif not ambiguous and playing is None and beginning is not None and stop is None:
         playing = False
         state_basis = "go-to-beginning-control-present"
     return {
         "is_playing": playing,
         "state_basis": state_basis,
-        "play_control_available": any("AXPress" in control.get("actions", []) for control in play_controls),
-        "stop_control_available": any("AXPress" in control.get("actions", []) for control in stop_controls),
+        "play_control_available": bool(
+            not ambiguous and play is not None and "AXPress" in play.get("actions", [])
+        ),
+        "stop_control_available": bool(
+            not ambiguous and stop is not None and "AXPress" in stop.get("actions", [])
+        ),
+        "control_ambiguous": ambiguous,
+        "play_control_count": len(play_controls),
+        "stop_control_count": len(stop_controls),
+        "beginning_control_count": len(beginning_controls),
     }
 
 
-def main_window(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+def snapshot_windows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     windows = snapshot.get("windows")
     if not isinstance(windows, list):
-        return None
+        return []
+    return [window for window in windows if isinstance(window, dict)]
+
+
+def ax_main_window(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    windows = snapshot_windows(snapshot)
     for window in windows:
-        if isinstance(window, dict) and window.get("main") is True:
+        if window.get("main") is True:
             return window
-    return next((window for window in windows if isinstance(window, dict)), None)
+    return windows[0] if windows else None
+
+
+def generic_logic_window_title(title: Any) -> bool:
+    return isinstance(title, str) and title.strip().casefold() in GENERIC_LOGIC_WINDOW_TITLES
+
+
+def project_window_rank(window: dict[str, Any]) -> tuple[int, int, int]:
+    document = normalize_project_document(window.get("document"))
+    title = window.get("title") if isinstance(window.get("title"), str) else None
+    precise_title = bool(title and not generic_logic_window_title(title) and title.casefold().endswith(".logicx"))
+    return (
+        1 if document is not None else 0,
+        1 if precise_title else 0,
+        1 if window.get("main") is True else 0,
+    )
+
+
+def main_window(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    windows = snapshot_windows(snapshot)
+    if not windows:
+        return None
+    ranked = sorted(windows, key=project_window_rank, reverse=True)
+    if project_window_rank(ranked[0])[:2] != (0, 0):
+        return ranked[0]
+    return ax_main_window(snapshot)
+
+
+def project_document_candidates(snapshot: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    supplied = snapshot.get("project_document_candidates")
+    if isinstance(supplied, list):
+        candidates.extend(
+            document
+            for value in supplied
+            if (document := normalize_project_document(value)) is not None
+        )
+    candidates.extend(
+        document
+        for window in snapshot_windows(snapshot)
+        if (document := normalize_project_document(window.get("document"))) is not None
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def precise_project_titles(snapshot: dict[str, Any]) -> list[str]:
+    return [
+        window["title"]
+        for window in snapshot_windows(snapshot)
+        if isinstance(window.get("title"), str)
+        and not generic_logic_window_title(window["title"])
+        and window["title"].casefold().endswith(".logicx")
+    ]
+
+
+def project_identity_ambiguous(snapshot: dict[str, Any]) -> bool:
+    documents = project_document_candidates(snapshot)
+    titles = precise_project_titles(snapshot)
+    if len(documents) > 1:
+        return True
+    if not documents:
+        return len(titles) > 1
+    document_titles = {Path(document).name for document in documents}
+    return any(title not in document_titles for title in titles)
 
 
 def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if snapshot.get("project_identity_complete") is False:
+        reason = (
+            "project_identity_ambiguous"
+            if snapshot.get("project_identity_diagnostic") == "native_axdocument_ambiguous"
+            else "project_identity_incomplete"
+        )
+        return {
+            "current_project": None,
+            "current_project_unavailable": True,
+            "current_project_unavailable_reason": reason,
+            "window_project_name": None,
+            "project_identity_source": None,
+        }
+    if project_identity_ambiguous(snapshot):
+        return {
+            "current_project": None,
+            "current_project_unavailable": True,
+            "current_project_unavailable_reason": "project_identity_ambiguous",
+            "window_project_name": None,
+            "project_identity_source": None,
+        }
     window = main_window(snapshot)
     if window is None:
         return {
@@ -599,13 +725,21 @@ def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             "window_project_name": None,
             "project_identity_source": None,
         }
-    current = normalize_document_path(window.get("document"))
+    current = normalize_project_document(window.get("document"))
     title = window.get("title") if isinstance(window.get("title"), str) else None
+    if generic_logic_window_title(title):
+        title = None
     return {
         "current_project": current,
         "current_project_unavailable": current is None,
         "current_project_unavailable_reason": (
-            None if current is not None else "document_path_not_exposed" if title else "main_window_has_no_document_or_title"
+            None
+            if current is not None
+            else "document_path_not_exposed"
+            if title
+            else "generic_application_title_only"
+            if generic_logic_window_title(window.get("title"))
+            else "project_window_has_no_document_or_title"
         ),
         "window_project_name": title,
         "project_identity_source": (
@@ -614,6 +748,21 @@ def project_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             else window.get("title_source", "AXTitle") if title else None
         ),
     }
+
+
+def window_evidence(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": index,
+            "title": window.get("title") if isinstance(window.get("title"), str) else None,
+            "role": window.get("role") if isinstance(window.get("role"), str) else None,
+            "subrole": window.get("subrole") if isinstance(window.get("subrole"), str) else None,
+            "main": window.get("main") is True,
+            "has_document": normalize_project_document(window.get("document")) is not None,
+            "document_source": window.get("document_source"),
+        }
+        for index, window in enumerate(snapshot_windows(snapshot))
+    ]
 
 
 def runtime_capabilities(snapshot: dict[str, Any]) -> list[str]:
@@ -626,6 +775,7 @@ def runtime_capabilities(snapshot: dict[str, Any]) -> list[str]:
     if (
         snapshot.get("transport_controls_observed") is True
         and snapshot.get("transport_controls_complete") is True
+        and snapshot.get("transport_control_window_ambiguous") is not True
         and transport["is_playing"] is not None
     ):
         capabilities.append("transport.state")
@@ -662,22 +812,48 @@ def validate_preflight(preflight: Any) -> tuple[str, dict[str, Any]]:
 
 
 def assert_project_binding(snapshot: dict[str, Any], expected_project: str) -> None:
-    project = project_from_snapshot(snapshot)
     expected = os.path.realpath(os.path.abspath(expected_project))
-    current = project["current_project"]
-    if current is not None:
-        if current != expected:
-            raise AdapterFailure("project_mismatch", "current Logic project does not match preflight", definitive=True)
-        return
-    if project["window_project_name"] is None:
-        reason = project["current_project_unavailable_reason"]
+    windows = snapshot_windows(snapshot)
+    if snapshot.get("project_identity_complete") is False:
         raise AdapterFailure(
-            "project_identity_unavailable",
-            f"Logic main window does not expose a project document or title: {reason}",
+            "project_identity_incomplete",
+            str(snapshot.get("project_identity_diagnostic") or "project identity traversal is incomplete"),
             definitive=True,
         )
-    if project["window_project_name"] != Path(expected).name:
-        raise AdapterFailure("project_mismatch", "Logic window title does not exactly match expected .logicx name", definitive=True)
+    distinct_documents = set(project_document_candidates(snapshot))
+    if project_identity_ambiguous(snapshot):
+        raise AdapterFailure(
+            "project_identity_ambiguous",
+            "conflicting Logic project document or title evidence is exposed",
+            definitive=True,
+        )
+    if expected in distinct_documents:
+        return
+    if distinct_documents:
+        raise AdapterFailure("project_mismatch", "no Logic project window matches preflight", definitive=True)
+    expected_title = Path(expected).name
+    precise_titles = precise_project_titles(snapshot)
+    title_matches = [
+        window
+        for window in windows
+        if isinstance(window.get("title"), str) and window["title"] == expected_title
+    ]
+    if len(title_matches) == 1 and set(precise_titles) == {expected_title}:
+        return
+    if len(title_matches) > 1 or len(set(precise_titles)) > 1:
+        raise AdapterFailure(
+            "project_identity_ambiguous",
+            "multiple Logic project-like window titles are exposed",
+            definitive=True,
+        )
+    project = project_from_snapshot(snapshot)
+    if project["window_project_name"] is None:
+        raise AdapterFailure(
+            "project_identity_unavailable",
+            f"Logic window set does not expose a project document or precise title: {project['current_project_unavailable_reason']}",
+            definitive=True,
+        )
+    raise AdapterFailure("project_mismatch", "no Logic window title exactly matches expected .logicx name", definitive=True)
 
 
 AX_ERROR_NAMES = {
@@ -728,6 +904,8 @@ class NativeAXBridge:
     MAX_WINDOWS = 64
     MAX_CONTROLS = 4000
     MAX_DEPTH = 32
+    MAX_IDENTITY_ELEMENTS = 512
+    MAX_IDENTITY_DEPTH = 12
 
     def __init__(self, process_identifier: int, timeout_seconds: float):
         if not isinstance(process_identifier, int) or process_identifier <= 0:
@@ -860,7 +1038,13 @@ class NativeAXBridge:
         self._keys.clear()
 
     def trusted(self) -> bool:
-        return bool(self._application_services.AXIsProcessTrusted()) and self.timeout_configured
+        return self.client_trusted() and self.timeout_configured
+
+    def client_trusted(self) -> bool:
+        return bool(self._application_services.AXIsProcessTrusted())
+
+    def legacy_fallback_allowed(self) -> bool:
+        return not self.client_trusted()
 
     def _key(self, name: str) -> int:
         if name not in self._keys:
@@ -1046,21 +1230,39 @@ class NativeAXBridge:
             modal_unknown or sheet_truncated,
         )
 
-    def _controls(self, main_window: int) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], int]], bool, bool, str | None]:
-        code, initial, initial_truncated = self._element_array(
-            main_window, "AXChildren", self.MAX_CONTROLS
-        )
-        if code not in ({0} | AX_LEAF_ERRORS):
-            return [], [], False, False, f"native_axchildren_{ax_error_name(code)}"
-        if code in AX_LEAF_ERRORS:
-            return [], [], False, False, "native_axchildren_unavailable"
-        queue = [(element, 1) for element in initial]
-        visited: list[int] = []
-        visited_hashes: dict[int, list[int]] = {}
-        controls: list[dict[str, Any]] = []
-        control_elements: list[tuple[dict[str, Any], int]] = []
-        truncated = initial_truncated
+    def _child_elements(
+        self, element: int, limit: int
+    ) -> tuple[list[int], bool, bool, str | None]:
+        children: list[int] = []
+        saw_supported_attribute = False
+        truncated = False
         diagnostic = None
+        for attribute in NATIVE_CHILD_ATTRIBUTES:
+            remaining = max(limit - len(children), 0)
+            code, values, attribute_truncated = self._element_array(element, attribute, remaining)
+            if code == 0:
+                saw_supported_attribute = True
+                children.extend(values)
+                truncated = truncated or attribute_truncated
+                if attribute_truncated:
+                    diagnostic = diagnostic or f"native_{attribute.casefold()}_element_limit"
+            elif code not in AX_LEAF_ERRORS:
+                truncated = True
+                diagnostic = diagnostic or f"native_{attribute.casefold()}_{ax_error_name(code)}"
+        if not saw_supported_attribute and diagnostic is not None:
+            return [], False, False, diagnostic
+        return children, True, truncated, diagnostic
+
+    def _descendant_document(
+        self, root: int, limit: int
+    ) -> tuple[str | None, int, bool, str | None]:
+        initial, observed, truncated, diagnostic = self._child_elements(root, limit)
+        if not observed:
+            return None, 0, False, diagnostic
+        queue = [(element, 1) for element in initial]
+        visited_hashes: dict[int, list[int]] = {}
+        visited_count = 0
+        found_document = None
         index = 0
         while index < len(queue):
             element, depth = queue[index]
@@ -1070,7 +1272,69 @@ class NativeAXBridge:
             if any(self._same_element(element, previous) for previous in bucket):
                 continue
             bucket.append(element)
-            if len(visited) >= self.MAX_CONTROLS:
+            if visited_count >= limit:
+                truncated = True
+                break
+            visited_count += 1
+            _, document = self._scalar(element, "AXDocument")
+            normalized_document = normalize_project_document(document)
+            if normalized_document is not None:
+                if found_document is None:
+                    found_document = document
+                elif normalize_project_document(found_document) != normalized_document:
+                    truncated = True
+                    diagnostic = "native_axdocument_ambiguous"
+            remaining = limit - len(queue)
+            children, child_observed, child_truncated, child_diagnostic = self._child_elements(
+                element, max(remaining, 0)
+            )
+            if not child_observed:
+                truncated = True
+                diagnostic = child_diagnostic or diagnostic
+                continue
+            if children and depth >= self.MAX_IDENTITY_DEPTH:
+                truncated = True
+                diagnostic = "native_axdocument_depth_limit"
+                continue
+            if child_truncated:
+                truncated = True
+                diagnostic = child_diagnostic or "native_axdocument_element_limit"
+            queue.extend((child, depth + 1) for child in children)
+        if truncated and diagnostic is None:
+            diagnostic = "native_axdocument_element_limit"
+        return found_document, max(visited_count, len(queue)), not truncated, diagnostic
+
+    def _controls(
+        self, root_window: int, element_limit: int
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[tuple[dict[str, Any], int]],
+        bool,
+        bool,
+        str | None,
+        int,
+    ]:
+        initial, observed, initial_truncated, diagnostic = self._child_elements(
+            root_window, element_limit
+        )
+        if not observed:
+            return [], [], False, False, diagnostic or "native_axchildren_unavailable", 0
+        queue = [(element, 1) for element in initial]
+        visited: list[int] = []
+        visited_hashes: dict[int, list[int]] = {}
+        controls: list[dict[str, Any]] = []
+        control_elements: list[tuple[dict[str, Any], int]] = []
+        truncated = initial_truncated
+        index = 0
+        while index < len(queue):
+            element, depth = queue[index]
+            index += 1
+            element_hash = int(self._core_foundation.CFHash(ctypes.c_void_p(element)))
+            bucket = visited_hashes.setdefault(element_hash, [])
+            if any(self._same_element(element, previous) for previous in bucket):
+                continue
+            bucket.append(element)
+            if len(visited) >= element_limit:
                 truncated = True
                 break
             visited.append(element)
@@ -1099,15 +1363,13 @@ class NativeAXBridge:
                 }
                 controls.append(row)
                 control_elements.append((row, element))
-            remaining = self.MAX_CONTROLS - len(visited)
-            child_code, children, child_truncated = self._element_array(
-                element, "AXChildren", max(remaining, 0)
+            remaining = element_limit - len(queue)
+            children, child_observed, child_truncated, child_diagnostic = self._child_elements(
+                element, max(remaining, 0)
             )
-            if child_code in AX_LEAF_ERRORS:
-                continue
-            if child_code != 0:
+            if not child_observed:
                 truncated = True
-                diagnostic = f"native_axchildren_{ax_error_name(child_code)}"
+                diagnostic = child_diagnostic or diagnostic
                 continue
             if children and depth >= self.MAX_DEPTH:
                 truncated = True
@@ -1115,11 +1377,11 @@ class NativeAXBridge:
                 continue
             if child_truncated:
                 truncated = True
-                diagnostic = "native_axchildren_element_limit"
+                diagnostic = child_diagnostic or "native_axchildren_element_limit"
             queue.extend((child, depth + 1) for child in children)
         if truncated and diagnostic is None:
             diagnostic = "native_axchildren_element_limit"
-        return controls, control_elements, True, not truncated, diagnostic
+        return controls, control_elements, True, not truncated, diagnostic, max(len(visited), len(queue))
 
     def snapshot(self, *, include_controls: bool, include_elements: bool = False) -> dict[str, Any]:
         if not self.trusted():
@@ -1128,7 +1390,7 @@ class NativeAXBridge:
                 "window_discovery_source": "AXUIElement",
                 "window_discovery_diagnostic": (
                     "native_ax_client_not_trusted"
-                    if not self._application_services.AXIsProcessTrusted()
+                    if not self.client_trusted()
                     else "native_ax_timeout_configuration_failed"
                 ),
                 "window_set_complete": False,
@@ -1177,6 +1439,31 @@ class NativeAXBridge:
                 if row["main"] and not row["document"]:
                     row["document"] = application_document
                     row["document_source"] = "application.AXDocument"
+        identity_budget = self.MAX_IDENTITY_ELEMENTS
+        identity_diagnostic = None
+        identity_complete = True
+        identity_order = sorted(
+            range(len(selected_windows)),
+            key=lambda index: project_window_rank(window_rows[index]),
+            reverse=True,
+        )
+        for index in identity_order:
+            if identity_budget <= 0:
+                identity_diagnostic = identity_diagnostic or "native_axdocument_element_limit"
+                identity_complete = False
+                break
+            if normalize_project_document(window_rows[index].get("document")) is not None:
+                continue
+            document, visited_count, subtree_complete, descendant_diagnostic = self._descendant_document(
+                selected_windows[index], identity_budget
+            )
+            identity_budget -= visited_count
+            identity_diagnostic = descendant_diagnostic or identity_diagnostic
+            identity_complete = identity_complete and subtree_complete
+            if document is not None:
+                window_rows[index]["document"] = document
+                window_rows[index]["document_source"] = "descendant.AXDocument"
+                continue
         selected_main = next(
             (
                 window
@@ -1193,10 +1480,91 @@ class NativeAXBridge:
         controls_observed = False
         controls_complete = False
         control_diagnostic = None
-        if include_controls and selected_main is not None:
-            controls, control_elements, controls_observed, controls_complete, control_diagnostic = self._controls(
-                selected_main
+        control_window_index = None
+        control_windows_scanned = 0
+        control_rows_observed = 0
+        control_roles_observed: set[str] = set()
+        control_candidates: list[
+            tuple[int, list[dict[str, Any]], list[tuple[dict[str, Any], int]], bool, bool]
+        ] = []
+        if include_controls and selected_windows:
+            remaining_controls = self.MAX_CONTROLS
+            scan_order = sorted(
+                range(len(selected_windows)),
+                key=lambda index: (
+                    project_window_rank(window_rows[index]),
+                    1 if window_rows[index].get("main") is True else 0,
+                ),
+                reverse=True,
             )
+            all_observed = True
+            all_complete = True
+            for index in scan_order:
+                if remaining_controls <= 0:
+                    all_complete = False
+                    control_diagnostic = control_diagnostic or "native_axchildren_element_limit"
+                    break
+                (
+                    window_controls,
+                    window_control_elements,
+                    window_observed,
+                    window_complete,
+                    window_diagnostic,
+                    visited_count,
+                ) = self._controls(selected_windows[index], remaining_controls)
+                control_windows_scanned += 1
+                control_rows_observed += len(window_controls)
+                control_roles_observed.update(
+                    row["role"]
+                    for row in window_controls
+                    if isinstance(row.get("role"), str)
+                )
+                remaining_controls -= visited_count
+                all_observed = all_observed and window_observed
+                all_complete = all_complete and window_complete
+                control_diagnostic = window_diagnostic or control_diagnostic
+                transport = transport_from_controls(window_controls)
+                if (
+                    transport["is_playing"] is not None
+                    or transport["play_control_available"]
+                    or transport["stop_control_available"]
+                    or transport["control_ambiguous"]
+                ):
+                    control_candidates.append(
+                        (
+                            index,
+                            window_controls,
+                            window_control_elements,
+                            window_observed,
+                            window_complete,
+                        )
+                    )
+            if len(control_candidates) == 1:
+                (
+                    control_window_index,
+                    controls,
+                    control_elements,
+                    controls_observed,
+                    _,
+                ) = control_candidates[0]
+                controls_complete = bool(all_complete)
+            elif len(control_candidates) > 1:
+                controls = [row for _, rows, _, _, _ in control_candidates for row in rows]
+                control_elements = [
+                    item for _, _, elements, _, _ in control_candidates for item in elements
+                ]
+                controls_observed = bool(all_observed)
+                controls_complete = bool(all_complete)
+                control_diagnostic = "native_transport_control_window_ambiguous"
+            else:
+                controls_observed = bool(scan_order) and all_observed
+                controls_complete = bool(scan_order) and all_complete
+            if control_window_index is None and controls_complete:
+                control_diagnostic = control_diagnostic or (
+                    "native_transport_control_window_ambiguous"
+                    if control_candidates
+                    else "native_transport_controls_not_found_in_window_set"
+                )
         result = {
             "accessibility_authorized": True,
             "modal_dialog": True if modal else False if complete and not modal_unknown else None,
@@ -1206,8 +1574,29 @@ class NativeAXBridge:
             "focus_temporarily_changed": False,
             "transport_controls_observed": controls_observed,
             "transport_controls_complete": controls_complete,
-            "control_tree_source": "AXUIElement.AXChildren" if controls_observed else None,
+            "control_tree_source": (
+                "AXUIElement.AXChildren+AXContents+AXChildrenInNavigationOrder"
+                if controls_observed
+                else None
+            ),
             "control_tree_diagnostic": control_diagnostic,
+            "control_windows_scanned": control_windows_scanned,
+            "control_window_index": control_window_index,
+            "control_window_title": (
+                window_rows[control_window_index].get("title")
+                if control_window_index is not None
+                else None
+            ),
+            "control_rows_observed": control_rows_observed,
+            "control_roles_observed": sorted(control_roles_observed),
+            "project_identity_diagnostic": identity_diagnostic,
+            "project_identity_complete": identity_complete,
+            "project_document_candidates": [
+                document
+                for row in window_rows
+                if (document := normalize_project_document(row.get("document"))) is not None
+            ],
+            "transport_control_window_ambiguous": len(control_candidates) > 1,
             "windows": window_rows,
             "controls": controls,
             "controls_truncated": controls_observed and not controls_complete,
@@ -1234,6 +1623,12 @@ class NativeAXBridge:
         if snapshot.get("transport_controls_complete") is not True:
             raise AdapterFailure("transport_control_tree_truncated", "native AX control tree is incomplete", definitive=True)
         transport = transport_from_controls(snapshot.get("controls"))
+        if snapshot.get("transport_control_window_ambiguous") is True or transport["control_ambiguous"]:
+            raise AdapterFailure(
+                "transport_control_ambiguous",
+                "multiple matching native AX transport controls are exposed",
+                definitive=True,
+            )
         if transport["is_playing"] is None:
             raise AdapterFailure("transport_state_not_observable", "native AX transport state is unavailable", definitive=True)
         wants_playing = operation == "transport.play"
@@ -1253,6 +1648,12 @@ class NativeAXBridge:
             and matches_label(row, labels)
             and "AXPress" in row.get("actions", [])
         ]
+        if len(candidates) > 1:
+            raise AdapterFailure(
+                "transport_control_ambiguous",
+                "multiple matching native AX transport controls expose AXPress",
+                definitive=True,
+            )
         if not candidates:
             raise AdapterFailure(
                 "play_control_not_found" if wants_playing else "stop_control_not_found",
@@ -1454,6 +1855,12 @@ class MacOSAccessibilityBackend:
                 if bridge.trusted():
                     native_dispatch_started = True
                     return bridge.dispatch_transport(operation, expected_project)
+                if not bridge.legacy_fallback_allowed():
+                    raise AdapterFailure(
+                        "native_ax_timeout_configuration_failed",
+                        "native AX client is trusted but its messaging timeout could not be configured",
+                        definitive=True,
+                    )
         except AdapterFailure:
             raise
         except Exception as exc:
@@ -1539,6 +1946,7 @@ class ReferenceAdapter:
                 "window_discovery_source": snapshot.get("window_discovery_source"),
                 "window_discovery_diagnostic": snapshot.get("window_discovery_diagnostic"),
                 "native_accessibility_diagnostic": snapshot.get("native_accessibility_diagnostic"),
+                "window_evidence": window_evidence(snapshot),
                 "window_set_complete": snapshot.get("window_set_complete") is True,
                 "focus_temporarily_changed": snapshot.get("focus_temporarily_changed") is True,
                 "transport_controls_observed": snapshot.get("transport_controls_observed") is True,
@@ -1553,6 +1961,9 @@ class ReferenceAdapter:
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
             data["window_discovery_diagnostic"] = snapshot.get("window_discovery_diagnostic")
             data["native_accessibility_diagnostic"] = snapshot.get("native_accessibility_diagnostic")
+            data["project_identity_diagnostic"] = snapshot.get("project_identity_diagnostic")
+            data["project_identity_complete"] = snapshot.get("project_identity_complete")
+            data["window_evidence"] = window_evidence(snapshot)
             data["control_tree_diagnostic"] = snapshot.get("control_tree_diagnostic")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
             data["focus_temporarily_changed"] = snapshot.get("focus_temporarily_changed") is True
@@ -1568,7 +1979,21 @@ class ReferenceAdapter:
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
             data["window_discovery_diagnostic"] = snapshot.get("window_discovery_diagnostic")
             data["native_accessibility_diagnostic"] = snapshot.get("native_accessibility_diagnostic")
+            data["project_identity_diagnostic"] = snapshot.get("project_identity_diagnostic")
+            data["project_identity_complete"] = snapshot.get("project_identity_complete")
+            data["window_evidence"] = window_evidence(snapshot)
             data["control_tree_diagnostic"] = snapshot.get("control_tree_diagnostic")
+            data["control_windows_scanned"] = snapshot.get("control_windows_scanned")
+            data["control_window_index"] = snapshot.get("control_window_index")
+            data["control_window_title"] = snapshot.get("control_window_title")
+            data["control_rows_observed"] = snapshot.get("control_rows_observed")
+            data["control_roles_observed"] = snapshot.get("control_roles_observed")
+            data["transport_control_window_ambiguous"] = (
+                snapshot.get("transport_control_window_ambiguous") is True
+            )
+            data["control_ambiguous"] = (
+                data["control_ambiguous"] or data["transport_control_window_ambiguous"]
+            )
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
             data["focus_temporarily_changed"] = snapshot.get("focus_temporarily_changed") is True
             data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True

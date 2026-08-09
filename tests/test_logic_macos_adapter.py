@@ -95,9 +95,20 @@ class FakeBackend:
 
 
 class FakeNativeBridge:
-    def __init__(self, state: dict, *, trusted=True, action=None, exit_error=None):
+    def __init__(
+        self,
+        state: dict,
+        *,
+        trusted=True,
+        legacy_fallback_allowed=None,
+        action=None,
+        exit_error=None,
+    ):
         self.state = state
         self.is_trusted = trusted
+        self.allow_legacy_fallback = (
+            not trusted if legacy_fallback_allowed is None else legacy_fallback_allowed
+        )
         self.action = action or {"ok": True, "performed": True, "already_satisfied": False}
         self.exit_error = exit_error
         self.snapshot_calls = []
@@ -118,6 +129,9 @@ class FakeNativeBridge:
 
     def trusted(self):
         return self.is_trusted
+
+    def legacy_fallback_allowed(self):
+        return self.allow_legacy_fallback
 
     def snapshot(self, *, include_controls, include_elements=False):
         self.snapshot_calls.append((include_controls, include_elements))
@@ -231,6 +245,104 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         observed = adapter_module.ReferenceAdapter(FakeBackend(state)).observe("project.current")
         self.assertEqual(observed["data"]["project_identity_source"], "AXTitleUIElement")
 
+    def test_project_identity_prefers_document_window_over_generic_ax_main(self):
+        state = snapshot(self.project)
+        state["windows"] = [
+            {"title": "Logic Pro", "document": None, "main": True},
+            {
+                "title": Path(self.project).name,
+                "document": self.project,
+                "document_source": "descendant.AXDocument",
+                "main": False,
+            },
+        ]
+        observed = adapter_module.ReferenceAdapter(FakeBackend(state)).observe("project.current")
+        self.assertEqual(observed["data"]["current_project"], str(Path(self.project).resolve()))
+        self.assertEqual(observed["data"]["project_identity_source"], "descendant.AXDocument")
+        self.assertTrue(observed["data"]["window_evidence"][1]["has_document"])
+        adapter_module.assert_project_binding(state, self.project)
+
+    def test_project_binding_rejects_multiple_distinct_logic_projects(self):
+        other = tempfile.TemporaryDirectory(suffix=".logicx")
+        self.addCleanup(other.cleanup)
+        state = snapshot(self.project)
+        state["windows"].append(
+            {
+                "title": Path(other.name).name,
+                "document": other.name,
+                "main": False,
+            }
+        )
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            adapter_module.assert_project_binding(state, self.project)
+        self.assertEqual(caught.exception.kind, "project_identity_ambiguous")
+        self.assertTrue(caught.exception.definitive)
+
+    def test_project_binding_rejects_distinct_project_like_titles(self):
+        state = snapshot(self.project)
+        state["windows"] = [
+            {"title": Path(self.project).name, "document": None, "main": True},
+            {"title": "Other.logicx", "document": None, "main": False},
+        ]
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            adapter_module.assert_project_binding(state, self.project)
+        self.assertEqual(caught.exception.kind, "project_identity_ambiguous")
+        observed = adapter_module.project_from_snapshot(state)
+        self.assertIsNone(observed["current_project"])
+        self.assertIsNone(observed["window_project_name"])
+        self.assertEqual(
+            observed["current_project_unavailable_reason"],
+            "project_identity_ambiguous",
+        )
+
+    def test_project_binding_rejects_document_with_conflicting_project_title(self):
+        state = snapshot(self.project)
+        state["windows"].append(
+            {"title": "Other.logicx", "document": None, "main": False}
+        )
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            adapter_module.assert_project_binding(state, self.project)
+        self.assertEqual(caught.exception.kind, "project_identity_ambiguous")
+        observed = adapter_module.project_from_snapshot(state)
+        self.assertIsNone(observed["current_project"])
+        self.assertEqual(
+            observed["current_project_unavailable_reason"],
+            "project_identity_ambiguous",
+        )
+
+    def test_project_binding_rejects_incomplete_identity_traversal(self):
+        state = snapshot(self.project)
+        state["project_identity_complete"] = False
+        state["project_identity_diagnostic"] = "native_axcontents_cannot_complete"
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            adapter_module.assert_project_binding(state, self.project)
+        self.assertEqual(caught.exception.kind, "project_identity_incomplete")
+        self.assertIn("native_axcontents_cannot_complete", str(caught.exception))
+        observed = adapter_module.project_from_snapshot(state)
+        self.assertIsNone(observed["current_project"])
+        self.assertEqual(
+            observed["current_project_unavailable_reason"],
+            "project_identity_incomplete",
+        )
+
+        state["project_identity_diagnostic"] = "native_axdocument_ambiguous"
+        observed = adapter_module.project_from_snapshot(state)
+        self.assertEqual(
+            observed["current_project_unavailable_reason"],
+            "project_identity_ambiguous",
+        )
+
+    def test_generic_logic_title_is_not_project_identity(self):
+        state = snapshot(self.project)
+        state["windows"] = [{"title": "Logic Pro", "document": None, "main": True}]
+        observed = adapter_module.ReferenceAdapter(FakeBackend(state)).observe("project.current")
+        self.assertIsNone(observed["data"]["window_project_name"])
+        self.assertEqual(
+            observed["data"]["current_project_unavailable_reason"],
+            "generic_application_title_only",
+        )
+        self.assertIsNone(observed["data"]["project_identity_source"])
+
     def test_snapshot_jxa_gates_control_traversal(self):
         lightweight_source = adapter_module.render_jxa(
             adapter_module.SNAPSHOT_JXA,
@@ -260,6 +372,66 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(len(backend.jxa_calls), 1)
         self.assertNotIn("discoverProcessWindows", backend.jxa_calls[0][0])
 
+    def test_native_snapshot_finds_project_and_transport_in_non_main_window(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        bridge.application = 999
+        bridge.trusted = lambda: True
+        bridge._same_element = lambda left, right: left == right
+        bridge._element_array = lambda element, attribute, limit: (
+            (0, [101, 202], False)
+            if element == 999 and attribute == "AXWindows"
+            else (0, [], False)
+        )
+        bridge._element = lambda element, attribute: (
+            (0, 101)
+            if element == 999 and attribute in {"AXMainWindow", "AXFocusedWindow"}
+            else (-25212, None)
+        )
+        scalar_values = {
+            (999, "AXDocument"): None,
+            (101, "AXTitle"): "Logic Pro",
+            (101, "AXRole"): "AXWindow",
+            (101, "AXSubrole"): "AXStandardWindow",
+            (101, "AXDocument"): "/tmp/unrelated.wav",
+            (101, "AXModal"): False,
+            (101, "AXMain"): True,
+            (202, "AXTitle"): Path(self.project).name,
+            (202, "AXRole"): "AXWindow",
+            (202, "AXSubrole"): "AXStandardWindow",
+            (202, "AXDocument"): None,
+            (202, "AXModal"): False,
+            (202, "AXMain"): False,
+        }
+        bridge._scalar = lambda element, attribute: (
+            0 if (element, attribute) in scalar_values else -25212,
+            scalar_values.get((element, attribute)),
+        )
+        bridge._descendant_document = lambda window, limit: (
+            (self.project, 10, True, None)
+            if window == 202
+            else (None, 5, True, None)
+        )
+        play = control("", value=False)
+        play["identifier"] = "TransportPlayButton"
+        bridge._controls = lambda window, limit: (
+            ([], [], True, True, None, 5)
+            if window == 101
+            else ([play], [(play, 303)], True, True, None, 10)
+        )
+
+        observed = bridge.snapshot(include_controls=True, include_elements=True)
+        project = adapter_module.project_from_snapshot(observed)
+        transport = adapter_module.transport_from_controls(observed["controls"])
+        self.assertEqual(project["current_project"], str(Path(self.project).resolve()))
+        self.assertEqual(project["project_identity_source"], "descendant.AXDocument")
+        self.assertFalse(transport["is_playing"])
+        self.assertEqual(observed["control_window_index"], 1)
+        self.assertEqual(observed["control_windows_scanned"], 2)
+        self.assertEqual(observed["control_window_title"], Path(self.project).name)
+        self.assertEqual(observed["control_rows_observed"], 1)
+        self.assertEqual(observed["control_roles_observed"], ["AXButton"])
+        self.assertTrue(observed["transport_controls_complete"])
+
     def test_untrusted_native_ax_falls_back_to_system_events(self):
         native_state = {
             "accessibility_authorized": False,
@@ -279,6 +451,25 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(observed["window_discovery_source"], "process.windows")
         self.assertEqual(observed["native_accessibility_diagnostic"], "native_ax_client_not_trusted")
         self.assertEqual(len(backend.jxa_calls), 2)
+
+    def test_trusted_native_ax_timeout_failure_never_falls_back_to_legacy_action(self):
+        native = FakeNativeBridge(
+            snapshot(self.project, window_discovery_source="AXUIElement.AXWindows"),
+            trusted=False,
+            legacy_fallback_allowed=False,
+        )
+        backend = StubMacOSBackend(native, snapshot(self.project))
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            backend.dispatch_transport(
+                "transport.play",
+                self.project,
+                "com.apple.mobilelogic",
+                4242,
+            )
+        self.assertEqual(caught.exception.kind, "native_ax_timeout_configuration_failed")
+        self.assertTrue(caught.exception.definitive)
+        self.assertEqual(native.dispatch_calls, [])
+        self.assertEqual(len(backend.jxa_calls), 1)
 
     def test_native_ax_bridge_error_falls_back_with_diagnostic(self):
         def unavailable_bridge(process_identifier, timeout_seconds):
@@ -383,10 +574,106 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertIn("MAX_WINDOWS = 64", source)
         self.assertIn("MAX_CONTROLS = 4000", source)
         self.assertIn("MAX_DEPTH = 32", source)
+        self.assertEqual(
+            adapter_module.NATIVE_CHILD_ATTRIBUTES,
+            ("AXChildren", "AXContents", "AXChildrenInNavigationOrder"),
+        )
         self.assertIn("native_ax_main_window_unavailable", source)
         self.assertNotIn("strict=True", source)
         self.assertNotIn("process.frontmost = true", adapter_module.PROCESS_SNAPSHOT_JXA)
         self.assertEqual(adapter_module.ax_error_name(-25204), "cannot_complete")
+
+    def test_optional_native_child_attribute_failure_marks_tree_incomplete(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        bridge._element_array = lambda element, attribute, limit: {
+            "AXChildren": (0, [], False),
+            "AXContents": (-25204, [], False),
+            "AXChildrenInNavigationOrder": (-25205, [], False),
+        }[attribute]
+        children, observed, truncated, diagnostic = bridge._child_elements(101, 20)
+        self.assertEqual(children, [])
+        self.assertTrue(observed)
+        self.assertTrue(truncated)
+        self.assertEqual(diagnostic, "native_axcontents_cannot_complete")
+
+    def test_native_child_attributes_share_one_element_budget(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        calls = []
+
+        def element_array(element, attribute, limit):
+            calls.append((attribute, limit))
+            if attribute == "AXChildren":
+                return 0, list(range(limit)), False
+            return 0, [], True
+
+        bridge._element_array = element_array
+        children, observed, truncated, diagnostic = bridge._child_elements(101, 4000)
+        self.assertEqual([limit for _, limit in calls], [4000, 0, 0])
+        self.assertEqual(len(children), 4000)
+        self.assertTrue(observed)
+        self.assertTrue(truncated)
+        self.assertEqual(diagnostic, "native_axcontents_element_limit")
+
+    def test_native_descendant_queue_shares_one_global_element_budget(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+
+        class FakeCoreFoundation:
+            @staticmethod
+            def CFHash(value):
+                return value.value
+
+        bridge._core_foundation = FakeCoreFoundation()
+        bridge._same_element = lambda left, right: left == right
+        limits = []
+
+        def child_elements(element, limit):
+            limits.append(limit)
+            if element == 100:
+                return list(range(1000, 3000)), True, False, None
+            if element == 1000:
+                return list(range(3000, 3000 + limit)), True, False, None
+            return [], True, False, None
+
+        bridge._child_elements = child_elements
+        bridge._scalar = lambda element, attribute: (-25212, None)
+        document, budget_used, complete, diagnostic = bridge._descendant_document(100, 4000)
+        self.assertIsNone(document)
+        self.assertEqual(budget_used, 4000)
+        self.assertLessEqual(max(limits), 4000)
+        self.assertEqual(limits[:3], [4000, 2000, 0])
+        self.assertTrue(complete)
+        self.assertIsNone(diagnostic)
+
+    def test_multiple_descendant_projects_in_one_window_are_incomplete_and_ambiguous(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+
+        class FakeCoreFoundation:
+            @staticmethod
+            def CFHash(value):
+                return value.value
+
+        bridge._core_foundation = FakeCoreFoundation()
+        bridge._same_element = lambda left, right: left == right
+        bridge._child_elements = lambda element, limit: (
+            ([101, 202], True, False, None)
+            if element == 100
+            else ([], True, False, None)
+        )
+        bridge._scalar = lambda element, attribute: (
+            (0, self.project)
+            if element == 101 and attribute == "AXDocument"
+            else (0, "/tmp/Other.logicx")
+            if element == 202 and attribute == "AXDocument"
+            else (-25212, None)
+        )
+        document, budget_used, complete, diagnostic = bridge._descendant_document(100, 20)
+        self.assertEqual(
+            adapter_module.normalize_project_document(document),
+            str(Path(self.project).resolve()),
+        )
+        self.assertEqual(budget_used, 2)
+        self.assertFalse(complete)
+        self.assertEqual(diagnostic, "native_axdocument_ambiguous")
 
     def test_foreground_empty_window_snapshot_fails_closed(self):
         state = snapshot(self.project)
@@ -473,7 +760,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertTrue(observed["data"]["current_project_unavailable"])
         self.assertEqual(
             observed["data"]["current_project_unavailable_reason"],
-            "main_window_has_no_document_or_title",
+            "project_window_has_no_document_or_title",
         )
         self.assertIsNone(observed["data"]["project_identity_source"])
         self.assertEqual(
@@ -488,7 +775,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         backend = FakeBackend(state)
         dispatched = adapter_module.ReferenceAdapter(backend).dispatch(preflight("transport.play", self.project))
         self.assertEqual(dispatched["error"]["kind"], "project_identity_unavailable")
-        self.assertIn("main_window_has_no_document_or_title", dispatched["error"]["message"])
+        self.assertIn("project_window_has_no_document_or_title", dispatched["error"]["message"])
         self.assertEqual(backend.dispatch_calls, [])
 
     def test_japanese_control_labels_are_mapped_without_coordinates(self):
@@ -497,6 +784,52 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         transport = adapter_module.transport_from_controls(state["controls"])
         self.assertFalse(transport["is_playing"])
         self.assertTrue(transport["play_control_available"])
+
+    def test_transport_identifier_normalization_remains_exact(self):
+        controls = [control("", value=False)]
+        controls[0]["identifier"] = "TransportPlayButton"
+        transport = adapter_module.transport_from_controls(controls)
+        self.assertFalse(transport["is_playing"])
+        self.assertTrue(transport["play_control_available"])
+
+        controls[0]["identifier"] = "ReplayButton"
+        transport = adapter_module.transport_from_controls(controls)
+        self.assertIsNone(transport["is_playing"])
+
+    def test_duplicate_exact_transport_controls_withhold_state_and_dispatch(self):
+        play_one = control("", value=False)
+        play_one["identifier"] = "TransportPlayButton"
+        play_two = control("", value=False)
+        play_two["identifier"] = "TransportPlayButton"
+        controls = [play_one, play_two, control("Go to Beginning")]
+        transport = adapter_module.transport_from_controls(controls)
+        self.assertTrue(transport["control_ambiguous"])
+        self.assertEqual(transport["play_control_count"], 2)
+        self.assertIsNone(transport["is_playing"])
+        self.assertFalse(transport["play_control_available"])
+
+        state = snapshot(self.project, window_discovery_source="AXUIElement.AXWindows")
+        state["controls"] = controls
+        state["_control_elements"] = [(play_one, 111), (play_two, 222)]
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        bridge.snapshot = lambda include_controls, include_elements: state
+        with self.assertRaises(adapter_module.AdapterFailure) as caught:
+            bridge.dispatch_transport("transport.play", self.project)
+        self.assertEqual(caught.exception.kind, "transport_control_ambiguous")
+        self.assertTrue(caught.exception.definitive)
+
+    def test_multiple_transport_control_windows_withhold_capabilities_and_dispatch(self):
+        state = snapshot(self.project, window_discovery_source="AXUIElement.AXWindows")
+        state["controls"] = [control("Play", value=False), control("Stop")]
+        state["transport_control_window_ambiguous"] = True
+        state["control_tree_diagnostic"] = "native_transport_control_window_ambiguous"
+        self.assertNotIn("transport.state", adapter_module.runtime_capabilities(state))
+        backend = FakeBackend(state)
+        result = adapter_module.ReferenceAdapter(backend).dispatch(
+            preflight("transport.play", self.project)
+        )
+        self.assertEqual(result["error"]["kind"], "capability_unavailable")
+        self.assertEqual(backend.dispatch_calls, [])
 
     def test_japanese_checkbox_play_control_is_observable_and_dispatchable(self):
         state = snapshot(self.project)
@@ -666,6 +999,11 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             adapter_module.normalize_document_path("file:///tmp/My%20Song.logicx"),
             project,
         )
+        self.assertEqual(
+            adapter_module.normalize_project_document("file:///tmp/My%20Song.logicx"),
+            project,
+        )
+        self.assertIsNone(adapter_module.normalize_project_document("file:///tmp/unrelated.wav"))
 
 
 if __name__ == "__main__":

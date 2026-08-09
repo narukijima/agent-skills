@@ -3,7 +3,7 @@ name: logic-pro
 description: Safely inspect and operate Logic Pro on macOS through a compatible MCP or adapter. Use for transport, tracks, instruments, MIDI import, save, and bounce with project binding and verified readback.
 status: active
 aliases: [logic pro, operate-logic-pro]
-version: 0.5.1
+version: 0.6.0
 ---
 
 # logic-pro — Logic Proを安全に操作する
@@ -44,7 +44,7 @@ MCP名やtool名を固定しない。実行時に利用可能なLogic Pro用MCP�
 変更操作は必ず一回につき一操作とし、次の順序を崩さない。
 
 1. **Observe**: 操作直前のLogic状態を読む。キャッシュ、default値、前回の観測を使わない。
-2. **Bind**: 期待する `.logicx` と現在Projectを一致確認する。file URLを取得できない場合だけ、完全な `.logicx` 名とLogicのProject表示名の厳密一致を代替証拠にする。
+2. **Bind**: 完全なwindow集合で期待する `.logicx` と現在Projectを一意に一致確認する。file URLを取得できない場合だけ、完全な `.logicx` 名とLogicのProject表示名の厳密一致を代替証拠にする。複数Project候補または不完全なidentity探索では変更しない。
 3. **Guard**: 操作要求をJSONにし、`scripts/logic_guard.py preflight` でallowlist、権限、引数、path、Project境界を検査する。
 4. **Act**: MCPまたは安全なローカルアダプタへ意味操作を一度だけ送る。複数操作を一つのtool callへまとめない。
 5. **Read back**: 操作応答とは別に、Logicの状態を新しく読み、期待状態と比較する。bounceなど出力を作る操作ではartifactも観測する。
@@ -91,6 +91,7 @@ MCPを第一経路にする。結果不明（B）のときは再送もGUI fallba
 
 - 結果不明の操作を自動再送しない。
 - 間違ったProject、ロック中、権限不明、モーダル表示中に変更しない。
+- 複数のProject候補、複数のtransport control window、同じ意味操作に一致する複数controlのどれかがある場合は変更しない。
 - allowlist外の操作を汎用GUI、AppleScript、CGEvent、MIDI送信で迂回しない。
 - 相対path、許可root外のpath、既存出力への上書きを許可しない。
 - MCP、adapter、patch、実行ファイルの版やhashが要求される環境では、照合できない版を実行しない。
