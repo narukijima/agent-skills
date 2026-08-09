@@ -433,6 +433,139 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(observed["control_roles_observed"], ["AXButton"])
         self.assertTrue(observed["transport_controls_complete"])
 
+    def test_native_axwindows_value_conversion_preserves_window_pointers(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        bridge.application = 999
+        released = []
+        retained = []
+
+        class FakeApplicationServices:
+            @staticmethod
+            def AXUIElementGetAttributeValueCount(element, key, count):
+                count._obj.value = 2
+                return 0
+
+            @staticmethod
+            def AXUIElementGetTypeID():
+                return 42
+
+            @staticmethod
+            def AXUIElementCopyAttributeValues(*args):
+                raise AssertionError("AXWindows must use the typed array value path")
+
+        class FakeCoreFoundation:
+            @staticmethod
+            def CFArrayGetTypeID():
+                return 77
+
+            @staticmethod
+            def CFGetTypeID(value):
+                return 77 if value.value == 700 else 42
+
+            @staticmethod
+            def CFArrayGetCount(value):
+                return 2
+
+            @staticmethod
+            def CFArrayGetValueAtIndex(value, index):
+                return (101, 202)[index]
+
+        bridge._application_services = FakeApplicationServices()
+        bridge._core_foundation = FakeCoreFoundation()
+        bridge._key = lambda name: 1
+        bridge._copy_raw = lambda element, attribute: (0, 700)
+        bridge._release = released.append
+        bridge._retain_element = lambda pointer: retained.append(pointer) or pointer
+
+        code, windows, truncated = bridge._element_array(999, "AXWindows", 64)
+        self.assertEqual(code, 0)
+        self.assertEqual(windows, [101, 202])
+        self.assertNotIn(bridge.application, windows)
+        self.assertFalse(truncated)
+        self.assertEqual(retained, [101, 202])
+        self.assertEqual(released, [700])
+
+    def test_native_axwindows_rejects_application_element_as_complete_window_set(self):
+        bridge = object.__new__(adapter_module.NativeAXBridge)
+        bridge.application = 999
+        bridge.trusted = lambda: True
+        bridge._same_element = lambda left, right: left == right
+        bridge._element_array = lambda element, attribute, limit: (
+            (0, [999], False)
+            if element == 999 and attribute == "AXWindows"
+            else (0, [], False)
+        )
+        bridge._element = lambda element, attribute: (
+            (0, 999)
+            if element == 999 and attribute in {"AXMainWindow", "AXFocusedWindow"}
+            else (-25212, None)
+        )
+        scalar_values = {
+            (999, "AXTitle"): "Logic Pro",
+            (999, "AXRole"): "AXApplication",
+            (999, "AXSubrole"): None,
+            (999, "AXDocument"): None,
+            (999, "AXModal"): False,
+            (999, "AXMain"): True,
+        }
+        bridge._scalar = lambda element, attribute: (
+            0 if (element, attribute) in scalar_values else -25212,
+            scalar_values.get((element, attribute)),
+        )
+        bridge._descendant_document = lambda *args: (_ for _ in ()).throw(
+            AssertionError("invalid window elements must not be traversed for project identity")
+        )
+        bridge._controls = lambda *args: (_ for _ in ()).throw(
+            AssertionError("invalid window elements must not be traversed for controls")
+        )
+
+        observed = bridge.snapshot(include_controls=True)
+        self.assertFalse(observed["window_set_complete"])
+        self.assertEqual(
+            observed["window_discovery_diagnostic"],
+            "native_axwindows_contains_application_element",
+        )
+        self.assertFalse(observed["project_identity_complete"])
+        self.assertEqual(
+            observed["project_identity_diagnostic"],
+            "native_axwindows_contains_application_element",
+        )
+        self.assertFalse(observed["transport_controls_observed"])
+        self.assertFalse(observed["transport_controls_complete"])
+        self.assertEqual(
+            observed["control_tree_diagnostic"],
+            "native_window_set_invalid_for_control_traversal",
+        )
+        self.assertEqual(observed["windows"][0]["role"], "AXApplication")
+
+    def test_invalid_native_window_set_uses_bounded_legacy_control_fallback(self):
+        native_state = {
+            "accessibility_authorized": True,
+            "window_discovery_source": "AXUIElement.AXWindows",
+            "window_discovery_diagnostic": "native_axwindows_contains_application_element",
+            "window_set_complete": False,
+            "transport_controls_observed": False,
+            "transport_controls_complete": False,
+            "control_tree_diagnostic": "native_window_set_invalid_for_control_traversal",
+            "windows": [{"title": "Logic Pro", "role": "AXApplication", "main": True}],
+            "controls": [],
+        }
+        legacy = snapshot(self.project, window_discovery_source="process.windows")
+        backend = StubMacOSBackend(FakeNativeBridge(native_state), legacy)
+
+        observed = backend.snapshot(include_controls=True)
+        self.assertEqual(observed["accessibility_backend"], "SystemEvents")
+        self.assertTrue(observed["window_set_complete"])
+        self.assertTrue(observed["transport_controls_complete"])
+        self.assertFalse(adapter_module.transport_from_controls(observed["controls"])["is_playing"])
+        self.assertIn("transport.play", adapter_module.runtime_capabilities(observed))
+        self.assertIn("transport.stop", adapter_module.runtime_capabilities(observed))
+        self.assertEqual(
+            observed["native_accessibility_diagnostic"],
+            "native_axwindows_contains_application_element",
+        )
+        self.assertIn("const INCLUDE_CONTROLS = true;", backend.jxa_calls[1][0])
+
     def test_untrusted_native_ax_falls_back_to_system_events(self):
         native_state = {
             "accessibility_authorized": False,
@@ -506,8 +639,36 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             4242,
         )
         self.assertTrue(result["performed"])
+        self.assertEqual(native.snapshot_calls, [(False, False)])
         self.assertEqual(native.dispatch_calls, [("transport.play", self.project)])
         self.assertEqual(native.factory_calls, [(4242, 10.0)])
+
+    def test_invalid_native_window_set_uses_legacy_action_before_native_dispatch(self):
+        native_state = {
+            "accessibility_authorized": True,
+            "window_discovery_source": "AXUIElement.AXWindows",
+            "window_discovery_diagnostic": "native_axwindows_contains_application_element",
+            "window_set_complete": False,
+            "transport_controls_observed": False,
+            "transport_controls_complete": False,
+            "windows": [{"title": "Logic Pro", "role": "AXApplication", "main": True}],
+            "controls": [],
+        }
+        native = FakeNativeBridge(native_state, trusted=True)
+        backend = StubMacOSBackend(native, snapshot(self.project))
+
+        result = backend.dispatch_transport(
+            "transport.play",
+            self.project,
+            "com.apple.mobilelogic",
+            4242,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(native.snapshot_calls, [(False, False)])
+        self.assertEqual(native.dispatch_calls, [])
+        self.assertEqual(len(backend.jxa_calls), 2)
+        self.assertTrue(backend.jxa_calls[1][1])
+        self.assertIn('const REQUESTED_OPERATION = "transport.play";', backend.jxa_calls[1][0])
 
     def test_native_ax_dispatch_type_error_stops_before_legacy_action(self):
         def invalid_bridge(process_identifier, timeout_seconds):

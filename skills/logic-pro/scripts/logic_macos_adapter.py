@@ -25,7 +25,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.4.1"
+ADAPTER_VERSION = "0.4.2"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -934,6 +934,16 @@ def native_exception_diagnostic(exc: Exception) -> str:
     return f"native_ax_bridge_error:{type(exc).__name__}{suffix}"
 
 
+def native_window_structure_invalid(snapshot: Any) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    diagnostic = snapshot.get("window_discovery_diagnostic")
+    return diagnostic == "native_axwindows_contains_application_element" or (
+        isinstance(diagnostic, str)
+        and diagnostic.startswith("native_axwindows_invalid_element_role:")
+    )
+
+
 class NativeAXBridge:
     """Bounded, dependency-free AXUIElement bridge for one application PID."""
 
@@ -1171,34 +1181,57 @@ class NativeAXBridge:
             return code, [], False
         if count.value <= 0:
             return 0, [], False
-        requested = min(count.value, limit + 1)
-        output = ctypes.c_void_p()
-        code = int(
-            self._application_services.AXUIElementCopyAttributeValues(
-                ctypes.c_void_p(element),
-                ctypes.c_void_p(self._key(attribute)),
-                0,
-                requested,
-                ctypes.byref(output),
+        if attribute == "AXWindows" and count.value <= limit:
+            code, array = self._copy_raw(element, attribute)
+            if code != 0 or array is None:
+                return code, [], False
+            if (
+                self._core_foundation.CFGetTypeID(ctypes.c_void_p(array))
+                != self._core_foundation.CFArrayGetTypeID()
+            ):
+                self._release(array)
+                return -25201, [], False
+        else:
+            requested = min(count.value, limit + 1)
+            output = ctypes.c_void_p()
+            code = int(
+                self._application_services.AXUIElementCopyAttributeValues(
+                    ctypes.c_void_p(element),
+                    ctypes.c_void_p(self._key(attribute)),
+                    0,
+                    requested,
+                    ctypes.byref(output),
+                )
             )
-        )
-        if code != 0 or not output.value:
-            return code, [], False
-        array = int(output.value)
+            if code != 0 or not output.value:
+                return code, [], False
+            array = int(output.value)
+            if (
+                self._core_foundation.CFGetTypeID(ctypes.c_void_p(array))
+                != self._core_foundation.CFArrayGetTypeID()
+            ):
+                self._release(array)
+                return -25201, [], False
         elements: list[int] = []
         try:
             array_count = self._core_foundation.CFArrayGetCount(ctypes.c_void_p(array))
             for index in range(min(array_count, limit)):
                 value = self._core_foundation.CFArrayGetValueAtIndex(ctypes.c_void_p(array), index)
                 if not value:
-                    continue
+                    return -25201, [], False
                 pointer = int(value)
                 if (
                     self._core_foundation.CFGetTypeID(ctypes.c_void_p(pointer))
                     == self._application_services.AXUIElementGetTypeID()
                 ):
                     elements.append(self._retain_element(pointer))
-            return 0, elements, count.value > limit or array_count > limit
+                else:
+                    return -25201, [], False
+            return 0, elements, (
+                count.value > limit
+                or array_count > limit
+                or array_count != count.value
+            )
         finally:
             self._release(array)
 
@@ -1474,21 +1507,45 @@ class NativeAXBridge:
             window_rows.append(row)
             modal = modal or row["subrole"] == "AXDialog" or row["modal"] or row["sheet_count"] > 0
             modal_unknown = modal_unknown or unknown
+        window_elements_valid = True
+        invalid_window_roles = []
+        contains_application_element = False
+        for window, row in zip(selected_windows, window_rows):
+            if self._same_element(window, self.application):
+                contains_application_element = True
+                window_elements_valid = False
+            if row.get("role") != "AXWindow":
+                invalid_window_roles.append(row.get("role"))
+                window_elements_valid = False
+        if contains_application_element:
+            complete = False
+            diagnostic = "native_axwindows_contains_application_element"
+        elif invalid_window_roles:
+            complete = False
+            role_names = sorted(
+                {role if isinstance(role, str) and role else "unknown" for role in invalid_window_roles}
+            )
+            diagnostic = "native_axwindows_invalid_element_role:" + ",".join(role_names)
         application_document_code, application_document = self._scalar(self.application, "AXDocument")
-        if application_document_code == 0 and isinstance(application_document, str):
+        if (
+            window_elements_valid
+            and application_document_code == 0
+            and isinstance(application_document, str)
+        ):
             for row in window_rows:
                 if row["main"] and not row["document"]:
                     row["document"] = application_document
                     row["document_source"] = "application.AXDocument"
         identity_budget = self.MAX_IDENTITY_ELEMENTS
-        identity_diagnostic = None
-        identity_complete = True
+        identity_diagnostic = None if window_elements_valid else diagnostic
+        identity_complete = window_elements_valid
         identity_order = sorted(
             range(len(selected_windows)),
             key=lambda index: project_window_rank(window_rows[index]),
             reverse=True,
         )
-        for index in identity_order:
+        identity_scan_order = identity_order if window_elements_valid else []
+        for index in identity_scan_order:
             if identity_budget <= 0:
                 identity_diagnostic = identity_diagnostic or "native_axdocument_element_limit"
                 identity_complete = False
@@ -1528,7 +1585,7 @@ class NativeAXBridge:
         control_candidates: list[
             tuple[int, list[dict[str, Any]], list[tuple[dict[str, Any], int]], bool, bool]
         ] = []
-        if include_controls and selected_windows:
+        if include_controls and selected_windows and window_elements_valid:
             remaining_controls = self.MAX_CONTROLS
             scan_order = sorted(
                 range(len(selected_windows)),
@@ -1606,6 +1663,8 @@ class NativeAXBridge:
                     if control_candidates
                     else "native_transport_controls_not_found_in_window_set"
                 )
+        elif include_controls and selected_windows:
+            control_diagnostic = "native_window_set_invalid_for_control_traversal"
         result = {
             "accessibility_authorized": True,
             "modal_dialog": True if modal else False if complete and not modal_unknown else None,
@@ -1853,7 +1912,11 @@ class MacOSAccessibilityBackend:
             legacy_include_controls = (
                 include_controls
                 and native_error is None
-                and (native is None or native.get("accessibility_authorized") is not True)
+                and (
+                    native is None
+                    or native.get("accessibility_authorized") is not True
+                    or native_window_structure_invalid(native)
+                )
             )
             legacy = self._run_jxa(
                 render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": legacy_include_controls})
@@ -1898,9 +1961,11 @@ class MacOSAccessibilityBackend:
         try:
             with self.native_bridge_factory(current_process_identifier, self.timeout_seconds) as bridge:
                 if bridge.trusted():
-                    native_dispatch_started = True
-                    return bridge.dispatch_transport(operation, expected_project)
-                if not bridge.legacy_fallback_allowed():
+                    native_window_snapshot = bridge.snapshot(include_controls=False)
+                    if not native_window_structure_invalid(native_window_snapshot):
+                        native_dispatch_started = True
+                        return bridge.dispatch_transport(operation, expected_project)
+                elif not bridge.legacy_fallback_allowed():
                     raise AdapterFailure(
                         "native_ax_timeout_configuration_failed",
                         "native AX client is trusted but its messaging timeout could not be configured",
