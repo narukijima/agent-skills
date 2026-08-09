@@ -13,7 +13,9 @@
 
 ## 1. 位置づけ
 
-`scripts/logic_macos_adapter.py` は、このSkillに同梱する標準macOS Accessibilityアダプタである。外部package、座標、画像一致、Space keyのtoggleに依存せず、Logic Pro自身（bundle identifier `com.apple.logic10`）のAccessibility treeから状態と対象controlを特定する。
+`scripts/logic_macos_adapter.py` は、このSkillに同梱する標準macOS Accessibilityアダプタである。外部package、座標、画像一致、Space keyのtoggleに依存せず、対応するLogic ProプロセスのAccessibility treeから状態と対象controlを特定する。
+
+対応bundle identifierは `com.apple.mobilelogic`（Logic Pro 12系）と `com.apple.logic10`（従来版）である。静的capabilityとfresh observationへ対応一覧および実際に検出したidentifierを含める。observeで選んだidentifierはdispatch直前にも固定し、別のLogicプロセスへ切り替えない。
 
 このアダプタは意味操作の一部をすぐ使えるreference profileとして提供する。`capabilities` が返さない操作は未対応であり、汎用GUI操作へ自動fallbackしない。他のMCPやアダプタは `operation-contract.md` の同じ意味境界を実装してよい。
 
@@ -38,11 +40,11 @@ python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --opera
 python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --operation project.current
 ```
 
-`capabilities` は静的な実装表、`observe` の `data.capabilities` はその時点で実測できた操作一覧である。Logic未起動、権限なし、Project windowなし、transport状態不明の場合、runtime一覧は安全側に縮小する。
+`capabilities` は静的な実装表と `supported_bundle_identifiers`、`observe` の `data.capabilities` はその時点で実測できた操作一覧、`data.bundle_identifier` は実際に選んだLogic Proプロセスを返す。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport状態不明の場合、runtime一覧は安全側に縮小する。
 
 ## 4. 対応表
 
-reference profile `logic-pro-macos-accessibility` version `0.1.0` の対応は次のとおり。
+reference profile `logic-pro-macos-accessibility` version `0.1.1` の対応は次のとおり。
 
 | 意味操作 | 対応 | 操作または独立読戻し |
 | --- | --- | --- |
@@ -120,11 +122,12 @@ version名だけで互換を推測せず、更新後は実機で次をsmoke test
 
 1. `capabilities` が全意味操作を `implemented` または `not-implemented` と理由付きで列挙する。
 2. `app.status` が現在のunlock、Accessibility、modalを返す。
-3. `project.current` のpath、またはfallback window titleが対象Projectと一致する。
-4. 停止中の `transport.state.data.is_playing` がfalse、再生中がtrueになる。
-5. `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
-6. modal表示中、lock中、別Project、Control Bar非表示でdispatchが行われない。
-7. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
+3. Logic Pro 12系では `bundle_identifier` が `com.apple.mobilelogic`、従来版では `com.apple.logic10` になる。
+4. `project.current` のpath、またはfallback window titleが対象Projectと一致する。
+5. 停止中の `transport.state.data.is_playing` がfalse、再生中がtrueになる。
+6. `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
+7. modal表示中、lock中、別Project、Control Bar非表示でdispatchが行われない。
+8. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
 
 repository testはLogicを動かさず、AX snapshot fixtureを使って全allowlistのsupport表、日英label、Project binding、fingerprint、timeout区別、独立readback境界を検証する。実機smokeはmacOS TCCとLogic UI状態を変更するため、利用者の明示的な実行環境で行う。
 

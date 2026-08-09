@@ -23,8 +23,8 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.1.0"
-LOGIC_BUNDLE_ID = "com.apple.logic10"
+ADAPTER_VERSION = "0.1.1"
+SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 EVIDENCE_SOURCE = "logic-accessibility"
 
 READ_OPERATIONS = (
@@ -58,9 +58,21 @@ STOP_LABELS = ("stop", "停止")
 BEGINNING_LABELS = ("go to beginning", "先頭へ移動", "先頭に移動")
 
 
+BUNDLE_DISCOVERY_JXA = r'''
+function findLogicProcess(systemEvents, preferredBundleId) {
+  const bundleIds = preferredBundleId === null ? SUPPORTED_LOGIC_BUNDLE_IDS : [preferredBundleId];
+  for (let i = 0; i < bundleIds.length; i++) {
+    let processes = [];
+    try { processes = systemEvents.applicationProcesses.whose({bundleIdentifier: bundleIds[i]})(); } catch (_) { processes = []; }
+    if (processes && processes.length > 0) return {process: processes[0], bundle_identifier: bundleIds[i]};
+  }
+  return null;
+}
+'''
+
+
 SNAPSHOT_JXA = r'''
 function run() {
-  const BUNDLE_ID = "com.apple.logic10";
   function safe(fn, fallback) { try { const value = fn(); return value === undefined ? fallback : value; } catch (_) { return fallback; } }
   function text(value) {
     if (value === null || value === undefined) return null;
@@ -72,14 +84,14 @@ function run() {
     return safe(() => attrs[0].value(), null);
   }
   const systemEvents = Application("/System/Library/CoreServices/System Events.app");
-  const processes = safe(() => systemEvents.applicationProcesses.whose({bundleIdentifier: BUNDLE_ID})(), []);
-  if (!processes || processes.length === 0) {
-    return JSON.stringify({ok: true, logic_running: false, accessibility_authorized: false, windows: [], controls: []});
+  const discovered = findLogicProcess(systemEvents, null);
+  if (discovered === null) {
+    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, windows: [], controls: []});
   }
-  const process = processes[0];
+  const process = discovered.process;
   const windows = safe(() => process.windows(), null);
   if (windows === null) {
-    return JSON.stringify({ok: true, logic_running: true, accessibility_authorized: false, windows: [], controls: []});
+    return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, windows: [], controls: []});
   }
   let mainWindow = null;
   for (let i = 0; i < windows.length; i++) {
@@ -125,6 +137,7 @@ function run() {
   return JSON.stringify({
     ok: true,
     logic_running: true,
+    bundle_identifier: discovered.bundle_identifier,
     accessibility_authorized: true,
     frontmost: safe(() => Boolean(process.frontmost()), null),
     modal_dialog: modal,
@@ -170,9 +183,9 @@ function run() {
     return parts[parts.length - 1];
   }
   const systemEvents = Application("/System/Library/CoreServices/System Events.app");
-  const processes = safe(() => systemEvents.applicationProcesses.whose({bundleIdentifier: "com.apple.logic10"})(), []);
-  if (!processes || processes.length === 0) return JSON.stringify({ok: false, definitive: true, reason: "logic_not_running"});
-  const process = processes[0];
+  const discovered = findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID);
+  if (discovered === null) return JSON.stringify({ok: false, definitive: true, reason: "logic_not_running"});
+  const process = discovered.process;
   const windows = safe(() => process.windows(), null);
   if (windows === null) return JSON.stringify({ok: false, definitive: true, reason: "accessibility_not_authorized"});
   let mainWindow = null;
@@ -212,7 +225,7 @@ function run() {
   const press = actions.find(action => text(safe(() => action.name(), null)) === "AXPress");
   if (!press) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
   press.perform();
-  return JSON.stringify({ok: true, performed: true, already_satisfied: false, before: {is_playing: playing}});
+  return JSON.stringify({ok: true, performed: true, already_satisfied: false, bundle_identifier: discovered.bundle_identifier, before: {is_playing: playing}});
 }
 '''
 
@@ -231,6 +244,15 @@ def utc_now() -> str:
 
 def canonical_json(value: dict[str, Any]) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def render_jxa(source: str, constants: dict[str, Any] | None = None) -> str:
+    assignments = {
+        "SUPPORTED_LOGIC_BUNDLE_IDS": list(SUPPORTED_LOGIC_BUNDLE_IDS),
+        **(constants or {}),
+    }
+    prefix = "".join(f"const {name} = {json.dumps(value)};\n" for name, value in assignments.items())
+    return prefix + BUNDLE_DISCOVERY_JXA + source
 
 
 def normalize_document_path(value: Any) -> str | None:
@@ -443,16 +465,22 @@ class MacOSAccessibilityBackend:
         return None
 
     def snapshot(self) -> dict[str, Any]:
-        snapshot = self._run_jxa(SNAPSHOT_JXA)
+        snapshot = self._run_jxa(render_jxa(SNAPSHOT_JXA))
         snapshot["screen_unlocked"] = self._screen_unlocked()
         return snapshot
 
-    def dispatch_transport(self, operation: str, expected_project: str) -> dict[str, Any]:
-        prefix = (
-            "const REQUESTED_OPERATION = " + json.dumps(operation) + ";\n"
-            "const EXPECTED_PROJECT = " + json.dumps(expected_project) + ";\n"
+    def dispatch_transport(self, operation: str, expected_project: str, bundle_identifier: str) -> dict[str, Any]:
+        if bundle_identifier not in SUPPORTED_LOGIC_BUNDLE_IDS:
+            raise AdapterFailure("unsupported_logic_bundle", "observed Logic bundle identifier is unsupported", definitive=True)
+        source = render_jxa(
+            ACTION_JXA,
+            {
+                "REQUESTED_OPERATION": operation,
+                "EXPECTED_PROJECT": expected_project,
+                "EXPECTED_BUNDLE_ID": bundle_identifier,
+            },
         )
-        result = self._run_jxa(prefix + ACTION_JXA, may_dispatch=True)
+        result = self._run_jxa(source, may_dispatch=True)
         if result.get("ok") is not True:
             definitive = result.get("definitive") is True
             raise AdapterFailure(
@@ -483,6 +511,7 @@ class ReferenceAdapter:
             "ok": True,
             "adapter": {"name": ADAPTER_NAME, "version": ADAPTER_VERSION},
             "platform": {"required": "macOS", "current": platform.system()},
+            "supported_bundle_identifiers": list(SUPPORTED_LOGIC_BUNDLE_IDS),
             "capabilities": list(IMPLEMENTED_READS + IMPLEMENTED_WRITES),
             "operations": operations,
             "ui_languages": ["en", "ja"],
@@ -505,6 +534,7 @@ class ReferenceAdapter:
         if operation == "app.status":
             data = {
                 "logic_running": snapshot.get("logic_running") is True,
+                "bundle_identifier": snapshot.get("bundle_identifier"),
                 "screen_unlocked": snapshot.get("screen_unlocked"),
                 "accessibility_authorized": snapshot.get("accessibility_authorized") is True,
                 "modal_dialog": snapshot.get("modal_dialog") if snapshot.get("logic_running") is True else None,
@@ -513,10 +543,12 @@ class ReferenceAdapter:
             }
         elif operation == "project.current":
             data = project
+            data["bundle_identifier"] = snapshot.get("bundle_identifier")
             data["capabilities"] = runtime_capabilities(snapshot)
         else:
             data = transport
             data.update(project)
+            data["bundle_identifier"] = snapshot.get("bundle_identifier")
             data["capabilities"] = runtime_capabilities(snapshot)
         return {"ok": True, **common, "data": data}
 
@@ -534,12 +566,15 @@ class ReferenceAdapter:
                 raise AdapterFailure("accessibility_not_authorized", "Accessibility permission is not confirmed", definitive=True)
             if snapshot.get("modal_dialog") is not False:
                 raise AdapterFailure("modal_dialog_present", "Logic modal state is unsafe or unknown", definitive=True)
+            bundle_identifier = snapshot.get("bundle_identifier")
+            if bundle_identifier not in SUPPORTED_LOGIC_BUNDLE_IDS:
+                raise AdapterFailure("unsupported_logic_bundle", "running Logic bundle identifier is unsupported", definitive=True)
             expected_project = request["expected_project"]
             assert_project_binding(snapshot, expected_project)
             capabilities = runtime_capabilities(snapshot)
             if operation not in capabilities or "transport.state" not in capabilities:
                 raise AdapterFailure("capability_unavailable", "operation or independent readback is unavailable", definitive=True)
-            action = self.backend.dispatch_transport(operation, expected_project)
+            action = self.backend.dispatch_transport(operation, expected_project, bundle_identifier)
             return {
                 "ok": True,
                 "operation": operation,
@@ -550,6 +585,7 @@ class ReferenceAdapter:
                     "already_satisfied": action.get("already_satisfied") is True,
                     "adapter": ADAPTER_NAME,
                     "adapter_version": ADAPTER_VERSION,
+                    "bundle_identifier": bundle_identifier,
                 },
                 "readback_required": True,
             }

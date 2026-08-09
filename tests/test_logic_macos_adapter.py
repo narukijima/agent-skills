@@ -40,12 +40,13 @@ def control(title: str, *, value=None, press=True) -> dict:
     }
 
 
-def snapshot(project: str, *, playing=False) -> dict:
+def snapshot(project: str, *, playing=False, bundle_identifier="com.apple.mobilelogic") -> dict:
     controls = [control("Play", value=playing)]
     controls.append(control("Stop") if playing else control("Go to Beginning"))
     return {
         "ok": True,
         "logic_running": True,
+        "bundle_identifier": bundle_identifier,
         "screen_unlocked": True,
         "accessibility_authorized": True,
         "modal_dialog": False,
@@ -64,8 +65,8 @@ class FakeBackend:
     def snapshot(self):
         return json.loads(json.dumps(self.state))
 
-    def dispatch_transport(self, operation, expected_project):
-        self.dispatch_calls.append((operation, expected_project))
+    def dispatch_transport(self, operation, expected_project, bundle_identifier):
+        self.dispatch_calls.append((operation, expected_project, bundle_identifier))
         if isinstance(self.action, Exception):
             raise self.action
         return dict(self.action)
@@ -87,6 +88,10 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             document["capabilities"],
             ["app.status", "project.current", "transport.state", "transport.play", "transport.stop"],
         )
+        self.assertEqual(
+            document["supported_bundle_identifiers"],
+            ["com.apple.mobilelogic", "com.apple.logic10"],
+        )
         unsupported = [row for row in document["operations"] if row["support"] == "not-implemented"]
         self.assertTrue(unsupported)
         self.assertTrue(all(row["reason"] for row in unsupported))
@@ -99,6 +104,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertTrue(result["observed_at"].endswith("Z"))
         self.assertEqual(result["data"]["current_project"], str(Path(self.project).resolve()))
         self.assertFalse(result["data"]["is_playing"])
+        self.assertEqual(result["data"]["bundle_identifier"], "com.apple.mobilelogic")
         self.assertIn("transport.play", result["data"]["capabilities"])
         self.assertIn("transport.stop", result["data"]["capabilities"])
 
@@ -132,7 +138,42 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(result["dispatch"]["status"], "success")
         self.assertTrue(result["readback_required"])
         self.assertNotIn("readback", result)
-        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project)])
+        self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, "com.apple.mobilelogic")])
+
+    def test_current_and_legacy_bundle_identifiers_use_the_same_contract(self):
+        for bundle_identifier in adapter_module.SUPPORTED_LOGIC_BUNDLE_IDS:
+            with self.subTest(bundle_identifier=bundle_identifier):
+                backend = FakeBackend(snapshot(self.project, bundle_identifier=bundle_identifier))
+                adapter = adapter_module.ReferenceAdapter(backend)
+                observed = adapter.observe("app.status")
+                self.assertTrue(observed["data"]["logic_running"])
+                self.assertEqual(observed["data"]["bundle_identifier"], bundle_identifier)
+                dispatched = adapter.dispatch(preflight("transport.play", self.project))
+                self.assertTrue(dispatched["ok"])
+                self.assertEqual(dispatched["dispatch"]["bundle_identifier"], bundle_identifier)
+                self.assertEqual(backend.dispatch_calls, [("transport.play", self.project, bundle_identifier)])
+
+    def test_snapshot_and_action_share_central_bundle_discovery(self):
+        snapshot_source = adapter_module.render_jxa(adapter_module.SNAPSHOT_JXA)
+        action_source = adapter_module.render_jxa(
+            adapter_module.ACTION_JXA,
+            {
+                "REQUESTED_OPERATION": "transport.play",
+                "EXPECTED_PROJECT": self.project,
+                "EXPECTED_BUNDLE_ID": "com.apple.mobilelogic",
+            },
+        )
+        for bundle_identifier in adapter_module.SUPPORTED_LOGIC_BUNDLE_IDS:
+            self.assertIn(bundle_identifier, snapshot_source)
+            self.assertIn(bundle_identifier, action_source)
+        self.assertIn("findLogicProcess(systemEvents, null)", snapshot_source)
+        self.assertIn("findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID)", action_source)
+
+    def test_unrecognized_observed_bundle_is_rejected_before_action(self):
+        backend = FakeBackend(snapshot(self.project, bundle_identifier="com.example.logic"))
+        result = adapter_module.ReferenceAdapter(backend).dispatch(preflight("transport.play", self.project))
+        self.assertEqual(result["error"]["kind"], "unsupported_logic_bundle")
+        self.assertEqual(backend.dispatch_calls, [])
 
     def test_timeout_or_ambiguous_bridge_error_is_unknown(self):
         timeout = adapter_module.AdapterFailure(
