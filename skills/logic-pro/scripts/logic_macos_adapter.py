@@ -23,7 +23,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.1.2"
+ADAPTER_VERSION = "0.1.3"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -72,6 +72,85 @@ function findLogicProcess(systemEvents, preferredBundleId) {
 '''
 
 
+WINDOW_DISCOVERY_JXA = r'''
+function axValue(element, name) {
+  try {
+    const attrs = element.attributes.whose({name: name})();
+    if (!attrs || attrs.length === 0) return null;
+    const value = attrs[0].value();
+    return value === undefined ? null : value;
+  } catch (_) {
+    return null;
+  }
+}
+
+function asElementArray(value) {
+  if (value === null || value === undefined) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    if (typeof value.length === "number") {
+      const result = [];
+      for (let i = 0; i < value.length; i++) result.push(value[i]);
+      return result;
+    }
+  } catch (_) {}
+  return [value];
+}
+
+function discoverProcessWindows(process) {
+  let directWindows = null;
+  try { directWindows = process.windows(); } catch (_) { directWindows = null; }
+  if (directWindows !== null && directWindows.length > 0) {
+    return {windows: directWindows, source: "process.windows", complete: true, accessibility_authorized: true};
+  }
+
+  const attributeWindows = asElementArray(axValue(process, "AXWindows"));
+  if (attributeWindows.length > 0) {
+    return {windows: attributeWindows, source: "AXWindows", complete: true, accessibility_authorized: true};
+  }
+
+  let directChildren = null;
+  try { directChildren = process.uiElements(); } catch (_) { directChildren = null; }
+  if (directChildren !== null) {
+    const childWindows = directChildren.filter(element => {
+      try { return String(element.role()) === "AXWindow"; } catch (_) { return false; }
+    });
+    if (childWindows.length > 0) {
+      return {windows: childWindows, source: "process.uiElements.AXWindow", complete: true, accessibility_authorized: true};
+    }
+  }
+
+  let descendants = null;
+  try { descendants = process.entireContents(); } catch (_) { descendants = null; }
+  if (descendants !== null) {
+    const descendantWindows = descendants.filter(element => {
+      try { return String(element.role()) === "AXWindow"; } catch (_) { return false; }
+    });
+    if (descendantWindows.length > 0) {
+      return {windows: descendantWindows, source: "process.entireContents.AXWindow", complete: true, accessibility_authorized: true};
+    }
+  }
+
+  const mainWindow = axValue(process, "AXMainWindow");
+  if (mainWindow !== null) {
+    return {windows: [mainWindow], source: "AXMainWindow", complete: false, accessibility_authorized: true};
+  }
+  const focusedWindow = axValue(process, "AXFocusedWindow");
+  if (focusedWindow !== null) {
+    return {windows: [focusedWindow], source: "AXFocusedWindow", complete: false, accessibility_authorized: true};
+  }
+
+  const authorized = directWindows !== null || directChildren !== null || descendants !== null;
+  return {
+    windows: [],
+    source: authorized ? "process.windows" : null,
+    complete: authorized,
+    accessibility_authorized: authorized
+  };
+}
+'''
+
+
 SNAPSHOT_JXA = r'''
 function run() {
   function safe(fn, fallback) { try { const value = fn(); return value === undefined ? fallback : value; } catch (_) { return fallback; } }
@@ -87,12 +166,13 @@ function run() {
   const systemEvents = Application("/System/Library/CoreServices/System Events.app");
   const discovered = findLogicProcess(systemEvents, null);
   if (discovered === null) {
-    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, windows: [], controls: []});
+    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, windows: [], controls: []});
   }
   const process = discovered.process;
-  const windows = safe(() => process.windows(), null);
-  if (windows === null) {
-    return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, windows: [], controls: []});
+  const windowDiscovery = discoverProcessWindows(process);
+  const windows = windowDiscovery.windows;
+  if (!windowDiscovery.accessibility_authorized) {
+    return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, windows: [], controls: []});
   }
   let mainWindow = null;
   for (let i = 0; i < windows.length; i++) {
@@ -104,13 +184,15 @@ function run() {
   for (let i = 0; i < windows.length; i++) {
     const subrole = text(safe(() => windows[i].subrole(), null));
     const sheets = safe(() => windows[i].sheets(), []);
-    if (subrole === "AXDialog" || (sheets && sheets.length > 0)) modal = true;
+    const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
+    if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) modal = true;
     windowRows.push({
       title: text(safe(() => windows[i].name(), null)),
       role: text(safe(() => windows[i].role(), null)),
       subrole: subrole,
       document: text(attr(windows[i], "AXDocument")),
       main: Boolean(attr(windows[i], "AXMain")),
+      modal: isModal,
       sheet_count: sheets ? sheets.length : 0
     });
   }
@@ -141,7 +223,9 @@ function run() {
     bundle_identifier: discovered.bundle_identifier,
     accessibility_authorized: true,
     frontmost: safe(() => Boolean(process.frontmost()), null),
-    modal_dialog: modal,
+    modal_dialog: modal ? true : (windowDiscovery.complete ? false : null),
+    window_discovery_source: windowDiscovery.source,
+    window_set_complete: windowDiscovery.complete,
     windows: windowRows,
     controls: controls,
     controls_truncated: mainWindow !== null && safe(() => mainWindow.entireContents().length, 0) > 4000
@@ -187,15 +271,18 @@ function run() {
   const discovered = findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID);
   if (discovered === null) return JSON.stringify({ok: false, definitive: true, reason: "logic_not_running"});
   const process = discovered.process;
-  const windows = safe(() => process.windows(), null);
-  if (windows === null) return JSON.stringify({ok: false, definitive: true, reason: "accessibility_not_authorized"});
+  const windowDiscovery = discoverProcessWindows(process);
+  const windows = windowDiscovery.windows;
+  if (!windowDiscovery.accessibility_authorized) return JSON.stringify({ok: false, definitive: true, reason: "accessibility_not_authorized"});
   let mainWindow = null;
   for (let i = 0; i < windows.length; i++) {
     const sheets = safe(() => windows[i].sheets(), []);
     const subrole = text(safe(() => windows[i].subrole(), null));
-    if (subrole === "AXDialog" || (sheets && sheets.length > 0)) return JSON.stringify({ok: false, definitive: true, reason: "modal_dialog_present"});
+    const isModal = safe(() => Boolean(attr(windows[i], "AXModal")), false);
+    if (subrole === "AXDialog" || isModal || (sheets && sheets.length > 0)) return JSON.stringify({ok: false, definitive: true, reason: "modal_dialog_present"});
     if (mainWindow === null && Boolean(attr(windows[i], "AXMain"))) mainWindow = windows[i];
   }
+  if (!windowDiscovery.complete) return JSON.stringify({ok: false, definitive: true, reason: "window_set_incomplete"});
   if (mainWindow === null && windows.length > 0) mainWindow = windows[0];
   if (mainWindow === null) return JSON.stringify({ok: false, definitive: true, reason: "project_window_not_found"});
   const expectedName = basename(EXPECTED_PROJECT);
@@ -222,7 +309,7 @@ function run() {
   if (playing === null && beginning && !stop) playing = false;
   if (playing === null) return JSON.stringify({ok: false, definitive: true, reason: "transport_state_not_observable"});
   const wantsPlaying = REQUESTED_OPERATION === "transport.play";
-  if (playing === wantsPlaying) return JSON.stringify({ok: true, performed: false, already_satisfied: true, before: {is_playing: playing}});
+  if (playing === wantsPlaying) return JSON.stringify({ok: true, performed: false, already_satisfied: true, window_discovery_source: windowDiscovery.source, before: {is_playing: playing}});
   const targetCandidates = wantsPlaying ? playControls : stopControls;
   if (targetCandidates.length === 0) return JSON.stringify({ok: false, definitive: true, reason: wantsPlaying ? "play_control_not_found" : "stop_control_not_found"});
   const target = targetCandidates.find(element => {
@@ -234,7 +321,7 @@ function run() {
   const press = actions.find(action => text(safe(() => action.name(), null)) === "AXPress");
   if (!press) return JSON.stringify({ok: false, definitive: true, reason: "ax_press_not_supported"});
   press.perform();
-  return JSON.stringify({ok: true, performed: true, already_satisfied: false, bundle_identifier: discovered.bundle_identifier, before: {is_playing: playing}});
+  return JSON.stringify({ok: true, performed: true, already_satisfied: false, bundle_identifier: discovered.bundle_identifier, window_discovery_source: windowDiscovery.source, before: {is_playing: playing}});
 }
 '''
 
@@ -262,7 +349,7 @@ def render_jxa(source: str, constants: dict[str, Any] | None = None) -> str:
         **(constants or {}),
     }
     prefix = "".join(f"const {name} = {json.dumps(value)};\n" for name, value in assignments.items())
-    return prefix + BUNDLE_DISCOVERY_JXA + source
+    return prefix + BUNDLE_DISCOVERY_JXA + WINDOW_DISCOVERY_JXA + source
 
 
 def normalize_document_path(value: Any) -> str | None:
@@ -368,10 +455,11 @@ def runtime_capabilities(snapshot: dict[str, Any]) -> list[str]:
     transport = transport_from_controls(snapshot.get("controls"))
     if transport["is_playing"] is not None:
         capabilities.append("transport.state")
-        if transport["is_playing"] is True or transport["play_control_available"]:
-            capabilities.append("transport.play")
-        if transport["is_playing"] is False or transport["stop_control_available"]:
-            capabilities.append("transport.stop")
+        if snapshot.get("window_set_complete") is True:
+            if transport["is_playing"] is True or transport["play_control_available"]:
+                capabilities.append("transport.play")
+            if transport["is_playing"] is False or transport["stop_control_available"]:
+                capabilities.append("transport.stop")
     return [operation for operation in ALL_OPERATIONS if operation in capabilities]
 
 
@@ -557,16 +645,22 @@ class ReferenceAdapter:
                 "accessibility_authorized": snapshot.get("accessibility_authorized") is True,
                 "modal_dialog": snapshot.get("modal_dialog") if snapshot.get("logic_running") is True else None,
                 "frontmost": snapshot.get("frontmost"),
+                "window_discovery_source": snapshot.get("window_discovery_source"),
+                "window_set_complete": snapshot.get("window_set_complete") is True,
                 "capabilities": runtime_capabilities(snapshot),
             }
         elif operation == "project.current":
             data = project
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
+            data["window_discovery_source"] = snapshot.get("window_discovery_source")
+            data["window_set_complete"] = snapshot.get("window_set_complete") is True
             data["capabilities"] = runtime_capabilities(snapshot)
         else:
             data = transport
             data.update(project)
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
+            data["window_discovery_source"] = snapshot.get("window_discovery_source")
+            data["window_set_complete"] = snapshot.get("window_set_complete") is True
             data["capabilities"] = runtime_capabilities(snapshot)
         return {"ok": True, **common, "data": data}
 
@@ -582,6 +676,8 @@ class ReferenceAdapter:
                 raise AdapterFailure("screen_locked_or_unknown", "screen unlocked state is not confirmed", definitive=True)
             if snapshot.get("accessibility_authorized") is not True:
                 raise AdapterFailure("accessibility_not_authorized", "Accessibility permission is not confirmed", definitive=True)
+            if snapshot.get("window_set_complete") is not True:
+                raise AdapterFailure("window_set_incomplete", "complete Logic window set is not confirmed", definitive=True)
             if snapshot.get("modal_dialog") is not False:
                 raise AdapterFailure("modal_dialog_present", "Logic modal state is unsafe or unknown", definitive=True)
             bundle_identifier = snapshot.get("bundle_identifier")
@@ -604,6 +700,8 @@ class ReferenceAdapter:
                     "adapter": ADAPTER_NAME,
                     "adapter_version": ADAPTER_VERSION,
                     "bundle_identifier": bundle_identifier,
+                    "window_discovery_source": action.get("window_discovery_source")
+                    or snapshot.get("window_discovery_source"),
                 },
                 "readback_required": True,
             }

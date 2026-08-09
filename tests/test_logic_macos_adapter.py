@@ -40,7 +40,14 @@ def control(title: str, *, role="AXButton", value=None, press=True) -> dict:
     }
 
 
-def snapshot(project: str, *, playing=False, bundle_identifier="com.apple.mobilelogic") -> dict:
+def snapshot(
+    project: str,
+    *,
+    playing=False,
+    bundle_identifier="com.apple.mobilelogic",
+    window_discovery_source="process.windows",
+    window_set_complete=True,
+) -> dict:
     controls = [control("Play", value=playing)]
     controls.append(control("Stop") if playing else control("Go to Beginning"))
     return {
@@ -51,6 +58,8 @@ def snapshot(project: str, *, playing=False, bundle_identifier="com.apple.mobile
         "accessibility_authorized": True,
         "modal_dialog": False,
         "frontmost": True,
+        "window_discovery_source": window_discovery_source,
+        "window_set_complete": window_set_complete,
         "windows": [{"title": Path(project).name, "document": project, "main": True}],
         "controls": controls,
     }
@@ -106,8 +115,52 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(result["data"]["current_project"], str(Path(self.project).resolve()))
         self.assertFalse(result["data"]["is_playing"])
         self.assertEqual(result["data"]["bundle_identifier"], "com.apple.mobilelogic")
+        self.assertEqual(result["data"]["window_discovery_source"], "process.windows")
+        self.assertTrue(result["data"]["window_set_complete"])
         self.assertIn("transport.play", result["data"]["capabilities"])
         self.assertIn("transport.stop", result["data"]["capabilities"])
+
+    def test_foreground_empty_window_snapshot_fails_closed(self):
+        state = snapshot(self.project)
+        state["windows"] = []
+        state["controls"] = []
+        adapter = adapter_module.ReferenceAdapter(FakeBackend(state))
+        observed = adapter.observe("project.current")
+        self.assertTrue(observed["data"]["current_project_unavailable"])
+        self.assertIsNone(observed["data"]["current_project"])
+        self.assertEqual(observed["data"]["capabilities"], ["app.status"])
+        dispatched = adapter.dispatch(preflight("transport.play", self.project))
+        self.assertEqual(dispatched["error"]["kind"], "project_mismatch")
+
+    def test_complete_axwindows_fallback_restores_project_transport_and_dispatch(self):
+        state = snapshot(self.project, window_discovery_source="AXWindows")
+        backend = FakeBackend(state, {"ok": True, "performed": True, "window_discovery_source": "AXWindows"})
+        adapter = adapter_module.ReferenceAdapter(backend)
+        observed = adapter.observe("transport.state")
+        self.assertEqual(observed["data"]["current_project"], str(Path(self.project).resolve()))
+        self.assertEqual(observed["data"]["window_discovery_source"], "AXWindows")
+        self.assertTrue(observed["data"]["window_set_complete"])
+        self.assertIn("transport.play", observed["data"]["capabilities"])
+        dispatched = adapter.dispatch(preflight("transport.play", self.project))
+        self.assertTrue(dispatched["ok"])
+        self.assertEqual(dispatched["dispatch"]["window_discovery_source"], "AXWindows")
+
+    def test_incomplete_main_window_fallback_is_read_only(self):
+        state = snapshot(
+            self.project,
+            window_discovery_source="AXMainWindow",
+            window_set_complete=False,
+        )
+        state["modal_dialog"] = None
+        backend = FakeBackend(state)
+        adapter = adapter_module.ReferenceAdapter(backend)
+        observed = adapter.observe("transport.state")
+        self.assertEqual(observed["data"]["current_project"], str(Path(self.project).resolve()))
+        self.assertIn("transport.state", observed["data"]["capabilities"])
+        self.assertNotIn("transport.play", observed["data"]["capabilities"])
+        dispatched = adapter.dispatch(preflight("transport.play", self.project))
+        self.assertEqual(dispatched["error"]["kind"], "window_set_incomplete")
+        self.assertEqual(backend.dispatch_calls, [])
 
     def test_japanese_control_labels_are_mapped_without_coordinates(self):
         state = snapshot(self.project)
@@ -196,6 +249,30 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             self.assertIn(bundle_identifier, action_source)
         self.assertIn("findLogicProcess(systemEvents, null)", snapshot_source)
         self.assertIn("findLogicProcess(systemEvents, EXPECTED_BUNDLE_ID)", action_source)
+
+    def test_snapshot_and_action_share_window_discovery_fallbacks(self):
+        snapshot_source = adapter_module.render_jxa(adapter_module.SNAPSHOT_JXA)
+        action_source = adapter_module.render_jxa(
+            adapter_module.ACTION_JXA,
+            {
+                "REQUESTED_OPERATION": "transport.play",
+                "EXPECTED_PROJECT": self.project,
+                "EXPECTED_BUNDLE_ID": "com.apple.mobilelogic",
+            },
+        )
+        for source in (
+            "process.windows",
+            "AXWindows",
+            "process.uiElements.AXWindow",
+            "process.entireContents.AXWindow",
+            "AXMainWindow",
+            "AXFocusedWindow",
+        ):
+            self.assertIn(source, snapshot_source)
+            self.assertIn(source, action_source)
+        self.assertIn("discoverProcessWindows(process)", snapshot_source)
+        self.assertIn("discoverProcessWindows(process)", action_source)
+        self.assertIn('reason: "window_set_incomplete"', action_source)
 
     def test_snapshot_and_action_jxa_share_supported_transport_control_roles(self):
         snapshot_source = adapter_module.render_jxa(adapter_module.SNAPSHOT_JXA)
