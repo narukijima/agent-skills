@@ -23,7 +23,7 @@ from urllib.parse import unquote, urlparse
 
 
 ADAPTER_NAME = "logic-pro-macos-accessibility"
-ADAPTER_VERSION = "0.1.3"
+ADAPTER_VERSION = "0.1.4"
 SUPPORTED_LOGIC_BUNDLE_IDS = ("com.apple.mobilelogic", "com.apple.logic10")
 SUPPORTED_TRANSPORT_CONTROL_ROLES = ("AXButton", "AXCheckBox")
 EVIDENCE_SOURCE = "logic-accessibility"
@@ -120,17 +120,6 @@ function discoverProcessWindows(process) {
     }
   }
 
-  let descendants = null;
-  try { descendants = process.entireContents(); } catch (_) { descendants = null; }
-  if (descendants !== null) {
-    const descendantWindows = descendants.filter(element => {
-      try { return String(element.role()) === "AXWindow"; } catch (_) { return false; }
-    });
-    if (descendantWindows.length > 0) {
-      return {windows: descendantWindows, source: "process.entireContents.AXWindow", complete: true, accessibility_authorized: true};
-    }
-  }
-
   const mainWindow = axValue(process, "AXMainWindow");
   if (mainWindow !== null) {
     return {windows: [mainWindow], source: "AXMainWindow", complete: false, accessibility_authorized: true};
@@ -140,7 +129,7 @@ function discoverProcessWindows(process) {
     return {windows: [focusedWindow], source: "AXFocusedWindow", complete: false, accessibility_authorized: true};
   }
 
-  const authorized = directWindows !== null || directChildren !== null || descendants !== null;
+  const authorized = directWindows !== null || directChildren !== null;
   return {
     windows: [],
     source: authorized ? "process.windows" : null,
@@ -166,13 +155,13 @@ function run() {
   const systemEvents = Application("/System/Library/CoreServices/System Events.app");
   const discovered = findLogicProcess(systemEvents, null);
   if (discovered === null) {
-    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, windows: [], controls: []});
+    return JSON.stringify({ok: true, logic_running: false, bundle_identifier: null, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, transport_controls_observed: false, windows: [], controls: []});
   }
   const process = discovered.process;
   const windowDiscovery = discoverProcessWindows(process);
   const windows = windowDiscovery.windows;
   if (!windowDiscovery.accessibility_authorized) {
-    return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, windows: [], controls: []});
+    return JSON.stringify({ok: true, logic_running: true, bundle_identifier: discovered.bundle_identifier, accessibility_authorized: false, window_discovery_source: null, window_set_complete: false, transport_controls_observed: false, windows: [], controls: []});
   }
   let mainWindow = null;
   for (let i = 0; i < windows.length; i++) {
@@ -197,24 +186,30 @@ function run() {
     });
   }
   const controls = [];
-  if (mainWindow !== null) {
-    const contents = safe(() => mainWindow.entireContents(), []);
-    const bounded = contents.slice(0, 4000);
-    for (let i = 0; i < bounded.length; i++) {
-      const element = bounded[i];
-      const role = text(safe(() => element.role(), null));
-      if (!SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(role) && !["AXRadioButton", "AXTextField", "AXStaticText"].includes(role)) continue;
-      const actions = safe(() => element.actions(), []);
-      controls.push({
-        role: role,
-        title: text(safe(() => element.name(), null)),
-        description: text(safe(() => element.description(), null)),
-        help: text(safe(() => element.help(), null)),
-        identifier: text(attr(element, "AXIdentifier")),
-        value: safe(() => element.value(), null),
-        enabled: safe(() => Boolean(element.enabled()), null),
-        actions: actions.map(action => text(safe(() => action.name(), null))).filter(Boolean)
-      });
+  let controlCount = 0;
+  let controlsObserved = false;
+  if (mainWindow !== null && INCLUDE_CONTROLS) {
+    const contents = safe(() => mainWindow.entireContents(), null);
+    if (contents !== null) {
+      controlsObserved = true;
+      controlCount = contents.length;
+      const bounded = contents.slice(0, 4000);
+      for (let i = 0; i < bounded.length; i++) {
+        const element = bounded[i];
+        const role = text(safe(() => element.role(), null));
+        if (!SUPPORTED_TRANSPORT_CONTROL_ROLES.includes(role) && !["AXRadioButton", "AXTextField", "AXStaticText"].includes(role)) continue;
+        const actions = safe(() => element.actions(), []);
+        controls.push({
+          role: role,
+          title: text(safe(() => element.name(), null)),
+          description: text(safe(() => element.description(), null)),
+          help: text(safe(() => element.help(), null)),
+          identifier: text(attr(element, "AXIdentifier")),
+          value: safe(() => element.value(), null),
+          enabled: safe(() => Boolean(element.enabled()), null),
+          actions: actions.map(action => text(safe(() => action.name(), null))).filter(Boolean)
+        });
+      }
     }
   }
   return JSON.stringify({
@@ -226,9 +221,10 @@ function run() {
     modal_dialog: modal ? true : (windowDiscovery.complete ? false : null),
     window_discovery_source: windowDiscovery.source,
     window_set_complete: windowDiscovery.complete,
+    transport_controls_observed: controlsObserved,
     windows: windowRows,
     controls: controls,
-    controls_truncated: mainWindow !== null && safe(() => mainWindow.entireContents().length, 0) > 4000
+    controls_truncated: controlsObserved && controlCount > 4000
   });
 }
 '''
@@ -346,6 +342,7 @@ def render_jxa(source: str, constants: dict[str, Any] | None = None) -> str:
     assignments = {
         "SUPPORTED_LOGIC_BUNDLE_IDS": list(SUPPORTED_LOGIC_BUNDLE_IDS),
         "SUPPORTED_TRANSPORT_CONTROL_ROLES": list(SUPPORTED_TRANSPORT_CONTROL_ROLES),
+        "INCLUDE_CONTROLS": True,
         **(constants or {}),
     }
     prefix = "".join(f"const {name} = {json.dumps(value)};\n" for name, value in assignments.items())
@@ -453,7 +450,7 @@ def runtime_capabilities(snapshot: dict[str, Any]) -> list[str]:
     if main_window(snapshot) is not None:
         capabilities.append("project.current")
     transport = transport_from_controls(snapshot.get("controls"))
-    if transport["is_playing"] is not None:
+    if snapshot.get("transport_controls_observed") is True and transport["is_playing"] is not None:
         capabilities.append("transport.state")
         if snapshot.get("window_set_complete") is True:
             if transport["is_playing"] is True or transport["play_control_available"]:
@@ -569,8 +566,8 @@ class MacOSAccessibilityBackend:
             return True
         return None
 
-    def snapshot(self) -> dict[str, Any]:
-        snapshot = self._run_jxa(render_jxa(SNAPSHOT_JXA))
+    def snapshot(self, *, include_controls: bool = True) -> dict[str, Any]:
+        snapshot = self._run_jxa(render_jxa(SNAPSHOT_JXA, {"INCLUDE_CONTROLS": include_controls}))
         snapshot["screen_unlocked"] = self._screen_unlocked()
         return snapshot
 
@@ -628,7 +625,7 @@ class ReferenceAdapter:
     def observe(self, operation: str) -> dict[str, Any]:
         if operation not in IMPLEMENTED_READS:
             raise AdapterFailure("unsupported_operation", f"reference adapter does not implement read: {operation}", definitive=True)
-        snapshot = self.backend.snapshot()
+        snapshot = self.backend.snapshot(include_controls=operation == "transport.state")
         project = project_from_snapshot(snapshot)
         transport = transport_from_controls(snapshot.get("controls"))
         common = {
@@ -647,6 +644,7 @@ class ReferenceAdapter:
                 "frontmost": snapshot.get("frontmost"),
                 "window_discovery_source": snapshot.get("window_discovery_source"),
                 "window_set_complete": snapshot.get("window_set_complete") is True,
+                "transport_controls_observed": snapshot.get("transport_controls_observed") is True,
                 "capabilities": runtime_capabilities(snapshot),
             }
         elif operation == "project.current":
@@ -654,6 +652,7 @@ class ReferenceAdapter:
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
+            data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True
             data["capabilities"] = runtime_capabilities(snapshot)
         else:
             data = transport
@@ -661,6 +660,7 @@ class ReferenceAdapter:
             data["bundle_identifier"] = snapshot.get("bundle_identifier")
             data["window_discovery_source"] = snapshot.get("window_discovery_source")
             data["window_set_complete"] = snapshot.get("window_set_complete") is True
+            data["transport_controls_observed"] = snapshot.get("transport_controls_observed") is True
             data["capabilities"] = runtime_capabilities(snapshot)
         return {"ok": True, **common, "data": data}
 
@@ -669,7 +669,7 @@ class ReferenceAdapter:
             operation, request = validate_preflight(preflight)
             if operation not in IMPLEMENTED_WRITES:
                 raise AdapterFailure("unsupported_operation", f"reference adapter does not implement write: {operation}", definitive=True)
-            snapshot = self.backend.snapshot()
+            snapshot = self.backend.snapshot(include_controls=True)
             if snapshot.get("logic_running") is not True:
                 raise AdapterFailure("logic_not_running", "Logic Pro is not running", definitive=True)
             if snapshot.get("screen_unlocked") is not True:

@@ -17,7 +17,9 @@
 
 対応bundle identifierは `com.apple.mobilelogic`（Logic Pro 12系）と `com.apple.logic10`（従来版）である。静的capabilityとfresh observationへ対応一覧および実際に検出したidentifierを含める。observeで選んだidentifierはdispatch直前にも固定し、別のLogicプロセスへ切り替えない。
 
-window探索は `process.windows()`、application-level `AXWindows`属性、直下`uiElements`、全descendantの`AXWindow` roleの順に完全な集合を探す。いずれも空でも `AXMainWindow` または `AXFocusedWindow` が得られる場合はread-only観測へ使うが、他windowやmodalの不在を証明できないためdispatchしない。観測は `window_discovery_source` と `window_set_complete` を返す。Appleはapplication-level objectの [AXWindows](https://developer.apple.com/documentation/applicationservices/kaxwindowsattribute)、[AXMainWindow](https://developer.apple.com/documentation/applicationservices/kaxmainwindowattribute)、[AXFocusedWindow](https://developer.apple.com/documentation/applicationservices/kaxfocusedwindowattribute) をそれぞれwindow取得属性として定義している。
+window探索は `process.windows()`、application-level `AXWindows`属性、直下`uiElements`の`AXWindow` roleの順に完全な集合を探す。process全体の `entireContents()` はLogic 12で無制限に待つ可能性があるためwindow探索に使わない。いずれも空でも `AXMainWindow` または `AXFocusedWindow` が得られる場合はread-only観測へ使うが、他windowやmodalの不在を証明できないためdispatchしない。観測は `window_discovery_source` と `window_set_complete` を返す。Appleはapplication-level objectの [AXWindows](https://developer.apple.com/documentation/applicationservices/kaxwindowsattribute)、[AXMainWindow](https://developer.apple.com/documentation/applicationservices/kaxmainwindowattribute)、[AXFocusedWindow](https://developer.apple.com/documentation/applicationservices/kaxfocusedwindowattribute) をそれぞれwindow取得属性として定義している。
+
+`app.status` と `project.current` はtransport control treeを走査しない。`transport.state` とdispatch前snapshotだけがmain windowのcontrolを収集し、結果の `transport_controls_observed` で実測の有無を示す。これにより軽量な安全ゲートを、Control Bar探索の遅延やtimeoutから分離する。
 
 このアダプタは意味操作の一部をすぐ使えるreference profileとして提供する。`capabilities` が返さない操作は未対応であり、汎用GUI操作へ自動fallbackしない。他のMCPやアダプタは `operation-contract.md` の同じ意味境界を実装してよい。
 
@@ -42,11 +44,11 @@ python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --opera
 python3 skills/logic-pro/scripts/logic_macos_adapter.py --pretty observe --operation project.current
 ```
 
-`capabilities` は静的な実装表、`supported_bundle_identifiers`、`supported_transport_control_roles` を返す。`observe` の `data.capabilities` はその時点で実測できた操作一覧、`data.bundle_identifier` は実際に選んだLogic Proプロセス、`window_discovery_source` と `window_set_complete` はwindow探索証拠を返す。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport状態不明、window集合不完全、または意味labelに一致するcontrolが `AXPress` を持たない場合、runtime一覧は安全側に縮小する。
+`capabilities` は静的な実装表、`supported_bundle_identifiers`、`supported_transport_control_roles` を返す。`observe` の `data.capabilities` はそのcallで実測できた操作一覧、`data.bundle_identifier` は実際に選んだLogic Proプロセス、`window_discovery_source` と `window_set_complete` はwindow探索証拠、`transport_controls_observed` はControl Bar走査の有無を返す。Logic未起動、対応identifierのプロセス不在、権限なし、Project windowなし、transport未観測または状態不明、window集合不完全、または意味labelに一致するcontrolが `AXPress` を持たない場合、runtime一覧は安全側に縮小する。
 
 ## 4. 対応表
 
-reference profile `logic-pro-macos-accessibility` version `0.1.3` の対応は次のとおり。
+reference profile `logic-pro-macos-accessibility` version `0.1.4` の対応は次のとおり。
 
 | 意味操作 | 対応 | 操作または独立読戻し |
 | --- | --- | --- |
@@ -128,10 +130,11 @@ version名だけで互換を推測せず、更新後は実機で次をsmoke test
 3. Logic Pro 12系では `bundle_identifier` が `com.apple.mobilelogic`、従来版では `com.apple.logic10` になる。
 4. `project.current` のpath、またはfallback window titleが対象Projectと一致する。
 5. `window_discovery_source` と `window_set_complete` がwindow取得経路とdispatch可否を説明する。
-6. 停止中の `transport.state.data.is_playing` がfalse、再生中がtrueになる。
-7. `AXButton` と `AXCheckBox` の対応layoutで `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
-8. modal表示中、lock中、window集合不完全、別Project、Control Bar非表示でdispatchが行われない。
-9. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
+6. `app.status` と `project.current` の `transport_controls_observed` がfalseで、main window control treeを走査しない。
+7. 停止中の `transport.state.data.is_playing` がfalse、再生中がtrueになり、`transport_controls_observed` がtrueになる。
+8. `AXButton` と `AXCheckBox` の対応layoutで `transport.play` と `transport.stop` を別々のpreflightで一回ずつ実行し、それぞれ別processの `observe` で読戻せる。
+9. modal表示中、lock中、window集合不完全、別Project、Control Bar非表示でdispatchが行われない。
+10. timeoutを短くしたfixtureで終了code 3とunknownが維持される。
 
 repository testはLogicを動かさず、AX snapshot fixtureを使って全allowlistのsupport表、empty-window、完全・不完全window fallback、`AXButton` / `AXCheckBox`、日英label、`AXPress`、Project binding、fingerprint、timeout区別、独立readback境界を検証する。実機smokeはmacOS TCCとLogic UI状態を変更するため、利用者の明示的な実行環境で行う。
 
@@ -141,5 +144,6 @@ repository testはLogicを動かさず、AX snapshot fixtureを使って全allow
 - coordinate click、画像認識、Space toggle、任意key sequenceを使わない。
 - `AXPress`対象はLogic所有のmain window内、日英の意味label、対応actionの三条件で特定する。
 - `AXMainWindow` / `AXFocusedWindow`だけのfallbackで変更操作を許可しない。
+- process全体の無制限な `entireContents()` をwindow fallbackに使わない。
 - 表示layoutやUI言語が互換表外ならcapabilityを返さず停止する。
 - adapterの成功は作品完成を意味しない。必ずguardの独立読戻し分類を通す。

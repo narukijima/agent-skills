@@ -60,6 +60,7 @@ def snapshot(
         "frontmost": True,
         "window_discovery_source": window_discovery_source,
         "window_set_complete": window_set_complete,
+        "transport_controls_observed": True,
         "windows": [{"title": Path(project).name, "document": project, "main": True}],
         "controls": controls,
     }
@@ -70,9 +71,15 @@ class FakeBackend:
         self.state = state
         self.action = action or {"ok": True, "performed": True, "already_satisfied": False}
         self.dispatch_calls = []
+        self.snapshot_calls = []
 
-    def snapshot(self):
-        return json.loads(json.dumps(self.state))
+    def snapshot(self, *, include_controls=True):
+        self.snapshot_calls.append(include_controls)
+        state = json.loads(json.dumps(self.state))
+        if not include_controls:
+            state["controls"] = []
+            state["transport_controls_observed"] = False
+        return state
 
     def dispatch_transport(self, operation, expected_project, bundle_identifier):
         self.dispatch_calls.append((operation, expected_project, bundle_identifier))
@@ -117,8 +124,32 @@ class LogicMacOSAdapterTests(unittest.TestCase):
         self.assertEqual(result["data"]["bundle_identifier"], "com.apple.mobilelogic")
         self.assertEqual(result["data"]["window_discovery_source"], "process.windows")
         self.assertTrue(result["data"]["window_set_complete"])
+        self.assertTrue(result["data"]["transport_controls_observed"])
         self.assertIn("transport.play", result["data"]["capabilities"])
         self.assertIn("transport.stop", result["data"]["capabilities"])
+
+    def test_app_status_defers_transport_control_traversal(self):
+        backend = FakeBackend(snapshot(self.project))
+        result = adapter_module.ReferenceAdapter(backend).observe("app.status")
+        self.assertEqual(backend.snapshot_calls, [False])
+        self.assertFalse(result["data"]["transport_controls_observed"])
+        self.assertEqual(result["data"]["capabilities"], ["app.status", "project.current"])
+
+    def test_project_current_defers_transport_control_traversal(self):
+        backend = FakeBackend(snapshot(self.project))
+        result = adapter_module.ReferenceAdapter(backend).observe("project.current")
+        self.assertEqual(backend.snapshot_calls, [False])
+        self.assertFalse(result["data"]["transport_controls_observed"])
+        self.assertEqual(result["data"]["current_project"], str(Path(self.project).resolve()))
+
+    def test_snapshot_jxa_gates_control_traversal(self):
+        lightweight_source = adapter_module.render_jxa(
+            adapter_module.SNAPSHOT_JXA,
+            {"INCLUDE_CONTROLS": False},
+        )
+        self.assertIn("const INCLUDE_CONTROLS = false;", lightweight_source)
+        self.assertIn("mainWindow !== null && INCLUDE_CONTROLS", lightweight_source)
+        self.assertIn("transport_controls_observed: controlsObserved", lightweight_source)
 
     def test_foreground_empty_window_snapshot_fails_closed(self):
         state = snapshot(self.project)
@@ -264,7 +295,6 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             "process.windows",
             "AXWindows",
             "process.uiElements.AXWindow",
-            "process.entireContents.AXWindow",
             "AXMainWindow",
             "AXFocusedWindow",
         ):
@@ -272,6 +302,7 @@ class LogicMacOSAdapterTests(unittest.TestCase):
             self.assertIn(source, action_source)
         self.assertIn("discoverProcessWindows(process)", snapshot_source)
         self.assertIn("discoverProcessWindows(process)", action_source)
+        self.assertNotIn("process.entireContents()", adapter_module.WINDOW_DISCOVERY_JXA)
         self.assertIn('reason: "window_set_incomplete"', action_source)
 
     def test_snapshot_and_action_jxa_share_supported_transport_control_roles(self):
