@@ -1,9 +1,10 @@
 ---
 name: x-api
 description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
-status: active
-aliases: [x api, twitter-api]
-version: 0.4.2
+license: MIT. See LICENSE.txt
+metadata:
+  claudagt.version: "0.4.2"
+  claudagt.status: "active"
 ---
 
 # x-api — X API v2 の取得と安全な投稿

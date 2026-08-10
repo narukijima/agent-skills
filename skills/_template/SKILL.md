@@ -1,9 +1,10 @@
 ---
 name: <skill-name>
-description: <200文字以内。どの依頼でこのSkillを使うかが分かる説明>
-status: active
-aliases: []
-version: 0.1.0
+description: <1024文字以内。何を行い、どの依頼で使うか、誤発動を避ける境界が分かる説明>
+license: MIT. See LICENSE.txt
+metadata:
+  claudagt.version: "0.1.0"
+  claudagt.status: "active"
 ---
 
 # `<skill-name>` — <一行説明>

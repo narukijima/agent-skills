@@ -37,7 +37,10 @@ source_dir="$repo_root/skills/$skill_name"
 destination="$target_root/skills/$skill_name"
 
 [[ -f "$source_dir/SKILL.md" ]] || { printf 'ERROR: skill not found: %s\n' "$skill_name" >&2; exit 1; }
-[[ -d "$repo_root/.git" ]] || { printf 'ERROR: source repository is not a Git checkout\n' >&2; exit 1; }
+git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  printf 'ERROR: source repository is not a Git checkout\n' >&2
+  exit 1
+}
 [[ ! -e "$destination" ]] || { printf 'ERROR: destination exists; refusing to overwrite: %s\n' "$destination" >&2; exit 1; }
 
 source_commit="$(git -C "$repo_root" rev-parse HEAD)"
@@ -45,7 +48,39 @@ source_repository="$(git -C "$repo_root" remote get-url origin 2>/dev/null || tr
 if [[ -z "$source_repository" ]]; then
   source_repository='local checkout (origin is not configured)'
 fi
-source_version="$(sed -n 's/^version:[[:space:]]*//p' "$source_dir/SKILL.md" | head -n 1)"
+source_version="$(python3 - "$source_dir/SKILL.md" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.match(r"^---\n(.*?)\n---(?:\n|$)", text, re.S)
+if not match:
+    raise SystemExit("ERROR: source Skill has invalid frontmatter")
+
+frontmatter = match.group(1).splitlines()
+metadata_indent = None
+version = None
+legacy_version = None
+for line in frontmatter:
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    indent = len(line) - len(line.lstrip(" "))
+    if indent == 0:
+        metadata_indent = 0 if line.strip() == "metadata:" else None
+        legacy = re.fullmatch(r'version:\s*["\']?([^"\']+?)["\']?\s*', line)
+        if legacy:
+            legacy_version = legacy.group(1).strip()
+        continue
+    if metadata_indent is not None and indent > metadata_indent:
+        item = re.fullmatch(r'\s*claudagt\.version:\s*["\']([^"\']+)["\']\s*', line)
+        if item:
+            version = item.group(1)
+            break
+
+print(version or legacy_version or "")
+PY
+)"
 [[ -n "$source_version" ]] || { printf 'ERROR: source Skill has no version\n' >&2; exit 1; }
 
 mkdir -p "$target_root/skills"

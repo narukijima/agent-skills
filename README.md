@@ -25,9 +25,13 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 初期状態で自動インポート・自動同期は行いません。必要になったAgentの作業時だけ、利用側リポジトリのrootを指定して実行します。
 
-インポートは変換なしのvendored copyです。既存の同名Skillは自動上書きせず、コピー元のrepository、commit SHA、Skill version、インポート時刻を `skills/x-api/agents/upstream.yaml` に記録します。更新は利用側で差分を確認してから、明示的に再インポートします。
+インポートは変換なしのvendored copyです。既存の同名Skillは自動上書きせず、コピー元のrepository、commit SHA、`metadata.claudagt.version`、インポート時刻を `skills/x-api/agents/upstream.yaml` に記録します。Skill内の `LICENSE.txt` とthird-party noticeもコピー対象です。更新は利用側で差分を確認してから、明示的に再インポートします。
 
 ## 公式Skill
+
+### ai-native-design
+
+既存design systemを先に調査し、一般UIは既存component / shadcn/ui、AI-native UIはVercel AI Elements、tool-heavy UIは21st Agent Elements、一般の21st.dev Marketplaceは規約に沿ったdesign discoveryとして比較します。AI固有state、untrusted generated content、server-side approval、accessibility、responsive、検証証拠までを一つの実行protocolで扱います。
 
 ### logic-pro
 
@@ -49,7 +53,11 @@ python3 skills/x-api/scripts/x_api.py --pretty post --dry-run --text 'draft only
 ```bash
 bash tools/validate-skills.sh
 python3 -m unittest discover -s tests -v
+python3 tools/score-behavior-eval.py --cases evals/ai-native-design/cases.json
 ```
+
+CIでは上記に加えて、公式 `skills-ref` validatorを全Skillへ実行します。
+最後のcommandはeval定義だけを検証し、`behavior_run: false` を返します。実behaviorをpassにするには、各promptを独立Agentで実行し、semantic criterionごとの判定と証拠を `--judgments` で採点します。keyword出現だけではpassにしません。
 
 ## 位置づけ
 

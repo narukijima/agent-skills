@@ -1,9 +1,10 @@
 ---
 name: logic-pro
 description: Safely inspect and operate Logic Pro on macOS through a compatible MCP or adapter. Use for transport, tracks, instruments, MIDI import, save, and bounce with project binding and verified readback.
-status: active
-aliases: [logic pro, operate-logic-pro]
-version: 0.6.2
+license: MIT. See LICENSE.txt
+metadata:
+  claudagt.version: "0.6.2"
+  claudagt.status: "active"
 ---
 
 # logic-pro — Logic Proを安全に操作する

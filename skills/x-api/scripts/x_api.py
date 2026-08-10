@@ -44,12 +44,12 @@ LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 def skill_version() -> str:
-    """Read the version from SKILL.md frontmatter so it has a single source."""
+    """Read metadata.claudagt.version from SKILL.md as the single source."""
     try:
         text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
     except OSError:
         return "unknown"
-    match = re.search(r"^version:\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$", text, re.M)
+    match = re.search(r'^\s+claudagt\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', text, re.M)
     return match.group(1) if match else "unknown"
 
 

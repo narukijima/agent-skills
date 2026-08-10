@@ -71,7 +71,29 @@ Evidence例: representative viewport screenshot、theme matrix、stress fixture�
 
 Evidence例: typecheck、focused unit / component test、dependency / bundle inspection、code review。
 
-## 6. Project verification
+## 6. Generated-content and approval security
+
+- AI生成Markdown / HTMLとtool resultがsanitizeまたはsafe rendererを通る。
+- URL scheme allowlistがあり、危険なscheme、spoofed destination、unsafe external navigationを拒否する。
+- raw HTML、SVG、画像、attachment、artifact previewのactive content、size、origin、sandboxを扱う。
+- model生成component / props / eventをruntime schemaとallowlistで制限する。
+- approval後のserver-side authorization、scope validation、idempotency、replay protectionを確認する。
+- timeout / network failure後に実行状態を照会し、不可逆なside effectを盲目的に再実行しない。
+- sanitizer、schema、authorization failureが安全側へ倒れ、errorと回復手段を示す。
+
+Evidence例: malicious Markdown / URL fixture、sanitizer test、schema rejection test、iframe policy、server authorization / idempotency test。
+
+## 7. Localization and visual regression
+
+対象Productが複数localeまたはRTLを支える場合だけ適用する。
+
+- translated label、長い日時 / 数値 / error message、IME、line breakでlayoutとactionが壊れない。
+- RTLでreading order、icon direction、tool timeline、code block、composerが意味を失わない。
+- visual changeの回帰riskが高い場合、Project既存のvisual regressionを関連stateとviewportへ追加する。
+
+Evidence例: locale / RTL fixture、representative screenshot、既存visual regression結果。
+
+## 8. Project verification
 
 Projectが提供するcommandを優先し、変更範囲に応じて実行する。
 
@@ -95,6 +117,8 @@ Projectが提供するcommandを優先し、変更範囲に応じて実行する
 | AI states | applicable / n/a | fixtures or tests | pass / fail / blocked |
 | Accessibility | applicable / n/a | keyboard / scan | pass / fail / blocked |
 | Responsive / theme / stress | applicable / n/a | viewports / fixtures | pass / fail / blocked |
+| Generated-content security | applicable / n/a | sanitizer / URL / schema / server checks | pass / fail / blocked |
+| Localization / visual regression | applicable / n/a | locale / RTL / screenshots | pass / fail / blocked |
 | Type / lint / test / build | applicable / n/a | commands | pass / fail / blocked |
 
 重要な `applicable` gateがfailまたはblockedなら、production-readyと報告しない。安全に残せる成果とblockerを分ける。

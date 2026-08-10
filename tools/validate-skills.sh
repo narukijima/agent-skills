@@ -31,21 +31,37 @@ match = re.match(r"^---\n(.*?)\n---\n", text, re.S)
 if not match:
     raise SystemExit("invalid frontmatter")
 frontmatter = match.group(1)
+lines = frontmatter.splitlines()
+top_level_keys = {
+    item.group(1)
+    for line in lines
+    if (item := re.match(r"^([a-z][a-z0-9-]*):(?:\s|$)", line))
+}
+allowed_keys = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+unknown_keys = sorted(top_level_keys - allowed_keys)
+if unknown_keys:
+    raise SystemExit("unsupported top-level frontmatter keys: " + ", ".join(unknown_keys))
 name = re.search(r"^name:\s*([^\n]+)$", frontmatter, re.M)
 description = re.search(r"^description:\s*(.+)$", frontmatter, re.M)
-status_value = re.search(r"^status:\s*(active|deprecated|retired)$", frontmatter, re.M)
-aliases = re.search(r"^aliases:\s*(.+)$", frontmatter, re.M)
-version = re.search(r"^version:\s*([0-9]+\.[0-9]+\.[0-9]+)$", frontmatter, re.M)
+license_value = re.search(r"^license:\s*(.+)$", frontmatter, re.M)
+metadata = re.search(r"^metadata:\s*$\n((?:^[ ]+.+$\n?)*)", frontmatter, re.M)
 if not name or name.group(1).strip() != skill_dir.name:
     raise SystemExit("frontmatter name does not match directory")
-if not description or len(description.group(1).strip()) > 200:
-    raise SystemExit("description is missing or longer than 200 characters")
-if not status_value:
-    raise SystemExit("status must be active, deprecated, or retired")
-if not aliases or not aliases.group(1).strip():
-    raise SystemExit("aliases is missing")
+if not description or not 1 <= len(description.group(1).strip()) <= 1024:
+    raise SystemExit("description is missing or longer than 1024 characters")
+if not license_value:
+    raise SystemExit("license is required by this repository")
+if "LICENSE.txt" in license_value.group(1) and not (skill_dir / "LICENSE.txt").is_file():
+    raise SystemExit("frontmatter references missing LICENSE.txt")
+if not metadata:
+    raise SystemExit("metadata is required by this repository")
+metadata_text = metadata.group(1)
+version = re.search(r'^\s+claudagt\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', metadata_text, re.M)
+status_value = re.search(r'^\s+claudagt\.status:\s*"(active|deprecated|retired)"\s*$', metadata_text, re.M)
 if not version:
-    raise SystemExit("version must use semver")
+    raise SystemExit("metadata.claudagt.version must be a quoted semver string")
+if not status_value:
+    raise SystemExit("metadata.claudagt.status must be active, deprecated, or retired")
 if len(text.encode("utf-8")) > 20 * 1024:
     raise SystemExit("SKILL.md is larger than 20 KiB")
 for heading in ("## 使用するKnowledge", "### Required", "### Conditional"):

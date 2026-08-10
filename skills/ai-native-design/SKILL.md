@@ -1,18 +1,13 @@
 ---
 name: ai-native-design
-description: AIチャット、Agent UI、reasoning summary、Tool Call/approval、streaming、sources、artifact、multi-agent、generative UI、AI dashboardなど、AI固有の状態・操作を含むWeb UIの設計・実装・改善に使う。通常のWebデザインだけには使わない。
-status: active
-aliases: [ai ui, agent ui, ai-native ui]
-version: 0.1.0
+description: AIチャット、Agent UI、reasoning summary、tool call／approval、streaming、sources、artifact、multi-agent、generative UI、AI dashboardなど、AI固有の状態・操作を含むWeb UIを調査・設計・実装・review・改善するときに使う。AI固有interactionを含まない一般的なLP、ブランドサイト、通常Web UI、backendだけの変更には使わない。
+license: MIT. See LICENSE.txt
+metadata:
+  claudagt.version: "0.2.0"
+  claudagt.status: "active"
 ---
 
 # ai-native-design — AI-native UIの探索・選定・統合・検証
-
-## 発動条件
-
-- 利用者が `ai-native-design` を明示したとき。
-- AIチャット、ChatGPT / Claude風画面、Agent frontend、Thinking / reasoning summary、Tool Call / Tool Result、tool approval、sources / citations、artifact、prompt composer、streaming response、agent progress / status、multi-agent、generative UI、AI dashboard、AI workflow visualizationを設計・実装・改善するとき。
-- AI固有の状態やinteractionを含まない通常のWebページ、一般的なブランド制作、バックエンドだけの変更には発動しない。
 
 ## 目的
 
@@ -69,9 +64,10 @@ version: 0.1.0
 
 1. 対象Projectの既存component、pattern、tokenで解決できないか調べる。
 2. 通常UI primitiveとdesign-system基盤はshadcn/uiを確認する。
-3. AI固有の意味・状態・interactionはVercel AI Elementsを確認する。
-4. より良い表現や比較対象が必要な場合だけ21st.devを探索する。
-5. 適切な既存解がない場合だけcustom implementationを検討する。
+3. 一般的なAI固有の意味・状態・interactionはVercel AI Elementsを第一候補として確認する。
+4. tool-heavy、coding-agent、subagent中心のUIでは、Vercel AI Elementsと21st Agent Elementsを明示的に比較する。
+5. visual表現や別案が必要な場合だけ、一般の21st.dev Marketplaceを公式CLI、MCP、または公式に認められた取得経路で探索する。
+6. 適切な既存解がない場合だけcustom implementationを検討する。
 
 同じ画面でsourceを組み合わせてよいが、役割を混同しない。ButtonやDialogをAI固有部品として再発明せず、Tool Stateを装飾だけのCardへ押し込めない。候補ごとにProject適合性、依存差分、accessibility、responsive、theme、保守性、license、更新経路を比較する。
 
@@ -85,7 +81,7 @@ version: 0.1.0
 - design systemへの統合コストが過大である。
 - product固有interactionに既存patternがない。
 
-「好み」「早そう」「見た目を変えたい」だけを再発明の理由にしない。21st.devの候補は個別のlicenseと出所を確認し、商用利用の可能性があるProjectでlicense不明のcodeを取り込まない。
+「好み」「早そう」「見た目を変えたい」だけを再発明の理由にしない。採用sourceのversion、commitまたはregistry item、取得日、licenseとnotice維持条件を記録する。21st.dev Marketplaceの候補はMarketplace Termsと個別licenseを分けて確認し、license不明のcodeを取り込まない。
 
 ### 5. 既存systemへ統合する
 
@@ -93,6 +89,8 @@ version: 0.1.0
 - registry / CLI導入前に現在のsourceと依存差分をpreviewし、無関係なfileやtokenを上書きしない。
 - 既存のcolor、radius、spacing、typography、focus、theme tokenへ合わせる。外部demoのbrand stylingをそのまま移植しない。
 - stateを型で表し、表示とbackend / stream eventの対応を明確にする。重複componentや不要なdependencyを追加しない。
+- model output、Markdown、tool result、artifactをuntrusted inputとして扱い、sanitize、URL scheme allowlist、runtime schema validation、sandboxを該当範囲で実装する。
+- approval UIをserver-side authorizationの代替にしない。server側でscope、権限、idempotency、replay、timeout後の実行状態を検証する。
 - streamingで既存内容を不必要に再mountせず、layout shift、scroll jump、focus lossを抑える。
 - progressive disclosureを使い、contentよりUI chromeやanimationを目立たせない。
 
@@ -108,7 +106,7 @@ version: 0.1.0
 
 - Project既存componentが要件を満たすなら最優先で再利用する。
 - 通常UIはshadcn/uiをfoundation候補とし、AI固有UIはAI Elementsを第一候補にする。ただしProject適合性の確認を省略しない。
-- 21st.devはdesign discoveryと比較に使い、foundationや品質保証済みsourceとして扱わない。
+- 21st Agent Elementsは21st公式のAI-native候補として、tool-heavy UIでAI Elementsと比較する。一般の21st.dev Marketplaceはdesign discoveryとして扱い、一律の品質保証済みsourceとみなさない。
 - 公式sourceに適切な実装があっても、version、base、依存、APIが対象Projectと非互換なら採用を強制しない。
 - visual fidelityより、情報階層、状態の明瞭さ、primary action、streaming安定性、user / agent actionの区別を優先する。
 - 表示状態を増やす前に、その状態が利用者の判断またはactionを変えるか確認する。変えない状態は統合または省略する。
@@ -121,6 +119,7 @@ version: 0.1.0
 - idleからcompletedまでの関連状態、tool状態、approval、error / retry、partial result
 - keyboard、focus、semantic HTML、screen reader通知、reduced motion
 - mobile / desktop、theme、overflow、long text / code / URL、large artifact、empty / network failure
+- untrusted Markdown / HTML / URL / tool result、artifact sandbox、model生成props、server-side approval enforcement
 - component再利用性、TypeScript type safety、lint、test、build
 
 詳細な適用条件と証拠は `references/quality-gates.md` を使う。
@@ -128,9 +127,9 @@ version: 0.1.0
 ## 出力契約
 
 - 調査: 確認したProject stack、既存design system、関連component / tokenを示す。
-- 選定: 採用sourceと理由、棄却した有力候補、custom実装なら必要性、community codeならlicense確認結果を示す。
+- 選定: 採用sourceと理由、version / commit / registry item / 取得日、棄却した有力候補、custom実装なら必要性、外部codeならlicense / notice / Terms確認結果を示す。
 - 実装: 変更file、追加dependency、状態とUIの対応を示す。dependency追加がなければ明記する。
-- 検証: 実行したgate / commandと結果、手動確認した状態、未実行項目と理由を分離する。
+- 検証: 実行したgate / commandと結果、手動確認した状態、security確認、未実行項目と理由を分離する。
 - 完了: 要件を満たし関連gateが成功した場合だけ完了とする。source不明、license不明、互換性不明、検証不能は成功扱いせず、blockerと安全な次手を返す。
 
 ## 禁止事項
@@ -138,8 +137,10 @@ version: 0.1.0
 - Projectを調査せずにUI libraryや新しいdesign systemを導入しない。
 - 適切な既存componentを合理的理由なく再実装しない。
 - AI Elementsを確認せずにAI固有componentを独自実装しない。
-- 21st.devのcode、demo asset、styleをlicense・依存・品質未確認でコピーしない。
+- 21st.dev Marketplaceを自動scrapingしない。公式CLI / MCP等を使い、code、demo asset、media、説明、tagなどをTerms・license・依存・品質未確認でコピーまたは再配布しない。
 - 内部Chain of Thoughtや秘密の推論tokenをそのまま表示する設計を標準化しない。
+- AI生成HTMLを無条件に `dangerouslySetInnerHTML` へ渡さず、危険なURL、未検証props、active SVG、unsandboxed iframeをrenderしない。
+- approval clickだけを権限確認とみなさず、server-side authorizationを省略しない。
 - external sourceの大量なdocumentationやsource codeをSkillへ複製しない。
 - static mockだけでstreaming、tool、approval、errorの品質を保証したと主張しない。
 - 実行していないaccessibility、test、lint、buildを成功と報告しない。

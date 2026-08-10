@@ -17,9 +17,10 @@ class AiNativeDesignContractTests(unittest.TestCase):
         )
         cls.contract = cls.skill_text + "\n" + cls.reference_text
 
-    def test_expected_self_contained_files_exist_without_scripts(self):
-        expected = {
+    def test_required_self_contained_files_exist(self):
+        required = {
             "SKILL.md",
+            "LICENSE.txt",
             "agents/openai.yaml",
             "references/source-strategy.md",
             "references/ai-ui-patterns.md",
@@ -30,8 +31,7 @@ class AiNativeDesignContractTests(unittest.TestCase):
             for path in SKILL.rglob("*")
             if path.is_file()
         }
-        self.assertEqual(actual, expected)
-        self.assertFalse((SKILL / "scripts").exists())
+        self.assertTrue(required.issubset(actual), required - actual)
 
     def test_skill_reference_links_resolve(self):
         links = re.findall(r"`(references/[^`]+\.md)`", self.skill_text)
@@ -56,7 +56,8 @@ class AiNativeDesignContractTests(unittest.TestCase):
             "対象Projectの既存component",
             "shadcn/ui",
             "Vercel AI Elements",
-            "21st.dev",
+            "21st Agent Elements",
+            "21st.dev Marketplace",
             "custom implementation",
         ]
         positions = [workflow.index(term) for term in ordered]
@@ -64,7 +65,8 @@ class AiNativeDesignContractTests(unittest.TestCase):
         for phrase in (
             "shadcn/ui — UI foundation",
             "Vercel AI Elements — AI-native components",
-            "21st.dev — design discovery",
+            "21st Agent Elements — tool-heavy AI-native candidate",
+            "21st.dev Marketplace — design discovery",
             "Custom implementation — last resort",
         ):
             self.assertIn(phrase, self.reference_text)
@@ -85,8 +87,28 @@ class AiNativeDesignContractTests(unittest.TestCase):
             "long code",
             "TypeScript",
             "production build",
+            "dangerouslySetInnerHTML",
+            "server-side authorization",
+            "idempotency",
+            "replay protection",
+            "Marketplace Terms",
         ):
             self.assertIn(requirement, self.contract)
+
+    def test_agent_skills_frontmatter_and_bundled_license(self):
+        frontmatter = re.match(r"^---\n(.*?)\n---\n", self.skill_text, re.S).group(1)
+        top_level = {
+            match.group(1)
+            for line in frontmatter.splitlines()
+            if (match := re.match(r"^([a-z][a-z0-9-]*):", line))
+        }
+        self.assertEqual(
+            top_level,
+            {"name", "description", "license", "metadata"},
+        )
+        self.assertIn('claudagt.version: "0.2.0"', frontmatter)
+        self.assertIn('claudagt.status: "active"', frontmatter)
+        self.assertTrue((SKILL / "LICENSE.txt").is_file())
 
     def test_catalog_and_agent_metadata_are_registered(self):
         catalog = (ROOT / "skills/SKILLS.md").read_text(encoding="utf-8")

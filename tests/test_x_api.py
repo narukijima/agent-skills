@@ -381,7 +381,7 @@ class XApiTests(unittest.TestCase):
 
     def test_user_agent_tracks_the_skill_version(self):
         text = (SCRIPT.parents[1] / "SKILL.md").read_text(encoding="utf-8")
-        version = re.search(r"^version:\s*(\S+)", text, re.M).group(1)
+        version = re.search(r'^\s+claudagt\.version:\s*"([^"]+)"', text, re.M).group(1)
         self.assertEqual(x_api.USER_AGENT, "agent-skills-x-api/" + version)
 
     def test_base_url_override_is_limited_to_loopback(self):

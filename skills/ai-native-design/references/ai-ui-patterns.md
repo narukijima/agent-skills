@@ -56,6 +56,9 @@ transport state、agent state、個々のtool stateを一つのbooleanへ押し�
 - secret、token、private path、不要なpayloadは表示前に除外またはredactする。
 - approvalでは実行主体、対象、data scope、外部作用、可逆性、費用、期限を関係する範囲で示す。
 - allow / deny後のpending、二重click、timeout、network failure、既に実行済みか不明な状態を設計する。不可逆操作を盲目的にretryしない。
+- approval UIは説明と意思確認のsurfaceであり、security boundaryではない。承認後もserver側で認証、authorization、resource / argument scopeを再検証する。
+- side effectにはidempotency keyとreplay protectionを使う。timeoutや接続断の後は再送前にserver上の実行状態を照会し、duplicate side effectを防ぐ。
+- 承認主体、承認対象、validated scope、request fingerprint、実行結果をsecretなしで監査可能にする。
 
 ## Sources and citations
 
@@ -84,6 +87,18 @@ transport state、agent state、個々のtool stateを一つのbooleanへ押し�
 - unknown component、invalid props、partial stream、version mismatchに安全なfallbackを持つ。
 - workflow graphは状態、方向、分岐、approval point、failure位置をsemantic textでも理解できるようにする。
 - animationは因果関係を補助する範囲に留め、reduced motionでは意味を失わない。
+
+## Untrusted generated content
+
+AI生成content、tool result、retrieved content、attachment、artifact、model生成propsをすべてuntrusted inputとして扱う。
+
+- Markdownはraw HTMLを標準で無効にするか、実績あるsanitizerと明示的allowlistを通す。未sanitize文字列を `dangerouslySetInnerHTML` に渡さない。
+- URLをparseし、navigationは原則 `https:` / `http:` だけを許可する。`javascript:`、unexpected `data:`、scriptable scheme、control character、URL spoofingを拒否する。
+- 新しいtabで開くexternal linkにはopener隔離を適用し、表示domainと実destinationの不一致を確認できるようにする。
+- code / HTML previewやremote artifactをiframeで実行する場合は、最小の `sandbox`、分離origin、CSP、message origin検証を使う。不要なら実行せずtext previewにする。
+- SVG、画像、添付はcontent typeだけで信用せず、size、実format、origin、active content、download filenameを検証する。untrusted inline SVGをDOMへ直接挿入しない。
+- model生成propsとtool payloadをruntime schemaで検証し、unknown component、event handler、URL、style injectionをallowlist外から受け取らない。
+- sanitizerやrendererのfallbackはcontentを安全なplain textとして保ち、sanitize失敗を黙って空表示にしない。
 
 ## Error, retry, and recovery
 
