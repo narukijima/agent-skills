@@ -1,53 +1,67 @@
 # Posting safety contract
 
-この文書は、X APIの通常投稿を実行する直前に読む。投稿は不可逆な外部作用であり、APIレスポンスが失われても公開済みの可能性がある。
+通常テキスト投稿は不可逆な外部作用である。UI上の確認や自然言語の指示ではなく、manifest、identity readback、SQLite transaction、budget、reconcileで強制する。
 
 ## Required gates
 
-すべて満たさない限り `--live` を実行しない。
+1. Projectがnormalized後の本文、`content_id`、stable `expected_user_id`、`app_id`、OAuth app credential fingerprintを確定している。
+2. approval authorityが同じ本文hash、account、app fingerprintへ一意な`approval_id`を発行している。
+3. approval gatewayの`prepare`が`valid: true`の短期manifestを0600で保存し、隔離された`X_API_MANIFEST_SIGNING_KEY`でHMAC-SHA256署名している。
+4. `X_POSTING_ENABLED=true`、exact `X_API_WRITE_MAX_CALLS=3`、Project / Agent別daily limitがgateway-owned設定として明示されている。
+5. gateway-owned `X_API_APP_ID`がmanifestの`app_id`と一致し、実credentialのpublic app IDから導出したfingerprintがmanifestと一致し、`/2/users/me`が`expected_user_id`とexact matchする。
+6. canonical SQLite ledgerにsent / unknown duplicateがなく、attempt budgetが残る。
+7. resultをpost IDまたは`reconcile`で照合できる。
 
-1. 投稿本文が利用側のProjectで確定している。
-2. 投稿アカウントとUser contextのアクセストークンの対応を確認している。
-3. `X_POSTING_ENABLED=true` が実行環境で明示されている。
-4. `--content-id` が利用側の台帳上で一意である。
-5. `--ledger` が指定され、同じ本文とcontent_idの過去結果を検査できる。
-6. `--dry-run` の出力を確認済みである。
-7. 投稿後にIDを照合できる。結果不明を成功扱いしない。
+どれか不成立ならlive sendを行わない。manifestの`approval_id`とHMACはapproval systemの代替ではなく、Project側の承認証拠を固定payloadへbindingする。署名鍵、予算値、credential、script、SQLiteを同じ一般Agentへ渡す構成では、Agent自身による改変を防げない。
 
-## Ledger rules
+## Manifest contract
 
-台帳はJSON Linesで、本文そのものではなく `content_sha256` を重複判定の主キーにする。1回の試行は**2行**で記録する（write-ahead方式）。
+`prepare`は本文をNFCへ正規化してからvalidation、SHA-256、weighted lengthを計算する。manifestにはschema version、content / app / credential fingerprint / expected account / approval ID、created / expiry、normalized text / hash、weighted length、OAuth refreshを含む最大3-call planを保存する。全体hashに加えgateway-owned secretによるHMAC-SHA256を付け、署名鍵を持たないcallerによる再計算改ざんを拒否する。
 
-1. `event: "attempt"` — API呼び出しの**直前**に `status: "unknown"` で追記する。送信中にプロセスが落ちてもこの行が残り、次回実行は `--retry-unknown` のゲートにかかる。
-2. `event: "result"` — 結果が判明した後に確定値で追記する。
+`send`はmanifest外の本文、file、account override、ledger pathを受け取らない。invalid / expired / tampered manifestはcredential解決、identity API、ledger attempt、external writeより前に拒否する。
 
-各行は最低限、次を含む。
+validationは最低限、空白のみ、control character、NFC、weighted limit 280、URL count、cashtag countを扱う。skin tone、ZWJ family / profession、regional flagを1 emoji cluster = weight 2として扱い、URLは23へ置換する。platform / plan固有制約は実行時の公式仕様を確認する。
 
-- `attempted_at`
-- `event`: `attempt`, `result`（無い行は旧形式で、1行=1試行として数える）
-- `content_sha256`
-- `content_id`
-- `status`: `sent`, `failed`, `unknown`, `rate_limited`
-- `post_id`（取得できた場合）
-- `http_status`（取得できた場合）
-- `retry_after` / `rate_limit_reset`（429の場合）
+## Canonical SQLite ledger
 
-現在の状態は同一 `content_id` / `content_sha256` の**最新行**で判定する。試行回数は `attempt` 行（と旧形式の行）の数で数え、上限は2回のまま変わらない。ただし `rate_limited` の `result` 行は対応する試行を**返還**する — 429はサーバーがリクエストを処理していないことが確実で、時間をおけば成功しうるため、不可逆事故に備えた試行予算を消費しない（旧形式では `http_status: 429` の行を数えない）。
+post ledgerは`state/x-api/x-posts.sqlite3`、Project / Agent別daily call counterは`state/x-api/x-usage.sqlite3`に固定する。callerの任意pathやephemeral `.tmp` JSONLを受け付けない。
 
-重複検査からattempt行の追記までは台帳ファイルの排他ロック（`<ledger>.lock` への `flock`）の下で行い、並行実行の片方だけが送信できる。ロックが使えないプラットフォームではstderrへ警告を出す。
+- WAL、`synchronous=FULL`、`BEGIN IMMEDIATE`を使う。
+- `(account_id, content_id)`と`(account_id, content_sha256)`をuniqueにする。
+- account ID、app ID、content ID / hash、normalized text、approval ID、status、attempt count / time、post ID、HTTP statusを保存する。
+- external POST前にtransactionで`unknown` attemptをwrite-ahead記録する。
+- event tableへattempt、result、reconcileを追記する。
+- `sent`は永久にduplicate拒否する。`unknown`はreconcileまで再attempt不可。`failed`または`confirmed_absent`の再attemptには新しい署名済み`approval_id`が必要で、attempt上限は2。429の`rate_limited`だけはattemptを返還し、同じ有効manifestを再利用できる。
+- 同じaccountのunknownを全て解消するまで、異なるcontent ID / hashの新規sendも拒否する。
+- 429は処理前拒否としてattemptを返還する。4xxは`failed`、5xx / timeout / disconnect / missing post IDは`unknown`。
 
-`sent` は同じ本文または同じ `content_id` を拒否する。`unknown` はAPI側の公開状態を照合するまで再送しない。再試行は最大2回までとし、利用側の運用台帳とも照合する。
+SQLiteは同一host / filesystemで同じbundled scriptとdatabaseを使うprocess間排他である。SQLiteを差し替えたり別copyのscriptを実行できる敵対的caller、network filesystem、複数machineに対するglobal uniquenessは仮定しない。その構成ではdedicated gatewayとcentral databaseがsingle writerを所有し、このSkillのpolicyをgatewayで強制する。
 
-`failed` と `unknown` の境界は「サーバーがリクエストを処理した可能性があるか」で引く。
+## Reconcile
 
-- `unknown`: タイムアウト、ネットワーク断、HTTP 5xx。レスポンスが失われただけで投稿は公開済みの可能性がある。
-- `failed`: HTTP 4xx（認証、権限、重複、レート制限）。処理前に拒否されたことが確実なので、上限内での再試行を許す。
+reconcileはcanonical ledgerのunknown intentだけを対象にする。
+
+1. ledgerからaccount、hash、attempt timeを取得する。
+2. `/2/users/me`で同じaccountを再確認する。
+3. accountのrecent original postsを最大100件取得する。
+4. postの`created_at`がattemptの30秒前から5分後に入り、normalized text hashも一致するときだけ`confirmed_success`としてpost IDを記録する。古い同文postは一致に使わない。
+5. URLを含まない本文に限り、errorのない取得timelineの最古・最新時刻がattempt timeを挟み、その範囲に一致postがなければ`confirmed_absent`とする。X側のURL短縮・表示変換でexact hashが変わり得る本文は不在確定しない。
+6. window coverageを証明できなければ`unresolved`を維持する。
+
+`failed`または`confirmed_absent`だけが、新しい`approval_id`を持つ署名済みmanifestによる再attemptを許す。timelineのempty response、partial error、URL変換、狭いwindowを「投稿なし」と推測しない。
+
+## Secrets and transport
+
+- OAuth secret / tokenをmanifest、SQLite、error、trace、stdoutへ保存しない。
+- OAuth 2.0 rotation markerはsecretを含めず、結果不明時はreauthorizationを要求する。
+- auth付きrequestのredirectはsame-originを含め全面拒否する。
+- base URL overrideは`X_API_TEST_MODE=true`かつposting無効時のloopback testだけに限定する。
+- 複数Agentの長期無人運用ではcredentialを一般Agent環境へexportせず、dedicated gateway processだけが所有する。
 
 ## Do not do
 
-- Authorizationヘッダーやトークンをログ・エラー・台帳へ保存しない。
-- timeout後に盲目的に再送しない。
-- XのWeb画面を投稿経路にしない。
-- APIの料金やRate Limitを固定の成功条件にしない。
-- このSkillの範囲へ返信、引用、いいね、フォロー、DM、削除を追加しない。
-- 画像・動画アップロードは0.x系では**設計上の境界**として範囲外（未実装ではない）。必要な利用側が独自経路を持つ場合も、台帳・重複拒否・unknown再送拒否と同等の防御を必ず備える。将来対応する場合は契約変更としてminor versionを上げて行う。
+- timeout、5xx、process crash後にblind retryしない。
+- SQLite fileを削除・差替えしてduplicate gateを回避しない。
+- approval後に本文、account、app、budget、expiryを書き換えない。
+- reply、quote、like、follow、DM、delete、mediaをこの0.x write capabilityへ追加しない。
+- browserをfallback posting pathにしない。

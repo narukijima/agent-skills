@@ -1,25 +1,25 @@
 ---
 name: x-api
-description: Use when an agent must retrieve X API v2 data or prepare or send a guarded post through the official REST API, with explicit authentication, cost, duplicate, and live-send checks.
+description: Use when an agent must explicitly retrieve paid X API v2 data or prepare, send, or reconcile one text post through a manifest, expected-account binding, budgets, and canonical SQLite ledger.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.4.2"
+  claudagt.version: "0.5.0"
   claudagt.status: "active"
 ---
 
-# x-api — X API v2 の取得と安全な投稿
+# x-api — X API v2の明示的な読み取りとguarded text post
 
 ## 目的
 
-このSkillは、X API v2を使う汎用的な読み取りと通常投稿を提供する。投稿の内容・時刻・文体・題材選定は利用側のProjectが所有し、このSkillはXへの境界だけを所有する。
+このSkillはX API v2の限定された読み取りと、通常テキスト投稿の安全境界を提供する。投稿内容、文体、時刻、対象account、approvalは利用側Projectが所有し、このSkillはvalidation、認証、expected account照合、予算、重複防止、結果不明の回復を所有する。
 
-対応する操作は次のとおり。
+対応範囲:
 
-- 読み取り: 自分のユーザー情報、ユーザー検索、投稿取得、ユーザーの投稿、直近検索
-- 書き込み: 通常投稿（単独のテキスト投稿）
-- 対象外: 返信、引用、いいね、フォロー、DM、削除、画像・動画アップロード、ブラウザ操作、Analytics画面の読み取り
+- read: authenticated user、user lookup、post lookup、user posts、recent search、usage
+- write: 単独の通常テキスト投稿を `prepare` → `send` → 必要時 `reconcile` で扱う
+- 対象外: reply、quote、like、follow、DM、delete、media upload、browser posting、Analytics UI
 
-対象外は未実装ではなく設計上の境界である（詳細は `references/posting-safety.md` の "Do not do"）。範囲を広げる場合は契約変更としてversionを上げて行う。
+write capabilityはbetaである。canonical SQLite ledgerは同一workspace内で、同じbundled scriptとdatabaseを使う複数processを直列化するが、任意コードを実行できる敵対的Agentや複数machineのglobal uniquenessは保証しない。複数Agent / machine / accountの完全無人運用は、署名鍵、資格情報、予算設定、bundled script、canonical databaseを一般Agentから隔離して所有する専用single-writer gateway経由でのみ採用する。
 
 ## 使用するKnowledge
 
@@ -29,69 +29,114 @@ metadata:
 
 ### Conditional
 
-- 条件: X APIのEndpoint、認証、料金の確認が必要なとき
+- 条件: Endpoint、認証、課金、response contractを扱うとき
   参照: `references/api-surface.md`
-- 条件: 通常投稿を実行するとき
+- 条件: `prepare`、`send`、`reconcile`を扱うとき
   参照: `references/posting-safety.md`
 
-## 最初に読むもの
+価格、plan、rate limit、投稿制約は変わる。実行時は公式X docs / Developer Consoleを正本にし、Skill内の古い固定値で利用可否や費用を断定しない。
 
-- X APIのEndpoint、認証、料金の確認が必要なときは `references/api-surface.md` を読む。
-- 投稿を実行するときは `references/posting-safety.md` を読む。
+## Safety boundary
 
-## 認証と費用の扱い
+- Skillは明示的に呼び出す。paid readとexternal writeをimplicit invocationしない。
+- secretは環境変数またはgateway-owned private token storeだけで受け取り、引数、manifest、台帳、stdout / stderrへ出さない。
+- readは `X_API_READ_ENABLED=true`、`X_API_READ_MAX_CALLS=<n>`、Project / Agent別のdaily call limitを必須にする。範囲外の`max_results`は増量・clampせず拒否する。
+- sendは `X_POSTING_ENABLED=true`、`X_API_WRITE_MAX_CALLS=3`、manifestと一致する`X_API_APP_ID`、OAuth app fingerprint、daily write limitを必須にする。3 callはOAuth 2.0 refreshの可能性、identity readback、post sendを覆う上限である。
+- 認証付きHTTP redirectは全面拒否する。`X_API_BASE_URL` overrideはpostingを無効化した `X_API_TEST_MODE=true` のloopback test serverだけに限定する。
+- `send`は`prepare`が生成した短期manifestだけを受け取る。direct `--text` / `--file` / `--ledger`は存在しない。
+- manifestはgateway-owned `X_API_MANIFEST_SIGNING_KEY`によるHMAC-SHA256を必須にし、本文、account、app credential fingerprint、approval、期限、call planの再計算改ざんを拒否する。署名鍵を一般Agentへ渡してはならない。
+- live前に`/2/users/me`を読み、manifestの`expected_user_id`とexact matchする。不一致時はSQLiteへattemptを書かない。
+- ledgerはworkspace rootの`state/x-api/x-posts.sqlite3`、daily usageは`state/x-api/x-usage.sqlite3`に固定し、caller-selected pathを受け取らない。
+- 同じaccountに未解決`unknown`が1件でもあれば、別contentの新規sendも停止する。
+- timeout、disconnect、5xx、post ID欠落は`unknown`にする。blind retry optionは存在せず、`reconcile`が必要である。
 
-- 秘密値は環境変数だけで受け取る。トークンをコマンド引数、原稿、ログ、Gitへ書かない。
-- 公開データの読み取りは `X_BEARER_TOKEN` を使う。
-- ユーザーコンテキストの第一経路は**OAuth 1.0a**（`X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET` の4変数、トークンは失効しない）。OAuth 2.0運用の利用側は `X_OAUTH2_CLIENT_ID` + `X_OAUTH2_TOKEN_STORE` でSkillにrefreshを任せられる。store更新は排他lockと秘密値を含まないwrite-ahead markerで保護し、回転結果が不明または保存に失敗した場合は自動再試行せず再認可を要求する。`X_ACCESS_TOKEN` だけの静的トークンも使える（約2時間で失効）。詳細は `references/api-surface.md`。
-- `me` と投稿はユーザーコンテキストを必須とする。`X_BEARER_TOKEN`だけで代用しない。
-- APIの料金、利用可能なEndpoint、Rate Limitは実行時の公式情報を優先し、Skill内に固定値を作らない。
+## 認証
 
-## 読み取りワークフロー
+- app-only read: `X_BEARER_TOKEN`
+- user context優先経路: OAuth 1.0aの4変数 `X_API_KEY`、`X_API_SECRET`、`X_ACCESS_TOKEN`、`X_ACCESS_TOKEN_SECRET`
+- user context代替: `X_OAUTH2_CLIENT_ID` + `X_OAUTH2_TOKEN_STORE`。bootstrap時は`X_OAUTH2_REFRESH_TOKEN`、confidential clientは`X_OAUTH2_CLIENT_SECRET`も使う。
+- pre-issued OAuth 2.0 user tokenは`X_ACCESS_TOKEN`と、そのtokenを発行したpublic client IDを示す`X_OAUTH2_STATIC_CLIENT_ID`で使う。期限と更新責任は利用側が持つ。
 
-1. 必要な情報を最小のEndpointとフィールドへ絞る。全件取得や不要なexpansionを既定にしない。
-2. `scripts/x_api.py` を使い、結果はJSONとして保存または次の処理へ渡す。
-3. HTTPエラー、429、空結果を成功扱いしない。レスポンスの `data`、`errors`、ページネーションを確認する。
-4. 取得結果に基づく主張を作る場合は、取得時刻、Endpoint、検索条件、ページネーションの有無を記録する。
+OAuth 1.0a tokenは通常expiryを持たないが、利用者のrevoke、app停止、key再生成などで無効になり得る。OAuth 2.0 refreshはSkillがprivate storeへatomic保存し、rotation結果不明時は自動再試行せずreauthorizationを要求する。詳細は`references/api-surface.md`を使う。
 
-例:
+## Read workflow
 
-```bash
-python3 skills/x-api/scripts/x_api.py --pretty me
-python3 skills/x-api/scripts/x_api.py --pretty user --username XDevelopers
-python3 skills/x-api/scripts/x_api.py --pretty posts --user-id 2244994945 --max-results 10
-python3 skills/x-api/scripts/x_api.py --pretty search-recent --query 'from:XDevelopers -is:retweet' --max-results 10
-```
-
-## 投稿ワークフロー
-
-投稿は常に次の順序で扱う。
-
-1. 利用側のProjectが本文、宛先アカウント、投稿目的、送信許可を確定する。
-2. まず `--dry-run` で本文のSHA-256、文字数、重み付き文字数（X基準の推定値。全角・絵文字は2、URLは23換算、上限280）を確認する。dry-runは既定動作である。
-3. 実送信が明示された場合だけ、`--live`、`X_POSTING_ENABLED=true`、`--content-id`、`--ledger <path>` の4条件を確認する。
-4. 台帳に同じ `content_id` または本文の `content_sha256` の `sent` があれば拒否する。ネットワーク結果が `unknown` の本文は、自動再送しない。再試行は利用者が `--retry-unknown` を明示した場合だけ許可し、試行上限は2回である。
-5. 台帳は自動で2行書かれる。送信直前に `attempt` 行（`unknown`）、結果判明後に `result` 行。送信中にプロセスが落ちても `attempt` 行が残り、次回は `--retry-unknown` のゲートにかかる。結果不明のときは `unknown` のまま残す。
-
-例:
+1. 目的、Endpoint、fields、page、最大件数、call budgetを確定する。
+2. 公式の現在価格とplan可用性を確認し、`X_API_READ_ENABLED=true`、invocation上限、daily上限、Project / Agent IDを設定する。
+3. `scripts/x_api.py`を実行する。
+4. envelopeの`status`を確認する。`partial`、`empty`、`failed`を`success`と同一視しない。
+5. `_meta`のEndpoint、取得時刻、auth mode、rate limitと、paginationを証拠に残す。
 
 ```bash
-python3 skills/x-api/scripts/x_api.py post --text 'ここに確定済みの投稿本文'
-python3 skills/x-api/scripts/x_api.py post --live \
-  --content-id 2026-08-08-20-01 \
-  --text 'ここに確定済みの投稿本文' \
-  --ledger .tmp/x-post-ledger.jsonl
+X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \
+  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_READ_CALL_LIMIT=100 \
+  python3 skills/x-api/scripts/x_api.py --pretty user --username XDevelopers
+
+X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \
+  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_READ_CALL_LIMIT=100 \
+  python3 skills/x-api/scripts/x_api.py --pretty usage
 ```
 
-`--live` はAPI認証、権限、課金、公開結果を伴う外部作用である。本文が未確定、台帳がない、投稿後の照合方法がない、または利用側の送信許可が不明な場合は実行せず、dry-run結果を返す。
+## Post workflow
+
+### 1. Prepare
+
+Projectで本文、stable X user ID、app label、OAuth app credential fingerprint、content ID、approval IDを確定し、approval gatewayで短期manifestを作る。prepareはNFC正規化、同一本文hash、weighted length、URL / cashtag、control characterを検査し、X APIやX credentialは使わないが、一般Agentから隔離したmanifest署名鍵を必要とする。fingerprintはOAuth 2.0なら`sha256("oauth2:" + client_id)`、OAuth 1.0aなら`sha256("oauth1:" + api_key)`である。
+
+```bash
+X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
+python3 skills/x-api/scripts/x_api.py --pretty prepare \
+  --manifest .tmp/approved-post.json \
+  --content-id 2026-08-10-001 \
+  --expected-user-id 123456789 \
+  --app-id x-production \
+  --expected-app-fingerprint '<64-char-sha256>' \
+  --approval-id approval-2026-08-10-001 \
+  --text '確定済み本文'
+```
+
+### 2. Send
+
+manifestの本文、account、hash、app fingerprint、approval、期限、3-call上限planを変更せず送る。sendはidentity mismatch、credential app mismatch、expired / unsigned / tampered manifest、duplicate、unresolved unknown、attempt上限、budget不足をexternal write前に拒否する。OAuth credentialは一度だけ解決し、identity readbackとPOSTで同じsnapshotを使う。
+
+```bash
+X_POSTING_ENABLED=true X_API_WRITE_MAX_CALLS=3 X_API_APP_ID=x-production \
+  X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
+  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_WRITE_CALL_LIMIT=20 \
+  python3 skills/x-api/scripts/x_api.py --pretty send \
+  --manifest .tmp/approved-post.json
+```
+
+### 3. Reconcile
+
+結果が`unknown`なら再送せず、同じaccountのrecent postsとcanonical hash / attempt timeを照合する。見つかれば`confirmed_success`、取得windowがattempt時刻を覆って不在なら`confirmed_absent`、証明できなければ`unresolved`のまま止める。
+
+```bash
+X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=3 \
+  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_READ_CALL_LIMIT=100 \
+  python3 skills/x-api/scripts/x_api.py --pretty reconcile \
+  --content-id 2026-08-10-001 \
+  --expected-user-id 123456789
+```
 
 ## 出力契約
 
-- 成功した読み取りはAPIのJSONを標準出力へ返す。
-- dry-runは送信しないことが分かるJSONを返す。
-- 成功した投稿は投稿ID、URL、本文SHA-256、台帳パスを返す。トークンやAuthorizationヘッダーは返さない。
-- 失敗は標準エラーへ短い原因を返し、非0終了する。429では `retry_after` / `rate_limit_reset` をエラー出力へ含め、待機の判断材料を利用側へ返す。429は試行予算を消費しない。自動ループしない。
+- readは`status`、`data`、`errors`、provider `meta / includes`、request `_meta`を返す。
+- prepareはnormalized text、validation、manifest hash / HMAC、account / credential app / approval binding、expiry、call planを返す。
+- send成功はaccount ID、app ID、content ID、post ID / URL、content hash、canonical ledger path、rate metadataを返す。
+- failureはsecretを含まないstructured errorをstderrへ返してnon-zero exitする。
+- `unknown`、`partial`、`empty`、`rate_limited`、`confirmed_absent`、`unresolved`を意味どおり区別する。
 
 ## 決定的な実行コード
 
-通常は `scripts/x_api.py` を使う。別の言語やSDKへ置き換える場合も、dry-run既定、liveゲート、重複拒否、unknown再送拒否、秘密値非表示の契約を維持する。
+通常は`scripts/x_api.py`だけを使う。transportを公式xurl / XDKへ置き換える場合も、manifest-only send、expected-account binding、canonical single writer、budget、redirect拒否、unknown reconciliationを上位policyとして維持する。XMCPなど広いTool surfaceを使う場合は対象operationだけをallowlistする。
+
+## 禁止事項
+
+- `send`をraw text、任意file、任意ledger pathで呼べるinterfaceへ戻さない。
+- expected user IDをusername、display name、credential存在で代用しない。
+- `unknown`をflag一つでretry可能にしない。
+- local SQLiteを複数machineのdistributed lockと主張しない。
+- tokenを一般Agentのprompt、log、manifest、databaseへ保存しない。
+- response bodyだけを返してrate limit、partial errors、request metadataを捨てない。
+- scope拡張をminor implementation detailとして行わない。

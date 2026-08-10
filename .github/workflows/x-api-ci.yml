@@ -1,0 +1,41 @@
+name: X API Skill CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/x-api-ci.yml"
+      - ".gitignore"
+      - "README.md"
+      - "skills/SKILLS.md"
+      - "skills/x-api/**"
+      - "tests/test_x_api.py"
+      - "tools/validate-skills.sh"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/x-api-ci.yml"
+      - ".gitignore"
+      - "README.md"
+      - "skills/SKILLS.md"
+      - "skills/x-api/**"
+      - "tests/test_x_api.py"
+      - "tools/validate-skills.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-x-api:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Validate Skill contracts
+        run: bash tools/validate-skills.sh
+      - name: Compile deterministic implementation
+        run: python3 -m py_compile skills/x-api/scripts/x_api.py tests/test_x_api.py
+      - name: Run X API regression tests
+        run: python3 -m unittest tests.test_x_api -v
+      - name: Basic secret scan
+        run: |
+          ! git grep -nE '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]{20,})' -- . ':!.github/workflows/x-api-ci.yml'

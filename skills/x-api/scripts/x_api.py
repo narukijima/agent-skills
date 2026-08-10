@@ -11,20 +11,22 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import time
+import unicodedata
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
     import fcntl
 except ImportError:  # non-POSIX platform: locking degrades to a warning
     fcntl = None  # type: ignore[assignment]
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 USER_FIELDS = "created_at,description,location,public_metrics,profile_image_url,protected,url,verified"
@@ -34,13 +36,46 @@ OAUTH1_VARIABLES = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOK
 
 # twitter-text v3 weighting: these code point ranges count 1, everything else 2.
 LIGHT_RANGES = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
-# URL characters are limited to the RFC 3986 ASCII set so that CJK text written
-# directly after a URL (no space, the normal Japanese style) is not swallowed.
-URL_PATTERN = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+URL_PATTERN = re.compile(
+    r"(?<![@A-Za-z0-9_])(?:"
+    r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
+    r"|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
+    r"(?::[0-9]{1,5})?(?:/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*)?"
+    r")",
+    re.IGNORECASE,
+)
+CASHTAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])\$[A-Za-z][A-Za-z0-9_]*")
 WEIGHTED_LIMIT = 280
+MANIFEST_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
+DEFAULT_MANIFEST_TTL_SECONDS = 900
 
 DEFAULT_BASE_URL = "https://api.x.com"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+CANONICAL_LEDGER_PATH = Path(__file__).resolve().parents[3] / "state/x-api/x-posts.sqlite3"
+
+
+class RejectRedirects(HTTPRedirectHandler):
+    """Never forward an authenticated request to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+    def http_error_302(self, req, fp, code, msg, headers):  # noqa: ANN001
+        raise HTTPError(req.full_url, code, "authenticated redirect refused", headers, fp)
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+
+_NO_REDIRECT_OPENER = build_opener(RejectRedirects())
+
+
+def urlopen(request: Request, timeout: int = 30):
+    """Compatibility seam for tests; production requests reject every redirect."""
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
 def skill_version() -> str:
@@ -66,6 +101,7 @@ class ApiFailure(RuntimeError):
         rate_limit_reset: Optional[str] = None,
         credential_state: Optional[str] = None,
         recovery_marker: Optional[str] = None,
+        outcome: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -74,6 +110,7 @@ class ApiFailure(RuntimeError):
         self.rate_limit_reset = rate_limit_reset
         self.credential_state = credential_state
         self.recovery_marker = recovery_marker
+        self.outcome = outcome
 
 
 class CredentialRotationFailure(ApiFailure):
@@ -264,7 +301,7 @@ def oauth2_refreshed_access_token(config: Dict[str, str]) -> str:
                 payload = json_loads(response.read())
         except HTTPError as exc:
             payload = json_loads(exc.read())
-            if exc.code < 500:
+            if 400 <= exc.code < 500:
                 try:
                     clear_private_marker(marker_path)
                 except OSError:
@@ -312,14 +349,20 @@ def require_user_credentials() -> Tuple[str, Dict[str, str]]:
         return "oauth1", credentials
     oauth2_config = oauth2_refresh_configuration()
     if oauth2_config is not None:
-        return "oauth2", {"X_ACCESS_TOKEN": oauth2_refreshed_access_token(oauth2_config)}
+        return "oauth2", {
+            "X_ACCESS_TOKEN": oauth2_refreshed_access_token(oauth2_config),
+            "X_APP_PUBLIC_ID": oauth2_config["client_id"],
+        }
     token = os.environ.get("X_ACCESS_TOKEN", "")
     if token:
-        return "oauth2", {"X_ACCESS_TOKEN": token}
+        return "oauth2", {
+            "X_ACCESS_TOKEN": token,
+            "X_APP_PUBLIC_ID": os.environ.get("X_OAUTH2_STATIC_CLIENT_ID", ""),
+        }
     raise ApiFailure(
         "user-context auth requires one of: the OAuth 1.0a variables "
         + ", ".join(OAUTH1_VARIABLES)
-        + " (non-expiring; preferred for long-running agents); the OAuth 2.0 refresh variables "
+        + " (usually no fixed expiry but revocable); the OAuth 2.0 refresh variables "
         "X_OAUTH2_CLIENT_ID + X_OAUTH2_TOKEN_STORE (+ X_OAUTH2_REFRESH_TOKEN to bootstrap); "
         "or a pre-issued OAuth 2.0 user token in X_ACCESS_TOKEN"
     )
@@ -369,12 +412,19 @@ def authorization_for(auth_kind: str, method: str, url: str, params: Optional[Di
     return "Bearer " + credentials["X_ACCESS_TOKEN"]
 
 
+def authorization_for_credentials(method: str, url: str, params: Optional[Dict[str, str]], user_credentials: Tuple[str, Dict[str, str]]) -> str:
+    mode, credentials = user_credentials
+    if mode == "oauth1":
+        return oauth1_authorization(method, url, params, credentials)
+    return "Bearer " + credentials["X_ACCESS_TOKEN"]
+
+
 def choose_auth(operation: str, requested: str) -> str:
-    if operation in {"me", "post"} and requested == "app":
+    if operation in {"me", "send", "reconcile"} and requested == "app":
         raise ApiFailure(operation + " requires user-context authentication; do not use --auth app")
     if requested in {"user", "app"}:
         return requested
-    if operation in {"me", "post"}:
+    if operation in {"me", "send", "reconcile"}:
         return "user"
     if os.environ.get("X_BEARER_TOKEN"):
         return "app"
@@ -391,8 +441,19 @@ def resolve_base_url() -> str:
             "X_API_BASE_URL override is limited to loopback test servers "
             "(credentials would be sent to that host); refusing: " + override
         )
+    if os.environ.get("X_API_TEST_MODE") != "true" or os.environ.get("X_POSTING_ENABLED") == "true":
+        raise ApiFailure("loopback X_API_BASE_URL requires X_API_TEST_MODE=true and posting disabled")
     print("note: sending requests to test base URL " + override, file=sys.stderr)
     return override
+
+
+def response_metadata(headers: Any) -> Dict[str, Any]:
+    rate_limit = {
+        "limit": headers.get("x-rate-limit-limit") if headers else None,
+        "remaining": headers.get("x-rate-limit-remaining") if headers else None,
+        "reset": headers.get("x-rate-limit-reset") if headers else None,
+    }
+    return {"rate_limit": {key: value for key, value in rate_limit.items() if value is not None}}
 
 
 def api_request(
@@ -401,11 +462,17 @@ def api_request(
     auth_kind: str,
     params: Optional[Dict[str, str]] = None,
     body: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, Any]:
+    user_credentials: Optional[Tuple[str, Dict[str, str]]] = None,
+) -> Tuple[int, Any, Dict[str, Any]]:
     url = resolve_base_url() + path
     query = ("?" + urlencode(params)) if params else ""
     request = Request(url + query, method=method)
-    request.add_header("Authorization", authorization_for(auth_kind, method, url, params))
+    authorization = (
+        authorization_for_credentials(method, url, params, user_credentials)
+        if auth_kind == "user" and user_credentials is not None
+        else authorization_for(auth_kind, method, url, params)
+    )
+    request.add_header("Authorization", authorization)
     request.add_header("Accept", "application/json")
     request.add_header("User-Agent", USER_AGENT)
     if body is not None:
@@ -416,7 +483,7 @@ def api_request(
             payload = json_loads(response.read())
             if not 200 <= response.status < 300:
                 raise ApiFailure("X API returned an error", response.status, payload)
-            return response.status, payload
+            return response.status, payload, response_metadata(response.headers)
     except HTTPError as exc:
         payload = json_loads(exc.read())
         raise ApiFailure(
@@ -432,173 +499,631 @@ def api_request(
         raise ApiFailure("X API request result is unknown: timeout") from exc
 
 
+def classify_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "success"
+    has_errors = bool(payload.get("errors"))
+    has_data = payload.get("data") not in (None, [], {})
+    if has_errors and has_data:
+        return "partial"
+    if has_errors:
+        return "failed"
+    if not has_data:
+        return "empty"
+    return "success"
+
+
 def fetch(method: str, path: str, auth_kind: str, params: Optional[Dict[str, str]] = None) -> Any:
-    return api_request(method, path, auth_kind, params)[1]
+    status, payload, metadata = api_request(method, path, auth_kind, params)
+    provider_payload = payload if isinstance(payload, dict) else {"data": payload}
+    return {
+        "status": classify_payload(payload),
+        "data": provider_payload.get("data"),
+        "errors": provider_payload.get("errors", []),
+        "meta": provider_payload.get("meta", {}),
+        "includes": provider_payload.get("includes", {}),
+        "_meta": {
+            "endpoint": path,
+            "http_status": status,
+            "requested_at": utc_now(),
+            "auth_mode": auth_kind,
+            **metadata,
+        },
+    }
 
 
 def print_json(value: Any, pretty: bool, stream: Any = None) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2 if pretty else None, sort_keys=pretty), file=stream or sys.stdout)
 
 
+def normalize_text(text: str) -> str:
+    return unicodedata.normalize("NFC", text.rstrip("\n"))
+
+
 def content_sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
+
+
+def _url_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    for match in URL_PATTERN.finditer(text):
+        end = match.end()
+        while end > match.start():
+            candidate = text[match.start():end]
+            trailing = text[end - 1]
+            if trailing in ".,!?;:>'\"\u3001\u3002\uff01\uff1f\uff0c":
+                end -= 1
+            elif trailing == ")" and candidate.count(")") > candidate.count("("):
+                end -= 1
+            elif trailing == "]" and candidate.count("]") > candidate.count("["):
+                end -= 1
+            elif trailing == "}" and candidate.count("}") > candidate.count("{"):
+                end -= 1
+            elif trailing in "\uff09\uff3d\uff5d":
+                end -= 1
+            else:
+                break
+        if end > match.start():
+            spans.append((match.start(), end))
+    return spans
+
+
+def _is_emoji(codepoint: int) -> bool:
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0x2300 <= codepoint <= 0x23FF
+        or 0x1F1E6 <= codepoint <= 0x1F1FF
+    )
+
+
+def _emoji_cluster_end(text: str, start: int) -> int:
+    codepoint = ord(text[start])
+    if text[start] in "#*0123456789":
+        index = start + 1
+        if index < len(text) and text[index] == "\ufe0f":
+            index += 1
+        return index + 1 if index < len(text) and text[index] == "\u20e3" else start
+    if not _is_emoji(codepoint):
+        return start
+    index = start + 1
+    if 0x1F1E6 <= codepoint <= 0x1F1FF and index < len(text) and 0x1F1E6 <= ord(text[index]) <= 0x1F1FF:
+        return index + 1
+    while index < len(text) and (text[index] in {"\ufe0e", "\ufe0f", "\u20e3"} or 0x1F3FB <= ord(text[index]) <= 0x1F3FF):
+        index += 1
+    while index < len(text) and (0xE0020 <= ord(text[index]) <= 0xE007E or ord(text[index]) == 0xE007F):
+        index += 1
+    while index + 1 < len(text) and text[index] == "\u200d" and _is_emoji(ord(text[index + 1])):
+        index += 2
+        while index < len(text) and (text[index] in {"\ufe0e", "\ufe0f", "\u20e3"} or 0x1F3FB <= ord(text[index]) <= 0x1F3FF):
+            index += 1
+        while index < len(text) and (0xE0020 <= ord(text[index]) <= 0xE007E or ord(text[index]) == 0xE007F):
+            index += 1
+    return index
 
 
 def weighted_length(text: str) -> int:
-    """Estimate X's weighted character count (twitter-text v3): URLs count 23, CJK and emoji count 2."""
-    total = 23 * len(URL_PATTERN.findall(text))
-    for char in URL_PATTERN.sub("", text):
-        code = ord(char)
-        total += 1 if any(low <= code <= high for low, high in LIGHT_RANGES) else 2
+    """Count normalized text using twitter-text v3 weights and emoji clusters."""
+    normalized = normalize_text(text)
+    spans = iter(_url_spans(normalized))
+    current_span = next(spans, None)
+    total = 0
+    index = 0
+    while index < len(normalized):
+        if current_span and index == current_span[0]:
+            total += 23
+            index = current_span[1]
+            current_span = next(spans, None)
+            continue
+        cluster_end = _emoji_cluster_end(normalized, index)
+        if cluster_end > index:
+            total += 2
+            index = cluster_end
+            continue
+        codepoint = ord(normalized[index])
+        total += 1 if any(low <= codepoint <= high for low, high in LIGHT_RANGES) else 2
+        index += 1
     return total
+
+
+def validate_post_text(text: str) -> Dict[str, Any]:
+    normalized = normalize_text(text)
+    errors: List[str] = []
+    if not normalized.strip():
+        errors.append("TEXT_EMPTY")
+    emoji_format_indices = set()
+    index = 0
+    while index < len(normalized):
+        cluster_end = _emoji_cluster_end(normalized, index)
+        if cluster_end > index:
+            emoji_format_indices.update(range(index, cluster_end))
+            index = cluster_end
+        else:
+            index += 1
+    if any(
+        unicodedata.category(char).startswith("C")
+        and char not in {"\n", "\t"}
+        and index not in emoji_format_indices
+        for index, char in enumerate(normalized)
+    ):
+        errors.append("CONTROL_CHARACTER")
+    weight = weighted_length(normalized)
+    if weight > WEIGHTED_LIMIT:
+        errors.append("TEXT_TOO_LONG")
+    cashtag_count = len(CASHTAG_PATTERN.findall(normalized))
+    if cashtag_count > 1:
+        errors.append("TOO_MANY_CASHTAGS")
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "text": normalized,
+        "text_length": len(normalized),
+        "weighted_length": weight,
+        "weighted_limit": WEIGHTED_LIMIT,
+        "url_count": len(_url_spans(normalized)),
+        "cashtag_count": cashtag_count,
+        "content_sha256": content_sha256(normalized),
+    }
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def read_ledger(path: Path) -> Iterable[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ApiFailure("invalid JSON in ledger: " + str(path)) from exc
-        if isinstance(record, dict):
-            records.append(record)
-    return records
+def parse_timestamp(value: str, label: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ApiFailure("invalid " + label) from exc
 
 
-def append_ledger(path: Path, record: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+def _manifest_digest(manifest: Dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in manifest.items() if key not in {"manifest_sha256", "manifest_hmac_sha256"}}
+    encoded = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def attempt_budget_used(matching: Iterable[Dict[str, Any]]) -> int:
-    """Count attempts against the 2-attempt budget.
-
-    Each attempt writes an "attempt" row before sending and a "result" row
-    after. A rate_limited result refunds its attempt because the request was
-    certainly not processed. Rows without an event field come from older
-    ledgers where one row was one attempt.
-    """
-    used = 0
-    for record in matching:
-        event = record.get("event")
-        if event == "attempt":
-            used += 1
-        elif event == "result":
-            if record.get("status") == "rate_limited":
-                used -= 1
-        elif record.get("http_status") != 429:
-            used += 1
-    return max(0, used)
+def manifest_signing_key() -> bytes:
+    value = os.environ.get("X_API_MANIFEST_SIGNING_KEY", "")
+    if len(value.encode("utf-8")) < 32:
+        raise ApiFailure("X_API_MANIFEST_SIGNING_KEY must be a gateway-owned secret of at least 32 bytes")
+    return value.encode("utf-8")
 
 
-def post_text(args: argparse.Namespace) -> Any:
+def _manifest_signature(manifest: Dict[str, Any], key: bytes) -> str:
+    signed = {key_name: value for key_name, value in manifest.items() if key_name != "manifest_hmac_sha256"}
+    encoded = json.dumps(signed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+
+
+def app_credential_fingerprint(auth_mode: str, public_id: str) -> str:
+    if not public_id:
+        raise ApiFailure("user credential app identity is unavailable; static OAuth 2.0 sends require X_OAUTH2_STATIC_CLIENT_ID")
+    return hashlib.sha256((auth_mode + ":" + public_id).encode("utf-8")).hexdigest()
+
+
+def configured_app_fingerprint(user_credentials: Tuple[str, Dict[str, str]]) -> str:
+    mode, credentials = user_credentials
+    public_id = credentials.get("X_API_KEY", "") if mode == "oauth1" else credentials.get("X_APP_PUBLIC_ID", "")
+    return app_credential_fingerprint(mode, public_id)
+
+
+def prepare_manifest(args: argparse.Namespace) -> Any:
     if args.text is not None and args.file is not None:
         raise ApiFailure("use either --text or --file, not both")
     if args.text is None and args.file is None:
-        raise ApiFailure("post requires --text or --file")
+        raise ApiFailure("prepare requires --text or --file")
     text = args.text if args.text is not None else Path(args.file).read_text(encoding="utf-8")
-    text = text.rstrip("\n")
-    if not text:
-        raise ApiFailure("post text must not be empty")
-    digest = content_sha256(text)
-    weight = weighted_length(text)
-    if args.live and args.dry_run:
-        raise ApiFailure("use either --live or --dry-run, not both")
-    if not args.live or args.dry_run:
-        result = {
-            "dry_run": True,
-            "content_sha256": digest,
-            "text_length": len(text),
-            "weighted_length": weight,
-            "weighted_limit": WEIGHTED_LIMIT,
-            "text": text,
+    validation = validate_post_text(text)
+    if not validation["valid"]:
+        raise ApiFailure("post validation failed: " + ", ".join(validation["errors"]), payload=validation)
+    created = datetime.now(timezone.utc)
+    manifest: Dict[str, Any] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "content_id": args.content_id,
+        "app_id": args.app_id,
+        "expected_app_fingerprint": args.expected_app_fingerprint,
+        "expected_user_id": args.expected_user_id,
+        "approval_id": args.approval_id,
+        "created_at": created.isoformat().replace("+00:00", "Z"),
+        "expires_at": (created + timedelta(seconds=args.expires_in)).isoformat().replace("+00:00", "Z"),
+        "text": validation["text"],
+        "content_sha256": validation["content_sha256"],
+        "weighted_length": validation["weighted_length"],
+        "budget": {"max_api_calls": 3, "calls": ["POST /2/oauth2/token (conditional)", "GET /2/users/me", "POST /2/tweets"]},
+    }
+    manifest["manifest_sha256"] = _manifest_digest(manifest)
+    manifest["manifest_hmac_sha256"] = _manifest_signature(manifest, manifest_signing_key())
+    write_private_json(Path(args.manifest), manifest)
+    return {"status": "prepared", "manifest": str(Path(args.manifest)), "validation": validation, **manifest}
+
+
+def load_manifest(path: Path, allow_expired: bool = False) -> Dict[str, Any]:
+    manifest = read_json_object(path, "post manifest")
+    required = {
+        "schema_version", "content_id", "app_id", "expected_app_fingerprint", "expected_user_id", "approval_id",
+        "created_at", "expires_at", "text", "content_sha256", "weighted_length", "budget", "manifest_sha256", "manifest_hmac_sha256",
+    }
+    missing = sorted(required - set(manifest))
+    if missing:
+        raise ApiFailure("post manifest is missing: " + ", ".join(missing))
+    if manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
+        raise ApiFailure("unsupported post manifest schema_version")
+    if not all(isinstance(manifest[key], str) and manifest[key] for key in ("content_id", "app_id", "expected_app_fingerprint", "expected_user_id", "approval_id", "text")):
+        raise ApiFailure("post manifest contains an empty identity, approval, content, or text field")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(manifest["expected_app_fingerprint"])):
+        raise ApiFailure("expected_app_fingerprint must be a SHA-256 hex digest")
+    if not str(manifest["expected_user_id"]).isdigit():
+        raise ApiFailure("expected_user_id must be a stable numeric X user ID")
+    if not secrets.compare_digest(str(manifest["manifest_sha256"]), _manifest_digest(manifest)):
+        raise ApiFailure("post manifest integrity check failed")
+    if not secrets.compare_digest(str(manifest["manifest_hmac_sha256"]), _manifest_signature(manifest, manifest_signing_key())):
+        raise ApiFailure("post manifest approval signature check failed")
+    validation = validate_post_text(str(manifest["text"]))
+    if not validation["valid"] or validation["content_sha256"] != manifest["content_sha256"] or validation["weighted_length"] != manifest["weighted_length"]:
+        raise ApiFailure("post manifest text validation or hash check failed", payload=validation)
+    budget = manifest.get("budget")
+    expected_calls = ["POST /2/oauth2/token (conditional)", "GET /2/users/me", "POST /2/tweets"]
+    if not isinstance(budget, dict) or budget.get("max_api_calls") != 3 or budget.get("calls") != expected_calls:
+        raise ApiFailure("post manifest must authorize exactly the refresh-if-needed, identity, and send plan")
+    if not allow_expired and datetime.now(timezone.utc) >= parse_timestamp(str(manifest["expires_at"]), "manifest expires_at"):
+        raise ApiFailure("post manifest has expired")
+    return manifest
+
+
+def require_budget(variable: str, required_calls: int, exact: bool = False) -> None:
+    raw = os.environ.get(variable, "")
+    try:
+        allowed = int(raw)
+    except ValueError as exc:
+        raise ApiFailure(variable + " must be an integer call budget") from exc
+    if exact and allowed != required_calls:
+        raise ApiFailure(variable + " must equal exactly " + str(required_calls) + " API calls")
+    if not exact and allowed < required_calls:
+        raise ApiFailure(variable + " must allow at least " + str(required_calls) + " API call(s)")
+
+
+def require_read_budget(required_calls: int = 1) -> None:
+    if os.environ.get("X_API_READ_ENABLED") != "true":
+        raise ApiFailure("paid X API reads require X_API_READ_ENABLED=true")
+    require_budget("X_API_READ_MAX_CALLS", required_calls)
+
+
+def reserve_daily_calls(kind: str, planned_calls: int) -> Dict[str, Any]:
+    project_id = os.environ.get("X_API_PROJECT_ID", "")
+    agent_id = os.environ.get("X_API_AGENT_ID", "")
+    variable = "X_API_DAILY_" + kind.upper() + "_CALL_LIMIT"
+    if not project_id or not agent_id:
+        raise ApiFailure("daily API budget requires X_API_PROJECT_ID and X_API_AGENT_ID")
+    try:
+        daily_limit = int(os.environ.get(variable, ""))
+    except ValueError as exc:
+        raise ApiFailure(variable + " must be an integer") from exc
+    if daily_limit < planned_calls:
+        raise ApiFailure(variable + " is smaller than the planned API calls")
+    path = CANONICAL_LEDGER_PATH.with_name("x-usage.sqlite3")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout=30000")
+        for attempt in range(100):
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS usage (day TEXT NOT NULL, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, kind TEXT NOT NULL, calls INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(day,project_id,agent_id,kind))"
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 99:
+                    raise
+                time.sleep(0.01)
+        connection.execute("BEGIN IMMEDIATE")
+        day = datetime.now(timezone.utc).date().isoformat()
+        row = connection.execute(
+            "SELECT calls FROM usage WHERE day=? AND project_id=? AND agent_id=? AND kind=?",
+            (day, project_id, agent_id, kind),
+        ).fetchone()
+        used = int(row["calls"]) if row else 0
+        if used + planned_calls > daily_limit:
+            raise ApiFailure(variable + " exceeded for project / agent budget scope")
+        connection.execute(
+            "INSERT INTO usage(day,project_id,agent_id,kind,calls,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(day,project_id,agent_id,kind) DO UPDATE SET calls=excluded.calls, updated_at=excluded.updated_at",
+            (day, project_id, agent_id, kind, used + planned_calls, utc_now()),
+        )
+        connection.commit()
+        return {
+            "day": day,
+            "project_id": project_id,
+            "agent_id": agent_id,
+            "kind": kind,
+            "reserved_calls": planned_calls,
+            "used_calls": used + planned_calls,
+            "daily_limit": daily_limit,
         }
-        if args.content_id:
-            result["content_id"] = args.content_id
-        return result
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def open_ledger() -> sqlite3.Connection:
+    CANONICAL_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(CANONICAL_LEDGER_PATH, timeout=30, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
+    try:
+        for attempt in range(100):
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    INSERT OR IGNORE INTO ledger_meta(key, value) VALUES ('schema_version', '2');
+                    CREATE TABLE IF NOT EXISTS intents (
+                      id INTEGER PRIMARY KEY,
+                      account_id TEXT NOT NULL,
+                      app_id TEXT NOT NULL,
+                      app_fingerprint TEXT NOT NULL,
+                      content_id TEXT NOT NULL,
+                      content_sha256 TEXT NOT NULL,
+                      text TEXT NOT NULL,
+                      approval_id TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      attempted_at TEXT,
+                      updated_at TEXT NOT NULL,
+                      post_id TEXT,
+                      http_status INTEGER,
+                      UNIQUE(account_id, content_id),
+                      UNIQUE(account_id, content_sha256)
+                    );
+                    CREATE TABLE IF NOT EXISTS events (
+                      id INTEGER PRIMARY KEY,
+                      intent_id INTEGER NOT NULL REFERENCES intents(id),
+                      event TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      recorded_at TEXT NOT NULL,
+                      http_status INTEGER,
+                      detail TEXT
+                    );
+                    """
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 99:
+                    raise
+                time.sleep(0.01)
+        schema_row = connection.execute("SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
+    except Exception:
+        connection.close()
+        raise
+    if schema_row is None or schema_row["value"] != str(LEDGER_SCHEMA_VERSION):
+        connection.close()
+        raise ApiFailure("unsupported canonical ledger schema_version")
+    return connection
+
+
+def _event(connection: sqlite3.Connection, intent_id: int, event: str, status: str, http_status: Optional[int] = None, detail: Optional[Dict[str, Any]] = None) -> None:
+    connection.execute(
+        "INSERT INTO events(intent_id,event,status,recorded_at,http_status,detail) VALUES (?,?,?,?,?,?)",
+        (intent_id, event, status, utc_now(), http_status, json.dumps(detail, sort_keys=True) if detail else None),
+    )
+
+
+def reserve_attempt(manifest: Dict[str, Any]) -> int:
+    connection = open_ledger()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM intents WHERE account_id=? AND (content_id=? OR content_sha256=?)",
+            (manifest["expected_user_id"], manifest["content_id"], manifest["content_sha256"]),
+        ).fetchone()
+        now = utc_now()
+        unresolved = connection.execute(
+            "SELECT content_id FROM intents WHERE account_id=? AND status='unknown' LIMIT 1",
+            (manifest["expected_user_id"],),
+        ).fetchone()
+        if unresolved and (row is None or unresolved["content_id"] != row["content_id"]):
+            raise ApiFailure("account has an unresolved unknown intent; reconcile it before any new post")
+        if row:
+            if row["content_id"] != manifest["content_id"]:
+                raise ApiFailure("duplicate post refused: identical content is already registered under another content_id")
+            if row["content_id"] == manifest["content_id"] and row["content_sha256"] != manifest["content_sha256"]:
+                raise ApiFailure("content_id is already bound to different text")
+            if row["status"] == "sent":
+                raise ApiFailure("duplicate post refused: content is already marked sent")
+            if row["status"] == "unknown":
+                raise ApiFailure("unknown post result refused: run reconcile before any retry")
+            if row["status"] in {"failed", "confirmed_absent"} and row["approval_id"] == manifest["approval_id"]:
+                raise ApiFailure("retry after failed or confirmed_absent requires a new signed approval_id")
+            if row["attempts"] >= 2:
+                raise ApiFailure("post attempt limit reached: maximum 2 attempts")
+            attempts = row["attempts"] + 1
+            connection.execute(
+                "UPDATE intents SET app_id=?, app_fingerprint=?, approval_id=?, status='unknown', attempts=?, attempted_at=?, updated_at=? WHERE id=?",
+                (
+                    manifest["app_id"], manifest["expected_app_fingerprint"], manifest["approval_id"],
+                    attempts, now, now, row["id"],
+                ),
+            )
+            intent_id = int(row["id"])
+        else:
+            cursor = connection.execute(
+                "INSERT INTO intents(account_id,app_id,app_fingerprint,content_id,content_sha256,text,approval_id,status,attempts,attempted_at,updated_at) VALUES (?,?,?,?,?,?,?,'unknown',1,?,?)",
+                (
+                    manifest["expected_user_id"], manifest["app_id"], manifest["expected_app_fingerprint"], manifest["content_id"],
+                    manifest["content_sha256"], manifest["text"], manifest["approval_id"], now, now,
+                ),
+            )
+            intent_id = int(cursor.lastrowid)
+        _event(connection, intent_id, "attempt", "unknown")
+        connection.commit()
+        return intent_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def record_result(intent_id: int, status: str, http_status: Optional[int] = None, post_id: Optional[str] = None, detail: Optional[Dict[str, Any]] = None, event: str = "result") -> None:
+    connection = open_ledger()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if status == "rate_limited":
+            connection.execute("UPDATE intents SET status=?, attempts=MAX(0,attempts-1), http_status=?, updated_at=? WHERE id=?", (status, http_status, utc_now(), intent_id))
+        else:
+            connection.execute("UPDATE intents SET status=?, http_status=?, post_id=COALESCE(?,post_id), updated_at=? WHERE id=?", (status, http_status, post_id, utc_now(), intent_id))
+        _event(connection, intent_id, event, status, http_status, detail)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def authenticated_identity(user_credentials: Tuple[str, Dict[str, str]]) -> Dict[str, Any]:
+    status, payload, metadata = api_request(
+        "GET", "/2/users/me", "user", params={"user.fields": "id,name,username"}, user_credentials=user_credentials
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("id"):
+        raise ApiFailure("authenticated identity response did not contain a user id", status, payload)
+    return {"data": data, "http_status": status, **metadata}
+
+
+def send_manifest(args: argparse.Namespace) -> Any:
     if os.environ.get("X_POSTING_ENABLED") != "true":
         raise ApiFailure("live posting requires X_POSTING_ENABLED=true")
-    if not args.ledger or not args.content_id:
-        raise ApiFailure("live posting requires --ledger and --content-id")
-    # Resolve credentials before touching the ledger so that a configuration
-    # error can never be recorded as an attempt.
-    require_user_credentials()
-
-    ledger_path = Path(args.ledger)
-    base_record = {"content_id": args.content_id, "content_sha256": digest}
-    # The duplicate check and the write-ahead append must be one atomic unit;
-    # otherwise two concurrent runs can both pass the check and double-post.
-    with file_lock(ledger_path, "post ledger", required=False):
-        matching = [
-            record
-            for record in read_ledger(ledger_path)
-            if record.get("content_sha256") == digest or record.get("content_id") == args.content_id
-        ]
-        if any(record.get("status") == "sent" for record in matching):
-            raise ApiFailure("duplicate post refused: content is already marked sent")
-        if matching and matching[-1].get("status") == "unknown" and not args.retry_unknown:
-            raise ApiFailure("unknown post result refused: inspect and explicitly use --retry-unknown")
-        if attempt_budget_used(matching) >= 2:
-            raise ApiFailure("post attempt limit reached: maximum 2 attempts per content_id or content_sha256")
-        # Write-ahead: if the process dies mid-send, this row survives and gates
-        # the next run behind --retry-unknown.
-        append_ledger(ledger_path, {"attempted_at": utc_now(), "event": "attempt", "status": "unknown", **base_record})
-
-    result: Dict[str, Any] = {"attempted_at": utc_now(), "event": "result", "status": "unknown", **base_record}
+    require_budget("X_API_WRITE_MAX_CALLS", 3, exact=True)
+    manifest = load_manifest(Path(args.manifest))
+    if os.environ.get("X_API_APP_ID", "") != manifest["app_id"]:
+        raise ApiFailure("X_API_APP_ID does not match manifest app_id; refusing unbound credentials")
+    budget_record = reserve_daily_calls("write", 3)
+    user_credentials = require_user_credentials()
+    if configured_app_fingerprint(user_credentials) != manifest["expected_app_fingerprint"]:
+        raise ApiFailure("configured OAuth app credential does not match expected_app_fingerprint")
+    identity = authenticated_identity(user_credentials)
+    actual_user_id = str(identity["data"]["id"])
+    if actual_user_id != manifest["expected_user_id"]:
+        raise ApiFailure("authenticated X account does not match expected_user_id; no ledger attempt was recorded")
+    intent_id = reserve_attempt(manifest)
     try:
-        status, payload = api_request("POST", "/2/tweets", "user", body={"text": text})
+        status, payload, metadata = api_request(
+            "POST", "/2/tweets", "user", body={"text": manifest["text"]}, user_credentials=user_credentials
+        )
     except ApiFailure as exc:
-        # 429 means the request was certainly not processed and refunds the
-        # attempt budget; other 4xx were rejected before processing; 5xx and
-        # network failures may have published the post, so they stay "unknown".
-        if exc.status == 429:
-            result["status"] = "rate_limited"
-        elif exc.status is not None and exc.status < 500:
-            result["status"] = "failed"
-        else:
-            result["status"] = "unknown"
-        if exc.status is not None:
-            result["http_status"] = exc.status
-        if exc.retry_after is not None:
-            result["retry_after"] = exc.retry_after
-        if exc.rate_limit_reset is not None:
-            result["rate_limit_reset"] = exc.rate_limit_reset
-        with file_lock(ledger_path, "post ledger", required=False):
-            append_ledger(ledger_path, result)
+        result_status = "rate_limited" if exc.status == 429 else "failed" if exc.status is not None and 400 <= exc.status < 500 else "unknown"
+        record_result(
+            intent_id, result_status, exc.status,
+            detail={"retry_after": exc.retry_after, "rate_limit_reset": exc.rate_limit_reset},
+        )
+        exc.outcome = result_status
         raise
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict) or not payload["data"].get("id"):
-        result["http_status"] = status
-        with file_lock(ledger_path, "post ledger", required=False):
-            append_ledger(ledger_path, result)
-        raise ApiFailure("post response did not contain a post id")
-    post_id = str(payload["data"]["id"])
-    result.update({"status": "sent", "post_id": post_id, "http_status": status})
-    with file_lock(ledger_path, "post ledger", required=False):
-        append_ledger(ledger_path, result)
-    return {"content_sha256": digest, "ledger": str(ledger_path), "post_id": post_id, "url": "https://x.com/i/web/status/" + post_id}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("id"):
+        record_result(intent_id, "unknown", status)
+        raise ApiFailure("post response did not contain a post id", status, payload, outcome="unknown")
+    post_id = str(data["id"])
+    record_result(intent_id, "sent", status, post_id, metadata)
+    return {
+        "status": "sent",
+        "account_id": actual_user_id,
+        "app_id": manifest["app_id"],
+        "content_id": manifest["content_id"],
+        "content_sha256": manifest["content_sha256"],
+        "ledger": str(CANONICAL_LEDGER_PATH),
+        "post_id": post_id,
+        "url": "https://x.com/i/web/status/" + post_id,
+        "_meta": {"http_status": status, "budget": budget_record, **metadata},
+    }
 
 
-def clamp_max_results(requested: int, minimum: int, maximum: int) -> str:
-    value = max(minimum, min(requested, maximum))
-    if value != requested:
-        print("note: max_results adjusted to %d (API range %d-%d)" % (value, minimum, maximum), file=sys.stderr)
-    return str(value)
+def validate_max_results(requested: int, minimum: int, maximum: int) -> str:
+    if not minimum <= requested <= maximum:
+        raise ApiFailure("max_results must be within API range %d-%d; refusing to increase or clamp the request" % (minimum, maximum))
+    return str(requested)
+
+
+def _ledger_intent(account_id: str, content_id: str) -> sqlite3.Row:
+    connection = open_ledger()
+    try:
+        row = connection.execute("SELECT * FROM intents WHERE account_id=? AND content_id=?", (account_id, content_id)).fetchone()
+        if row is None:
+            raise ApiFailure("no canonical ledger intent matches account and content_id")
+        return row
+    finally:
+        connection.close()
+
+
+def reconcile(args: argparse.Namespace) -> Any:
+    require_read_budget(3)
+    row = _ledger_intent(args.expected_user_id, args.content_id)
+    if row["status"] != "unknown":
+        return {"status": row["status"], "content_id": args.content_id, "account_id": args.expected_user_id, "reconciled": False}
+    budget_record = reserve_daily_calls("read", 3)
+    user_credentials = require_user_credentials()
+    if configured_app_fingerprint(user_credentials) != row["app_fingerprint"]:
+        raise ApiFailure("configured OAuth app credential does not match the ledger app fingerprint")
+    identity = authenticated_identity(user_credentials)
+    if str(identity["data"]["id"]) != args.expected_user_id:
+        raise ApiFailure("authenticated X account does not match reconciliation account")
+    status, payload, metadata = api_request(
+        "GET", "/2/users/" + quote(args.expected_user_id, safe="") + "/tweets", "user",
+        params={"max_results": "100", "tweet.fields": "created_at", "exclude": "replies,retweets"},
+        user_credentials=user_credentials,
+    )
+    posts = payload.get("data") if isinstance(payload, dict) else None
+    attempted_at = parse_timestamp(str(row["attempted_at"]), "ledger attempted_at")
+    match_window_start = attempted_at - timedelta(seconds=30)
+    match_window_end = attempted_at + timedelta(minutes=5)
+    match = None
+    for post in posts or []:
+        if not isinstance(post, dict) or not post.get("created_at"):
+            continue
+        created_at = parse_timestamp(str(post["created_at"]), "post created_at")
+        if (
+            match_window_start <= created_at <= match_window_end
+            and content_sha256(str(post.get("text", ""))) == row["content_sha256"]
+        ):
+            match = post
+            break
+    if match and match.get("id"):
+        post_id = str(match["id"])
+        record_result(int(row["id"]), "sent", status, post_id, {"reconcile": "confirmed_success"}, event="reconcile")
+        return {"status": "confirmed_success", "post_id": post_id, "url": "https://x.com/i/web/status/" + post_id, "_meta": {"budget": budget_record, **metadata}}
+    timestamps = [parse_timestamp(str(post["created_at"]), "post created_at") for post in posts or [] if isinstance(post, dict) and post.get("created_at")]
+    has_errors = bool(payload.get("errors")) if isinstance(payload, dict) else False
+    has_urls = bool(_url_spans(str(row["text"])))
+    if not has_errors and not has_urls and timestamps and min(timestamps) <= attempted_at <= max(timestamps):
+        evidence = {
+            "reconcile": "timeline_window_covered",
+            "oldest_post_at": min(timestamps).isoformat(),
+            "newest_post_at": max(timestamps).isoformat(),
+            "attempted_at": attempted_at.isoformat(),
+            "posts_examined": len(posts or []),
+        }
+        record_result(int(row["id"]), "confirmed_absent", status, detail=evidence, event="reconcile")
+        return {"status": "confirmed_absent", "content_id": args.content_id, "account_id": args.expected_user_id, "_meta": {"budget": budget_record, "reconciliation": evidence, **metadata}}
+    evidence = {
+        "reconcile": "unresolved",
+        "attempted_at": attempted_at.isoformat(),
+        "posts_examined": len(posts or []),
+        "partial_errors": has_errors,
+        "contains_url": has_urls,
+    }
+    record_result(int(row["id"]), "unknown", status, detail=evidence, event="reconcile")
+    return {"status": "unresolved", "content_id": args.content_id, "account_id": args.expected_user_id, "_meta": {"budget": budget_record, "reconciliation": evidence, **metadata}}
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read X API v2 data or prepare a guarded text post.")
-    parser.add_argument("--auth", choices=["auto", "app", "user"], default="auto", help="read auth mode; post always uses user context")
+    parser = argparse.ArgumentParser(description="Read X API v2 data or prepare, send, and reconcile a guarded text post.")
+    parser.add_argument("--auth", choices=["auto", "app", "user"], default="auto", help="read auth mode; send always uses user context")
     parser.add_argument("--pretty", action="store_true", help="pretty-print JSON")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -609,48 +1134,77 @@ def build_parser() -> argparse.ArgumentParser:
     by_id.add_argument("--user-id", required=True)
     posts = sub.add_parser("posts", help="get posts by user id")
     posts.add_argument("--user-id", required=True)
-    posts.add_argument("--max-results", type=int, default=10, help="5-100; out-of-range values are clamped")
+    posts.add_argument("--max-results", type=int, default=10, help="5-100; out-of-range values are rejected")
     posts.add_argument("--pagination-token")
     tweet = sub.add_parser("post-by-id", help="get posts by comma-separated ids")
     tweet.add_argument("--ids", required=True)
     search = sub.add_parser("search-recent", help="search recent posts")
     search.add_argument("--query", required=True)
-    search.add_argument("--max-results", type=int, default=10, help="10-100; out-of-range values are clamped")
+    search.add_argument("--max-results", type=int, default=10, help="10-100; out-of-range values are rejected")
     search.add_argument("--next-token")
-    post = sub.add_parser("post", help="dry-run by default; optionally send one text post")
-    group = post.add_mutually_exclusive_group()
+    sub.add_parser("usage", help="get project usage; requires the explicit read budget gate")
+    prepare = sub.add_parser("prepare", help="validate text and write a short-lived immutable post manifest")
+    group = prepare.add_mutually_exclusive_group()
     group.add_argument("--text")
     group.add_argument("--file")
-    post.add_argument("--live", action="store_true")
-    post.add_argument("--dry-run", action="store_true", help="explicitly select the default non-sending mode")
-    post.add_argument("--content-id")
-    post.add_argument("--ledger")
-    post.add_argument("--retry-unknown", action="store_true")
+    prepare.add_argument("--manifest", required=True)
+    prepare.add_argument("--content-id", required=True)
+    prepare.add_argument("--expected-user-id", required=True)
+    prepare.add_argument("--app-id", required=True)
+    prepare.add_argument("--expected-app-fingerprint", required=True)
+    prepare.add_argument("--approval-id", required=True)
+    prepare.add_argument("--expires-in", type=int, default=DEFAULT_MANIFEST_TTL_SECONDS, choices=range(60, 3601), metavar="60-3600")
+    send = sub.add_parser("send", help="send only the exact content in a valid approved manifest")
+    send.add_argument("--manifest", required=True)
+    reconcile_parser = sub.add_parser("reconcile", help="resolve an unknown canonical-ledger result before retry")
+    reconcile_parser.add_argument("--content-id", required=True)
+    reconcile_parser.add_argument("--expected-user-id", required=True)
     return parser
 
 
 def dispatch(args: argparse.Namespace) -> Any:
     auth = choose_auth(args.command, args.auth)
-    if args.command == "me":
-        return fetch("GET", "/2/users/me", auth, {"user.fields": USER_FIELDS})
-    if args.command == "user":
-        return fetch("GET", "/2/users/by/username/" + quote(args.username, safe=""), auth, {"user.fields": USER_FIELDS})
-    if args.command == "user-by-id":
-        return fetch("GET", "/2/users/" + args.user_id, auth, {"user.fields": USER_FIELDS})
     if args.command == "posts":
-        params = {"max_results": clamp_max_results(args.max_results, 5, 100), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
+        validate_max_results(args.max_results, 5, 100)
+    if args.command == "search-recent":
+        validate_max_results(args.max_results, 10, 100)
+    budget_record = None
+    if args.command in {"me", "user", "user-by-id", "posts", "post-by-id", "search-recent", "usage"}:
+        planned_calls = 1 if auth == "app" else 2
+        require_read_budget(planned_calls)
+        budget_record = reserve_daily_calls("read", planned_calls)
+
+    def attach_budget(result: Any) -> Any:
+        if budget_record is not None and isinstance(result, dict) and isinstance(result.get("_meta"), dict):
+            result["_meta"]["budget"] = budget_record
+        return result
+
+    if args.command == "me":
+        return attach_budget(fetch("GET", "/2/users/me", auth, {"user.fields": USER_FIELDS}))
+    if args.command == "user":
+        return attach_budget(fetch("GET", "/2/users/by/username/" + quote(args.username, safe=""), auth, {"user.fields": USER_FIELDS}))
+    if args.command == "user-by-id":
+        return attach_budget(fetch("GET", "/2/users/" + args.user_id, auth, {"user.fields": USER_FIELDS}))
+    if args.command == "posts":
+        params = {"max_results": validate_max_results(args.max_results, 5, 100), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
         if args.pagination_token:
             params["pagination_token"] = args.pagination_token
-        return fetch("GET", "/2/users/" + args.user_id + "/tweets", auth, params)
+        return attach_budget(fetch("GET", "/2/users/" + args.user_id + "/tweets", auth, params))
     if args.command == "post-by-id":
-        return fetch("GET", "/2/tweets", auth, {"ids": args.ids, "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS})
+        return attach_budget(fetch("GET", "/2/tweets", auth, {"ids": args.ids, "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}))
     if args.command == "search-recent":
-        params = {"query": args.query, "max_results": clamp_max_results(args.max_results, 10, 100), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
+        params = {"query": args.query, "max_results": validate_max_results(args.max_results, 10, 100), "tweet.fields": POST_FIELDS, "expansions": "author_id", "user.fields": USER_FIELDS}
         if args.next_token:
             params["next_token"] = args.next_token
-        return fetch("GET", "/2/tweets/search/recent", auth, params)
-    if args.command == "post":
-        return post_text(args)
+        return attach_budget(fetch("GET", "/2/tweets/search/recent", auth, params))
+    if args.command == "usage":
+        return attach_budget(fetch("GET", "/2/usage/tweets", auth))
+    if args.command == "prepare":
+        return prepare_manifest(args)
+    if args.command == "send":
+        return send_manifest(args)
+    if args.command == "reconcile":
+        return reconcile(args)
     raise ApiFailure("unsupported command")
 
 
@@ -658,7 +1212,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        print_json(dispatch(args), args.pretty)
+        result = dispatch(args)
+        print_json(result, args.pretty)
+        if isinstance(result, dict) and result.get("status") in {"partial", "failed", "unresolved"}:
+            return 2
         return 0
     except ApiFailure as exc:
         detail = {"error": str(exc)}
@@ -672,6 +1229,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             detail["credential_state"] = exc.credential_state
         if exc.recovery_marker is not None:
             detail["recovery_marker"] = exc.recovery_marker
+        if exc.outcome is not None:
+            detail["status"] = exc.outcome
         if exc.payload is not None:
             detail["response"] = exc.payload
         print_json(detail, True, sys.stderr)

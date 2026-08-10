@@ -39,13 +39,25 @@ Logic Pro専用MCPまたは互換アダプタを利用し、状態確認、trans
 
 ### x-api
 
-X API v2の読み取りと、dry-runを標準にした通常投稿です。返信・引用・いいね・フォロー・DM・削除・ブラウザ操作は含めません。投稿の実行には、ユーザーコンテキスト、`X_POSTING_ENABLED=true`、送信台帳、`--live` が必要です。ユーザーコンテキストの第一経路は失効しないOAuth 1.0a（長期運用エージェント向け）で、OAuth 2.0 userトークンも利用できます。
+X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
 
 ```bash
-python3 skills/x-api/scripts/x_api.py --pretty me
-python3 skills/x-api/scripts/x_api.py --pretty user --username XDevelopers
-python3 skills/x-api/scripts/x_api.py --pretty search-recent --query 'from:XDevelopers -is:retweet'
-python3 skills/x-api/scripts/x_api.py --pretty post --dry-run --text 'draft only'
+X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \
+  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_READ_CALL_LIMIT=100 \
+  python3 skills/x-api/scripts/x_api.py --pretty user --username XDevelopers
+
+X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
+python3 skills/x-api/scripts/x_api.py --pretty prepare \
+  --manifest .tmp/approved-post.json --content-id c-1 \
+  --expected-user-id 123456789 --app-id x-production \
+  --expected-app-fingerprint '<64-char-sha256>' \
+  --approval-id approval-1 --text '確定済み本文'
+
+X_POSTING_ENABLED=true X_API_WRITE_MAX_CALLS=3 X_API_APP_ID=x-production \
+  X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
+  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_WRITE_CALL_LIMIT=20 \
+  python3 skills/x-api/scripts/x_api.py --pretty send \
+  --manifest .tmp/approved-post.json
 ```
 
 ## 検証
