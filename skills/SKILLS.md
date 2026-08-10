@@ -5,7 +5,6 @@
 | Skill | 状態 | 用途 |
 | --- | --- | --- |
 | [`ai-native-design`](ai-native-design/SKILL.md) | active | AI-native UIの既存Project調査、source探索、選定、統合、品質検証 |
-| [`logic-pro`](logic-pro/SKILL.md) | active | Logic Proの状態確認と、Project境界・読戻し検証付きの安全な操作 |
 | [`x-api`](x-api/SKILL.md) | active | 明示予算付きX API v2 readと署名manifest / account-app binding / SQLite付き通常投稿 |
 
 ## 新しいSkill

@@ -33,10 +33,6 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 既存design systemを先に調査し、一般UIは既存component / shadcn/ui、AI-native UIはVercel AI Elements、tool-heavy UIは21st Agent Elements、一般の21st.dev Marketplaceは規約に沿ったdesign discoveryとして比較します。AI固有state、untrusted generated content、server-side approval、accessibility、responsive、検証証拠までを一つの実行protocolで扱います。
 
-### logic-pro
-
-Logic Pro専用MCPまたは互換アダプタを利用し、状態確認、transport、track、内蔵音源、MIDI取込、保存、bounceをProject境界と独立読戻し付きで扱います。特定MCPのtool名には依存せず、実行時capabilityを意味操作へ対応付けます。macOS向けには、状態・Project・Play/Stopを日英Accessibility labelと独立読戻しで扱う自己完結reference adapterを同梱します。
-
 ### x-api
 
 X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
