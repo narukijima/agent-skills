@@ -5,6 +5,7 @@ license: MIT. See LICENSE.txt
 metadata:
   claudagt.version: "0.1.0"
   claudagt.status: "active"
+  claudagt.aliases: "<comma-separated aliases>"
 ---
 
 # `<skill-name>` — <一行説明>

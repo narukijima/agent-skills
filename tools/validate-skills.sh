@@ -58,10 +58,13 @@ if not metadata:
 metadata_text = metadata.group(1)
 version = re.search(r'^\s+claudagt\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', metadata_text, re.M)
 status_value = re.search(r'^\s+claudagt\.status:\s*"(active|deprecated|retired)"\s*$', metadata_text, re.M)
+aliases = re.search(r'^\s+claudagt\.aliases:\s*"([^"\n]+)"\s*$', metadata_text, re.M)
 if not version:
     raise SystemExit("metadata.claudagt.version must be a quoted semver string")
 if not status_value:
     raise SystemExit("metadata.claudagt.status must be active, deprecated, or retired")
+if not aliases or not all(value.strip() for value in aliases.group(1).split(",")):
+    raise SystemExit("metadata.claudagt.aliases must be a non-empty comma-separated string")
 if len(text.encode("utf-8")) > 20 * 1024:
     raise SystemExit("SKILL.md is larger than 20 KiB")
 for heading in ("## 使用するKnowledge", "### Required", "### Conditional"):

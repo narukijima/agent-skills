@@ -5,6 +5,7 @@ license: MIT. See LICENSE.txt
 metadata:
   claudagt.version: "0.2.0"
   claudagt.status: "active"
+  claudagt.aliases: "ai native design,ai ui"
 ---
 
 # ai-native-design — AI-native UIの探索・選定・統合・検証

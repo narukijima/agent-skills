@@ -52,7 +52,6 @@ DEFAULT_MANIFEST_TTL_SECONDS = 900
 
 DEFAULT_BASE_URL = "https://api.x.com"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
-CANONICAL_LEDGER_PATH = Path(__file__).resolve().parents[3] / "state/x-api/x-posts.sqlite3"
 
 
 class RejectRedirects(HTTPRedirectHandler):
@@ -111,6 +110,32 @@ class ApiFailure(RuntimeError):
         self.credential_state = credential_state
         self.recovery_marker = recovery_marker
         self.outcome = outcome
+
+
+def resolve_workspace_root(script_path: Optional[Path] = None) -> Tuple[Path, str]:
+    """Resolve the workspace from a repository marker, never vendor depth."""
+    current = (script_path or Path(__file__)).resolve().parent
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        if marker.is_dir():
+            return candidate, ".git-directory"
+        if marker.is_file():
+            return candidate, ".git-file"
+    raise ApiFailure(
+        "workspace root is unavailable: no .git marker was found; "
+        "refusing a vendor-depth-derived ledger path"
+    )
+
+
+WORKSPACE_ROOT, WORKSPACE_ROOT_RESOLUTION = resolve_workspace_root()
+CANONICAL_LEDGER_PATH = WORKSPACE_ROOT / "state/x-api/x-posts.sqlite3"
+
+
+def workspace_metadata() -> Dict[str, str]:
+    return {
+        "workspace_root": str(WORKSPACE_ROOT),
+        "workspace_root_resolution": WORKSPACE_ROOT_RESOLUTION,
+    }
 
 
 class CredentialRotationFailure(ApiFailure):
@@ -568,6 +593,19 @@ def _url_spans(text: str) -> List[Tuple[int, int]]:
     return spans
 
 
+def _url_values(text: str) -> List[str]:
+    return [text[start:end] for start, end in _url_spans(text)]
+
+
+def is_quote_target_url(value: str) -> bool:
+    candidate = value if "://" in value else "https://" + value
+    parsed = urlsplit(candidate)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not (host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com")):
+        return False
+    return bool(re.fullmatch(r"/(?:[A-Za-z0-9_]+|i/web)/status/[0-9]+/?", parsed.path))
+
+
 def _is_emoji(codepoint: int) -> bool:
     return (
         0x1F000 <= codepoint <= 0x1FAFF
@@ -653,6 +691,10 @@ def validate_post_text(text: str) -> Dict[str, Any]:
     cashtag_count = len(CASHTAG_PATTERN.findall(normalized))
     if cashtag_count > 1:
         errors.append("TOO_MANY_CASHTAGS")
+    urls = _url_values(normalized)
+    quote_targets = [value for value in urls if is_quote_target_url(value)]
+    if quote_targets:
+        errors.append("UNDECLARED_QUOTE_TARGET")
     return {
         "valid": not errors,
         "errors": errors,
@@ -660,7 +702,9 @@ def validate_post_text(text: str) -> Dict[str, Any]:
         "text_length": len(normalized),
         "weighted_length": weight,
         "weighted_limit": WEIGHTED_LIMIT,
-        "url_count": len(_url_spans(normalized)),
+        "url_count": len(urls),
+        "quote_target_count": len(quote_targets),
+        "quote_targets": quote_targets,
         "cashtag_count": cashtag_count,
         "content_sha256": content_sha256(normalized),
     }
@@ -735,7 +779,13 @@ def prepare_manifest(args: argparse.Namespace) -> Any:
     manifest["manifest_sha256"] = _manifest_digest(manifest)
     manifest["manifest_hmac_sha256"] = _manifest_signature(manifest, manifest_signing_key())
     write_private_json(Path(args.manifest), manifest)
-    return {"status": "prepared", "manifest": str(Path(args.manifest)), "validation": validation, **manifest}
+    return {
+        "status": "prepared",
+        "manifest": str(Path(args.manifest)),
+        "validation": validation,
+        **manifest,
+        **workspace_metadata(),
+    }
 
 
 def load_manifest(path: Path, allow_expired: bool = False) -> Dict[str, Any]:
@@ -1038,6 +1088,7 @@ def send_manifest(args: argparse.Namespace) -> Any:
         "content_id": manifest["content_id"],
         "content_sha256": manifest["content_sha256"],
         "ledger": str(CANONICAL_LEDGER_PATH),
+        **workspace_metadata(),
         "post_id": post_id,
         "url": "https://x.com/i/web/status/" + post_id,
         "_meta": {"http_status": status, "budget": budget_record, **metadata},

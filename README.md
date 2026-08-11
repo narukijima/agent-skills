@@ -25,7 +25,7 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 初期状態で自動インポート・自動同期は行いません。必要になったAgentの作業時だけ、利用側リポジトリのrootを指定して実行します。
 
-インポートは変換なしのvendored copyです。既存の同名Skillは自動上書きせず、コピー元のrepository、commit SHA、`metadata.claudagt.version`、インポート時刻を `skills/x-api/agents/upstream.yaml` に記録します。Skill内の `LICENSE.txt` とthird-party noticeもコピー対象です。更新は利用側で差分を確認してから、明示的に再インポートします。
+canonical SkillはAgent Skills仕様に従い、version / status / aliasesを`metadata.claudagt.*`に置きます。インポート時だけ、agent-directory v1の検索・検証契約に必要なtop-level `status` / `aliases`を同じmetadataから決定的に投影します。それ以外はvendored copyで、既存の同名Skillは自動上書きしません。コピー元のrepository、commit SHA、`metadata.claudagt.version`、frontmatter projection、インポート時刻を `skills/x-api/agents/upstream.yaml` に記録します。Skill内の `LICENSE.txt` とthird-party noticeもコピー対象です。更新は利用側で差分を確認してから、明示的に再インポートします。
 
 ## 公式Skill
 
@@ -35,7 +35,7 @@ bash tools/import-skill.sh x-api --target /path/to/agent-directory
 
 ### x-api
 
-X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
+X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。本文中のX status URLもquoteとして既定拒否し、ledger rootは`.git` markerから解決します。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
 
 ```bash
 X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \

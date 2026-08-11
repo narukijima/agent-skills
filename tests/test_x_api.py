@@ -125,7 +125,51 @@ class XApiTests(unittest.TestCase):
             self.assertEqual(result["text"], "caf\u00e9")
             self.assertEqual(result["content_sha256"], x_api.content_sha256("caf\u00e9"))
             self.assertTrue(result["validation"]["valid"])
+            self.assertEqual(result["workspace_root"], str(x_api.WORKSPACE_ROOT))
+            self.assertIn(result["workspace_root_resolution"], {".git-directory", ".git-file"})
             self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o600)
+
+    def test_status_urls_are_rejected_as_undeclared_quote_targets(self):
+        quote_urls = (
+            "https://x.com/example/status/123456789",
+            "https://www.x.com/example/status/123456789?ref=share",
+            "twitter.com/example/status/123456789",
+            "https://mobile.twitter.com/i/web/status/123456789",
+        )
+        for url in quote_urls:
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as directory:
+                manifest = Path(directory) / "approved.json"
+                validation = x_api.validate_post_text("source\n" + url)
+                self.assertFalse(validation["valid"])
+                self.assertEqual(validation["quote_target_count"], 1)
+                self.assertIn("UNDECLARED_QUOTE_TARGET", validation["errors"])
+                with self.assertRaises(x_api.ApiFailure) as raised:
+                    make_manifest(manifest, "source\n" + url)
+                self.assertIn("UNDECLARED_QUOTE_TARGET", str(raised.exception))
+                self.assertFalse(manifest.exists())
+        ordinary = x_api.validate_post_text("source\nhttps://example.com/article")
+        self.assertTrue(ordinary["valid"])
+        self.assertEqual(ordinary["quote_target_count"], 0)
+
+    def test_workspace_root_uses_nearest_git_marker_not_vendor_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            script = workspace / "project" / "skills" / "x-api" / "scripts" / "x_api.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# fixture\n", encoding="utf-8")
+            (workspace / ".git").write_text("gitdir: /tmp/example\n", encoding="utf-8")
+            resolved, reason = x_api.resolve_workspace_root(script)
+            self.assertEqual(resolved, workspace.resolve())
+            self.assertEqual(reason, ".git-file")
+            (workspace / ".git").unlink()
+            (workspace / ".git").mkdir()
+            resolved, reason = x_api.resolve_workspace_root(script)
+            self.assertEqual(resolved, workspace.resolve())
+            self.assertEqual(reason, ".git-directory")
+            (workspace / ".git").rmdir()
+            with self.assertRaises(x_api.ApiFailure) as raised:
+                x_api.resolve_workspace_root(script)
+            self.assertIn("no .git marker", str(raised.exception))
 
     def test_weighted_length_handles_emoji_clusters_and_urls(self):
         for value in ("👾", "🙋🏽", "👨‍🎤", "👨‍👩‍👧‍👦", "🇯🇵"):
@@ -676,10 +720,11 @@ class XApiTests(unittest.TestCase):
             with self.assertRaises(x_api.ApiFailure):
                 x_api.resolve_base_url()
 
-    def test_skill_v05_contract_and_metadata_are_consistent(self):
+    def test_skill_v051_contract_and_metadata_are_consistent(self):
         skill = (SCRIPT.parents[1] / "SKILL.md").read_text(encoding="utf-8")
         metadata = (SCRIPT.parents[1] / "agents" / "openai.yaml").read_text(encoding="utf-8")
-        self.assertIn('claudagt.version: "0.5.0"', skill)
+        self.assertIn('claudagt.version: "0.5.1"', skill)
+        self.assertIn('claudagt.aliases: "x api,twitter-api"', skill)
         self.assertIn("license: MIT. See LICENSE.txt", skill)
         self.assertTrue((SCRIPT.parents[1] / "LICENSE.txt").is_file())
         for term in ("prepare", "send", "reconcile", "expected_user_id", "x-posts.sqlite3"):

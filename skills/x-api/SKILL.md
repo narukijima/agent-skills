@@ -3,8 +3,9 @@ name: x-api
 description: Use when an agent must explicitly retrieve paid X API v2 data or prepare, send, or reconcile one text post through a manifest, expected-account binding, budgets, and canonical SQLite ledger.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.5.0"
+  claudagt.version: "0.5.1"
   claudagt.status: "active"
+  claudagt.aliases: "x api,twitter-api"
 ---
 
 # x-api — X API v2の明示的な読み取りとguarded text post
@@ -17,7 +18,7 @@ metadata:
 
 - read: authenticated user、user lookup、post lookup、user posts、recent search、usage
 - write: 単独の通常テキスト投稿を `prepare` → `send` → 必要時 `reconcile` で扱う
-- 対象外: reply、quote、like、follow、DM、delete、media upload、browser posting、Analytics UI
+- 対象外: reply、quote（本文中のX status URLによるquote cardも含む）、like、follow、DM、delete、media upload、browser posting、Analytics UI
 
 write capabilityはbetaである。canonical SQLite ledgerは同一workspace内で、同じbundled scriptとdatabaseを使う複数processを直列化するが、任意コードを実行できる敵対的Agentや複数machineのglobal uniquenessは保証しない。複数Agent / machine / accountの完全無人運用は、署名鍵、資格情報、予算設定、bundled script、canonical databaseを一般Agentから隔離して所有する専用single-writer gateway経由でのみ採用する。
 
@@ -46,7 +47,7 @@ write capabilityはbetaである。canonical SQLite ledgerは同一workspace内�
 - `send`は`prepare`が生成した短期manifestだけを受け取る。direct `--text` / `--file` / `--ledger`は存在しない。
 - manifestはgateway-owned `X_API_MANIFEST_SIGNING_KEY`によるHMAC-SHA256を必須にし、本文、account、app credential fingerprint、approval、期限、call planの再計算改ざんを拒否する。署名鍵を一般Agentへ渡してはならない。
 - live前に`/2/users/me`を読み、manifestの`expected_user_id`とexact matchする。不一致時はSQLiteへattemptを書かない。
-- ledgerはworkspace rootの`state/x-api/x-posts.sqlite3`、daily usageは`state/x-api/x-usage.sqlite3`に固定し、caller-selected pathを受け取らない。
+- ledgerは最寄りの`.git` markerから解決したworkspace rootの`state/x-api/x-posts.sqlite3`、daily usageは`state/x-api/x-usage.sqlite3`に固定し、caller-selected pathやvendorのdirectory深度を根拠にしない。markerを解決できなければfail closedにする。
 - 同じaccountに未解決`unknown`が1件でもあれば、別contentの新規sendも停止する。
 - timeout、disconnect、5xx、post ID欠落は`unknown`にする。blind retry optionは存在せず、`reconcile`が必要である。
 
@@ -81,7 +82,7 @@ X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \
 
 ### 1. Prepare
 
-Projectで本文、stable X user ID、app label、OAuth app credential fingerprint、content ID、approval IDを確定し、approval gatewayで短期manifestを作る。prepareはNFC正規化、同一本文hash、weighted length、URL / cashtag、control characterを検査し、X APIやX credentialは使わないが、一般Agentから隔離したmanifest署名鍵を必要とする。fingerprintはOAuth 2.0なら`sha256("oauth2:" + client_id)`、OAuth 1.0aなら`sha256("oauth1:" + api_key)`である。
+Projectで本文、stable X user ID、app label、OAuth app credential fingerprint、content ID、approval IDを確定し、approval gatewayで短期manifestを作る。prepareはNFC正規化、同一本文hash、weighted length、URL / cashtag、control characterを検査する。`x.com` / `twitter.com`のstatus URLは暗黙のquote targetとして分類し、`UNDECLARED_QUOTE_TARGET`で拒否する。X APIやX credentialは使わないが、一般Agentから隔離したmanifest署名鍵を必要とする。fingerprintはOAuth 2.0なら`sha256("oauth2:" + client_id)`、OAuth 1.0aなら`sha256("oauth1:" + api_key)`である。
 
 ```bash
 X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
@@ -123,7 +124,7 @@ X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=3 \
 
 - readは`status`、`data`、`errors`、provider `meta / includes`、request `_meta`を返す。
 - prepareはnormalized text、validation、manifest hash / HMAC、account / credential app / approval binding、expiry、call planを返す。
-- send成功はaccount ID、app ID、content ID、post ID / URL、content hash、canonical ledger path、rate metadataを返す。
+- prepare / sendはmarkerから解決したworkspace rootと解決根拠を返す。send成功はaccount ID、app ID、content ID、post ID / URL、content hash、canonical ledger path、rate metadataも返す。
 - failureはsecretを含まないstructured errorをstderrへ返してnon-zero exitする。
 - `unknown`、`partial`、`empty`、`rate_limited`、`confirmed_absent`、`unresolved`を意味どおり区別する。
 

@@ -20,11 +20,11 @@
 
 `send`はmanifest外の本文、file、account override、ledger pathを受け取らない。invalid / expired / tampered manifestはcredential解決、identity API、ledger attempt、external writeより前に拒否する。
 
-validationは最低限、空白のみ、control character、NFC、weighted limit 280、URL count、cashtag countを扱う。skin tone、ZWJ family / profession、regional flagを1 emoji cluster = weight 2として扱い、URLは23へ置換する。platform / plan固有制約は実行時の公式仕様を確認する。
+validationは最低限、空白のみ、control character、NFC、weighted limit 280、URL count、cashtag count、quote target countを扱う。skin tone、ZWJ family / profession、regional flagを1 emoji cluster = weight 2として扱い、URLは23へ置換する。`x.com` / `twitter.com`のstatus URLは、`quote_tweet_id`を使わなくても公開時にquote cardを生成するため、`UNDECLARED_QUOTE_TARGET`で既定拒否する。この0.x capabilityにはquoteを承認するbypass flagを置かない。platform / plan固有制約は実行時の公式仕様を確認する。
 
 ## Canonical SQLite ledger
 
-post ledgerは`state/x-api/x-posts.sqlite3`、Project / Agent別daily call counterは`state/x-api/x-usage.sqlite3`に固定する。callerの任意pathやephemeral `.tmp` JSONLを受け付けない。
+post ledgerは最寄りの`.git` file / directory markerからworkspace rootを解決し、そのrootの`state/x-api/x-posts.sqlite3`へ固定する。Project / Agent別daily call counterも同じrootの`state/x-api/x-usage.sqlite3`へ固定する。callerの任意path、ephemeral `.tmp` JSONL、bundled scriptからの固定depthをroot根拠にしない。markerが見つからなければdatabaseを作らずfail closedにし、prepare / send出力へrootとmarker種別を残す。
 
 - WAL、`synchronous=FULL`、`BEGIN IMMEDIATE`を使う。
 - `(account_id, content_id)`と`(account_id, content_sha256)`をuniqueにする。
@@ -63,5 +63,5 @@ reconcileはcanonical ledgerのunknown intentだけを対象にする。
 - timeout、5xx、process crash後にblind retryしない。
 - SQLite fileを削除・差替えしてduplicate gateを回避しない。
 - approval後に本文、account、app、budget、expiryを書き換えない。
-- reply、quote、like、follow、DM、delete、mediaをこの0.x write capabilityへ追加しない。
+- reply、quote（本文中のX status URLによる暗黙quoteを含む）、like、follow、DM、delete、mediaをこの0.x write capabilityへ追加しない。
 - browserをfallback posting pathにしない。

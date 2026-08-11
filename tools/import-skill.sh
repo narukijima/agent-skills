@@ -48,7 +48,10 @@ source_repository="$(git -C "$repo_root" remote get-url origin 2>/dev/null || tr
 if [[ -z "$source_repository" ]]; then
   source_repository='local checkout (origin is not configured)'
 fi
-source_version="$(python3 - "$source_dir/SKILL.md" <<'PY'
+temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-skill-import.XXXXXX")"
+trap 'rm -rf "$temporary_dir"' EXIT
+source_version_file="$temporary_dir/source-version"
+python3 - "$source_dir/SKILL.md" "$source_version_file" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -78,17 +81,46 @@ for line in frontmatter:
             version = item.group(1)
             break
 
-print(version or legacy_version or "")
+Path(sys.argv[2]).write_text(version or legacy_version or "", encoding="utf-8")
 PY
-)"
+source_version="$(<"$source_version_file")"
 [[ -n "$source_version" ]] || { printf 'ERROR: source Skill has no version\n' >&2; exit 1; }
 
 mkdir -p "$target_root/skills"
-temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-skill-import.XXXXXX")"
-trap 'rm -rf "$temporary_dir"' EXIT
 cp -R "$source_dir" "$temporary_dir/$skill_name"
 find "$temporary_dir/$skill_name" \( -type d -name '__pycache__' \) -prune -exec rm -rf {} +
 find "$temporary_dir/$skill_name" -type f \( -name '*.pyc' -o -name '.DS_Store' \) -delete
+python3 - "$temporary_dir/$skill_name/SKILL.md" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+match = re.match(r"^---\n(.*?)\n---(?:\n|$)", text, re.S)
+if not match:
+    raise SystemExit("ERROR: source Skill has invalid frontmatter")
+frontmatter = match.group(1)
+status = re.search(r'^\s+claudagt\.status:\s*"(active|deprecated|retired)"\s*$', frontmatter, re.M)
+aliases = re.search(r'^\s+claudagt\.aliases:\s*"([^"]+)"\s*$', frontmatter, re.M)
+if not status or not aliases:
+    raise SystemExit("ERROR: source Skill has no agent-directory status / aliases metadata")
+if re.search(r"^(?:status|aliases):", frontmatter, re.M):
+    raise SystemExit("ERROR: source Skill unexpectedly contains legacy top-level status / aliases")
+alias_values = [value.strip() for value in aliases.group(1).split(",") if value.strip()]
+if not alias_values:
+    raise SystemExit("ERROR: source Skill has empty agent-directory aliases metadata")
+lines = frontmatter.splitlines()
+insert_at = next((index for index, line in enumerate(lines) if line.startswith("metadata:")), len(lines))
+projection = [
+    "status: " + status.group(1),
+    "aliases: [" + ", ".join(json.dumps(value, ensure_ascii=False) for value in alias_values) + "]",
+]
+lines[insert_at:insert_at] = projection
+projected = "---\n" + "\n".join(lines) + "\n---\n" + text[match.end():]
+path.write_text(projected, encoding="utf-8")
+PY
 mkdir -p "$temporary_dir/$skill_name/agents"
 cat > "$temporary_dir/$skill_name/agents/upstream.yaml" <<EOF
 source_repository: "$source_repository"
@@ -96,6 +128,7 @@ source_skill: "skills/$skill_name"
 source_commit: "$source_commit"
 source_version: "$source_version"
 import_mode: "vendored-copy"
+frontmatter_projection: "agent-directory-v1"
 imported_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF
 mv "$temporary_dir/$skill_name" "$destination"
