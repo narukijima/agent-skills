@@ -106,7 +106,7 @@ class AiNativeDesignContractTests(unittest.TestCase):
             top_level,
             {"name", "description", "license", "metadata"},
         )
-        self.assertIn('claudagt.version: "0.2.0"', frontmatter)
+        self.assertIn('claudagt.version: "0.2.1"', frontmatter)
         self.assertIn('claudagt.status: "active"', frontmatter)
         self.assertTrue((SKILL / "LICENSE.txt").is_file())
 

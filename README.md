@@ -39,7 +39,7 @@ canonical SkillはAgent Skills仕様に従い、version / status / aliasesを`me
 
 ### x-api
 
-X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。本文中のX status URLもquoteとして既定拒否し、ledger rootは`.git` markerから解決します。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
+X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。本文中のX status URLもquoteとして既定拒否し、ledger rootは`.git` markerから解決します。結果不明の投稿は`reconcile`がHTML escapeとt.co展開を復元して照合し、それでも証明できない`unknown`だけをgateway署名鍵と帯域外検証を条件とする`resolve`で監査付き手動解決します。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
 
 ```bash
 X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \
@@ -67,10 +67,11 @@ bash tools/validate-skills.sh
 python3 -m unittest discover -s tests -v
 python3 tools/score-behavior-eval.py --cases evals/ai-native-design/cases.json
 python3 tools/score-behavior-eval.py --cases evals/seo/cases.json
+python3 tools/score-behavior-eval.py --cases evals/x-api/cases.json
 ```
 
 CIでは上記に加えて、公式 `skills-ref` validatorを全Skillへ実行します。
-2つのscore commandはeval定義だけを検証し、`behavior_run: false` を返します。実behaviorをpassにするには、各promptを独立Agentで実行し、semantic criterionごとの判定と証拠を `--judgments` で採点します。keyword出現だけではpassにしません。
+score commandはeval定義だけを検証し、`behavior_run: false` を返します。実behaviorをpassにするには、各promptを独立Agentで実行し、semantic criterionごとの判定と証拠を `--judgments` で採点します。keyword出現だけではpassにしません。
 
 ## 位置づけ
 

@@ -90,7 +90,7 @@ class SeoSkillContractTests(unittest.TestCase):
             if (match := re.match(r"^([a-z][a-z0-9-]*):", line))
         }
         self.assertEqual(top_level, {"name", "description", "license", "metadata"})
-        self.assertIn('claudagt.version: "0.1.0"', frontmatter)
+        self.assertIn('claudagt.version: "0.2.0"', frontmatter)
         catalog = (ROOT / "skills/SKILLS.md").read_text(encoding="utf-8")
         metadata = (SKILL / "agents/openai.yaml").read_text(encoding="utf-8")
         self.assertIn("[`seo`](seo/SKILL.md)", catalog)
@@ -119,7 +119,7 @@ class SeoSkillContractTests(unittest.TestCase):
             projected = (imported / "SKILL.md").read_text(encoding="utf-8")
             upstream = (imported / "agents/upstream.yaml").read_text(encoding="utf-8")
             self.assertIn("status: active", projected)
-            self.assertIn('source_version: "0.1.0"', upstream)
+            self.assertIn('source_version: "0.2.0"', upstream)
             self.assertIn('import_mode: "vendored-copy"', upstream)
 
 
@@ -177,7 +177,8 @@ class SeoEvidenceToolTests(unittest.TestCase):
         )
         by_code = {item["code"]: item for item in result["signals"]}
         self.assertEqual(by_code["SEARCH_CRAWLER_BLOCKED"]["severity_candidate"], "Critical")
-        self.assertEqual(by_code["SEARCH_CRAWLER_BLOCKED"]["confidence"], "Confirmed")
+        self.assertEqual(by_code["SEARCH_CRAWLER_BLOCKED"]["evidence_state"], "observed")
+        self.assertNotIn("confidence", by_code["SEARCH_CRAWLER_BLOCKED"])
         for code in ("CANONICAL_MISMATCH", "SITEMAP_REDIRECT", "SITEMAP_NOINDEX", "SITEMAP_NON_CANONICAL"):
             self.assertIn(code, by_code)
         self.assertTrue(all(item["needs_diagnosis"] for item in result["signals"]))

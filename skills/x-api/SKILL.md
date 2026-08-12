@@ -3,7 +3,7 @@ name: x-api
 description: Use when an agent must explicitly retrieve paid X API v2 data or prepare, send, or reconcile one text post through a manifest, expected-account binding, budgets, and canonical SQLite ledger.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.5.1"
+  claudagt.version: "0.6.0"
   claudagt.status: "active"
   claudagt.aliases: "x api,twitter-api"
 ---
@@ -17,7 +17,7 @@ metadata:
 対応範囲:
 
 - read: authenticated user、user lookup、post lookup、user posts、recent search、usage
-- write: 単独の通常テキスト投稿を `prepare` → `send` → 必要時 `reconcile` で扱う
+- write: 単独の通常テキスト投稿を `prepare` → `send` → 必要時 `reconcile` で扱う。`reconcile`が証明できない`unknown`だけを、gateway署名鍵と帯域外検証を条件とする`resolve`で監査付き手動解決する
 - 対象外: reply、quote（本文中のX status URLによるquote cardも含む）、like、follow、DM、delete、media upload、browser posting、Analytics UI
 
 write capabilityはbetaである。canonical SQLite ledgerは同一workspace内で、同じbundled scriptとdatabaseを使う複数processを直列化するが、任意コードを実行できる敵対的Agentや複数machineのglobal uniquenessは保証しない。複数Agent / machine / accountの完全無人運用は、署名鍵、資格情報、予算設定、bundled script、canonical databaseを一般Agentから隔離して所有する専用single-writer gateway経由でのみ採用する。
@@ -110,7 +110,7 @@ X_POSTING_ENABLED=true X_API_WRITE_MAX_CALLS=3 X_API_APP_ID=x-production \
 
 ### 3. Reconcile
 
-結果が`unknown`なら再送せず、同じaccountのrecent postsとcanonical hash / attempt timeを照合する。見つかれば`confirmed_success`、取得windowがattempt時刻を覆って不在なら`confirmed_absent`、証明できなければ`unresolved`のまま止める。
+結果が`unknown`なら再送せず、同じaccountのrecent postsとcanonical hash / attempt timeを照合する。X APIが返すtextはHTML escape(`&amp;`等)とt.co短縮を含むため、照合はraw、unescape後、`entities.urls`のexpanded URLで復元した候補textすべてのhashで行う。見つかれば`confirmed_success`、取得windowがattempt時刻を覆って不在なら`confirmed_absent`(URL変換でhashが変わり得るURL入り本文は不在確定しない)、証明できなければ`unresolved`のまま止める。
 
 ```bash
 X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=3 \
@@ -120,11 +120,24 @@ X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=3 \
   --expected-user-id 123456789
 ```
 
+### 4. Resolve — reconcileが証明できないときの唯一の手動解決
+
+URL入り本文のtimeoutなど、`reconcile`を繰り返しても`unknown`が解決できない場合だけ使う。gateway-owned `X_API_MANIFEST_SIGNING_KEY`の保持を権限条件とし、実postの有無を帯域外(X UI等)で確認した上で、`--outcome sent --post-id <実ID>`または`--outcome confirmed_absent`と必須`--reason`を渡す。結果はevent tableへ`manual-resolve`として監査記録され、`sent`は永続duplicate拒否、`confirmed_absent`は新しい署名済みapproval_idによる再attemptだけを許す。SQLiteの直接編集・削除でこの手順を代替しない。
+
+```bash
+X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
+python3 skills/x-api/scripts/x_api.py --pretty resolve \
+  --content-id 2026-08-10-001 --expected-user-id 123456789 \
+  --outcome confirmed_absent \
+  --reason 'X UIで2026-08-10T12:00Z-12:30Zのtimelineを目視確認、該当postなし'
+```
+
 ## 出力契約
 
 - readは`status`、`data`、`errors`、provider `meta / includes`、request `_meta`を返す。
 - prepareはnormalized text、validation、manifest hash / HMAC、account / credential app / approval binding、expiry、call planを返す。
 - prepare / sendはmarkerから解決したworkspace rootと解決根拠を返す。send成功はaccount ID、app ID、content ID、post ID / URL、content hash、canonical ledger path、rate metadataも返す。
+- resolveは`manual-resolve` event、outcome、reason、ledger pathを返す。
 - failureはsecretを含まないstructured errorをstderrへ返してnon-zero exitする。
 - `unknown`、`partial`、`empty`、`rate_limited`、`confirmed_absent`、`unresolved`を意味どおり区別する。
 
@@ -136,7 +149,7 @@ X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=3 \
 
 - `send`をraw text、任意file、任意ledger pathで呼べるinterfaceへ戻さない。
 - expected user IDをusername、display name、credential存在で代用しない。
-- `unknown`をflag一つでretry可能にしない。
+- `unknown`をflag一つでretry可能にしない。手動解決は署名鍵、帯域外検証の`--reason`、監査eventを必須とする`resolve`だけに限定する。
 - local SQLiteを複数machineのdistributed lockと主張しない。
 - tokenを一般Agentのprompt、log、manifest、databaseへ保存しない。
 - response bodyだけを返してrate limit、partial errors、request metadataを捨てない。

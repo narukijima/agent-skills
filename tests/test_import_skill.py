@@ -54,7 +54,7 @@ class ImportSkillTests(unittest.TestCase):
             skill = (imported / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("status: active", skill)
             self.assertIn('aliases: ["ai native design", "ai ui"]', skill)
-            self.assertIn('source_version: "0.2.0"', upstream)
+            self.assertIn('source_version: "0.2.1"', upstream)
             self.assertIn('import_mode: "vendored-copy"', upstream)
             self.assertIn('frontmatter_projection: "agent-directory-v1"', upstream)
 

@@ -70,6 +70,27 @@ if len(text.encode("utf-8")) > 20 * 1024:
 for heading in ("## 使用するKnowledge", "### Required", "### Conditional"):
     if heading not in text:
         raise SystemExit("missing required heading: " + heading)
+openai_path = skill_dir / "agents" / "openai.yaml"
+if not openai_path.is_file():
+    raise SystemExit("missing agents/openai.yaml")
+openai_text = openai_path.read_text(encoding="utf-8")
+display = re.search(r'^\s+display_name:\s*"([^"\n]+)"\s*$', openai_text, re.M)
+short = re.search(r'^\s+short_description:\s*"([^"\n]+)"\s*$', openai_text, re.M)
+prompt = re.search(r'^\s+default_prompt:\s*"([^"\n]+)"\s*$', openai_text, re.M)
+implicit = re.search(r"^\s+allow_implicit_invocation:\s*(true|false)\s*$", openai_text, re.M)
+if not display:
+    raise SystemExit("agents/openai.yaml requires a quoted interface.display_name")
+if not short or not 25 <= len(short.group(1)) <= 64:
+    raise SystemExit("agents/openai.yaml short_description must be a quoted 25-64 character string")
+if not prompt or ("$" + skill_dir.name) not in prompt.group(1):
+    raise SystemExit("agents/openai.yaml default_prompt must reference $" + skill_dir.name)
+if not implicit:
+    raise SystemExit("agents/openai.yaml requires policy.allow_implicit_invocation: true or false")
+catalog_path = skill_dir.parent / "SKILLS.md"
+if not catalog_path.is_file():
+    raise SystemExit("missing skills/SKILLS.md catalog")
+if "[`" + skill_dir.name + "`](" + skill_dir.name + "/SKILL.md)" not in catalog_path.read_text(encoding="utf-8"):
+    raise SystemExit("skill is not registered in skills/SKILLS.md")
 PY
   then
     printf 'FAIL: invalid skill contract: %s\n' "$skill_dir" >&2

@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SEVERITY_RANK = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
 
 
@@ -216,7 +216,7 @@ def signal(
         "issue": issue,
         "evidence": evidence,
         "impact": impact,
-        "confidence": "Confirmed",
+        "evidence_state": "observed",
         "severity_candidate": severity,
         "needs_diagnosis": True,
     }

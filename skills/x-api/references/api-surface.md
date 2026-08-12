@@ -11,11 +11,14 @@
 | posts by ID | GET | `/2/tweets?ids=...` | App or User | 1 |
 | user posts | GET | `/2/users/:id/tweets` | App or User | 1 |
 | recent search | GET | `/2/tweets/search/recent` | App or User | 1 |
-| project usage | GET | `/2/usage/tweets` | selected read auth | 1 |
+| project usage | GET | `/2/usage/tweets` | App-only (`X_BEARER_TOKEN`) | 1 |
 | text post workflow | POST/GET/POST | `/2/oauth2/token` (conditional), `/2/users/me`, `/2/tweets` | User context | maximum 3 |
 | OAuth 2.0 refresh | POST | `/2/oauth2/token` | client authentication | user-context operationの予算へ含める |
+| manual resolve | なし (API callなし) | canonical ledgerのみ | gateway-owned signing key | 0 |
 
-readは`X_API_READ_ENABLED=true`と`X_API_READ_MAX_CALLS`、sendは`X_POSTING_ENABLED=true`とexact `X_API_WRITE_MAX_CALLS=3`を必須にする。App-only readは1 call、OAuth refreshの可能性がある通常のUser-context readは最大2 call、reconcileは最大3 callを事前予約する。両方で`X_API_PROJECT_ID`、`X_API_AGENT_ID`、kind別`X_API_DAILY_READ_CALL_LIMIT` / `X_API_DAILY_WRITE_CALL_LIMIT`をSQLiteへ予約し、累積上限を超えたcall planを外部request前に拒否する。`max_results`がAPI範囲外ならclampせず失敗させる。
+readは`X_API_READ_ENABLED=true`と`X_API_READ_MAX_CALLS`、sendは`X_POSTING_ENABLED=true`とexact `X_API_WRITE_MAX_CALLS=3`を必須にする。App-only readは1 call、OAuth refreshの可能性がある通常のUser-context readは最大2 call、reconcileは最大3 callを事前予約する。両方で`X_API_PROJECT_ID`、`X_API_AGENT_ID`、kind別`X_API_DAILY_READ_CALL_LIMIT` / `X_API_DAILY_WRITE_CALL_LIMIT`をSQLiteへ予約し、累積上限を超えたcall planを外部request前に拒否する。`max_results`がAPI範囲外ならclampせず失敗させる。`--user-id`と`expected_user_id`は数値のstable X user IDだけを受け付ける。
+
+daily予約は外部callの前に行い、その後のpre-flight拒否(fingerprint / identity mismatch等)や失敗でも返還しない。予約は課金上限の過小評価を防ぐ安全側の設計であり、拒否が続く構成では予約分だけdaily budgetが早く尽きる。
 
 これらの予算値とProject / Agent IDは、一般Agentが書き換えられないgateway-owned設定であることを前提にする。同じcallerが環境変数やusage databaseを変更できる構成では、ローカルcounterを強制的な課金上限とはみなさない。
 
@@ -60,6 +63,8 @@ readはprovider bodyを次へ正規化する。
 2xxで`data`と`errors`が併存すれば`partial`、errorだけなら`failed`、dataが空なら`empty`とする。成功responseのrate-limit headerも返す。HTTP 429は`retry_after` / resetを返し、自動sleep / loopしない。
 
 ## OAuth 2.0 rotation safety
+
+token storeの排他は`fcntl` file lockへ依存するため、OAuth 2.0 refresh経路はPOSIX環境専用である。`fcntl`のないplatformではrefreshを実行せずfail closedにする。
 
 refresh request直前にsecretを含まない`<store>.refresh-pending`を0600 / fsyncでwrite-ahead保存する。storeは0600 temporary fileからatomic replaceし、file / parent directoryをfsyncする。response不明、5xx、access token欠落、rotated token保存失敗はcredential state unknownとしてmarkerを残し、自動refreshを止めてreauthorizationを要求する。4xx rejectionはrequestが確定拒否されたためmarkerをclearする。
 

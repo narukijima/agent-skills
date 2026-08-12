@@ -5,6 +5,8 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -574,6 +576,118 @@ class XApiTests(unittest.TestCase):
                 self.assertTrue(url_result["_meta"]["reconciliation"]["contains_url"])
                 self.assertGreater(old_id, 0)
 
+    def test_reconcile_matches_html_escaped_and_tco_expanded_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "posts.sqlite3"
+            amp_path = Path(directory) / "amp.json"
+            url_path = Path(directory) / "url.json"
+            make_manifest(amp_path, "A & B")
+            make_manifest(url_path, "see https://example.com/article", content_id="c-url")
+            with patch.object(x_api, "CANONICAL_LEDGER_PATH", database):
+                x_api.reserve_attempt(load_signed_manifest(amp_path))
+                attempted = datetime.now(timezone.utc)
+                amp_payload = {"data": [{"id": "801", "text": "A &amp; B", "created_at": attempted.isoformat()}]}
+                args = x_api.build_parser().parse_args(["reconcile", "--content-id", "c-1", "--expected-user-id", "42"])
+                with patch.dict(os.environ, READ_ENV, clear=False), patch.object(
+                    x_api, "api_request", side_effect=[identity_response(), (200, amp_payload, {})]
+                ):
+                    result = x_api.reconcile(args)
+                self.assertEqual(result["status"], "confirmed_success")
+                self.assertEqual(result["post_id"], "801")
+
+                x_api.reserve_attempt(load_signed_manifest(url_path))
+                url_payload = {"data": [{
+                    "id": "802",
+                    "text": "see https://t.co/abc123",
+                    "created_at": attempted.isoformat(),
+                    "entities": {"urls": [{"url": "https://t.co/abc123", "expanded_url": "https://example.com/article"}]},
+                }]}
+                url_args = x_api.build_parser().parse_args(["reconcile", "--content-id", "c-url", "--expected-user-id", "42"])
+                with patch.dict(os.environ, READ_ENV, clear=False), patch.object(
+                    x_api, "api_request", side_effect=[identity_response(), (200, url_payload, {})]
+                ):
+                    url_result = x_api.reconcile(url_args)
+                self.assertEqual(url_result["status"], "confirmed_success")
+                self.assertEqual(url_result["post_id"], "802")
+
+    def test_manual_resolve_requires_key_reason_and_unknown_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "posts.sqlite3"
+            manifest_path = Path(directory) / "approved.json"
+            retry_path = Path(directory) / "retry.json"
+            make_manifest(manifest_path, "see https://example.com")
+            make_manifest(retry_path, "see https://example.com", approval_id="approval-2")
+            with patch.object(x_api, "CANONICAL_LEDGER_PATH", database):
+                x_api.reserve_attempt(load_signed_manifest(manifest_path))
+                args = x_api.build_parser().parse_args([
+                    "resolve", "--content-id", "c-1", "--expected-user-id", "42",
+                    "--outcome", "confirmed_absent", "--reason", "checked the X UI timeline",
+                ])
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(x_api.ApiFailure) as no_key:
+                        x_api.resolve_manual(args)
+                self.assertIn("X_API_MANIFEST_SIGNING_KEY", str(no_key.exception))
+                env = {"X_API_MANIFEST_SIGNING_KEY": SIGNING_KEY}
+                sent_args = x_api.build_parser().parse_args([
+                    "resolve", "--content-id", "c-1", "--expected-user-id", "42",
+                    "--outcome", "sent", "--reason", "found the post in the X UI",
+                ])
+                with patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(x_api.ApiFailure) as missing_post:
+                        x_api.resolve_manual(sent_args)
+                    self.assertIn("--post-id", str(missing_post.exception))
+                    result = x_api.resolve_manual(args)
+                self.assertEqual(result["status"], "confirmed_absent")
+                self.assertEqual(result["event"], "manual-resolve")
+                with patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(x_api.ApiFailure) as not_unknown:
+                        x_api.resolve_manual(args)
+                self.assertIn("current status", str(not_unknown.exception))
+                self.assertGreater(x_api.reserve_attempt(load_signed_manifest(retry_path)), 0)
+            connection = sqlite3.connect(database)
+            event = connection.execute("SELECT detail FROM events WHERE event='manual-resolve'").fetchone()
+            connection.close()
+            self.assertIsNotNone(event)
+            self.assertIn("checked the X UI timeline", event[0])
+
+    def test_script_outside_git_fails_closed_with_structured_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "x_api.py"
+            script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+            manifest = Path(directory) / "approved.json"
+            help_run = subprocess.run(
+                [sys.executable, str(script), "--help"],
+                capture_output=True, text=True, cwd=directory, check=False,
+            )
+            self.assertEqual(help_run.returncode, 0, help_run.stderr)
+            env = {**os.environ, "X_API_MANIFEST_SIGNING_KEY": SIGNING_KEY}
+            prepare_run = subprocess.run(
+                [sys.executable, str(script), "prepare", "--manifest", str(manifest), "--text", "hello",
+                 "--content-id", "c-1", "--expected-user-id", "42", "--app-id", "a",
+                 "--expected-app-fingerprint", APP_FINGERPRINT, "--approval-id", "ap-1"],
+                capture_output=True, text=True, cwd=directory, env=env, check=False,
+            )
+            self.assertEqual(prepare_run.returncode, 1, prepare_run.stderr)
+            detail = json.loads(prepare_run.stderr)
+            self.assertIn("workspace root is unavailable", detail["error"])
+            self.assertFalse(manifest.exists())
+
+    def test_user_id_must_be_numeric_and_usage_is_app_only(self):
+        args = x_api.build_parser().parse_args(["user-by-id", "--user-id", "me?injected"])
+        with patch.dict(os.environ, READ_ENV, clear=True):
+            with self.assertRaises(x_api.ApiFailure) as raised:
+                x_api.dispatch(args)
+        self.assertIn("numeric X user ID", str(raised.exception))
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "m.json"
+            with self.assertRaises(x_api.ApiFailure):
+                make_manifest(manifest, expected_user_id="not-numeric")
+            self.assertFalse(manifest.exists())
+        with self.assertRaises(x_api.ApiFailure) as usage_user:
+            x_api.choose_auth("usage", "user")
+        self.assertIn("app-only", str(usage_user.exception))
+        self.assertEqual(x_api.choose_auth("usage", "auto"), "app")
+
     def test_partial_oauth1_environment_is_an_error(self):
         with patch.dict(os.environ, {"X_API_KEY": "key", "X_ACCESS_TOKEN": "token"}, clear=True):
             with self.assertRaises(x_api.ApiFailure) as raised:
@@ -720,19 +834,19 @@ class XApiTests(unittest.TestCase):
             with self.assertRaises(x_api.ApiFailure):
                 x_api.resolve_base_url()
 
-    def test_skill_v051_contract_and_metadata_are_consistent(self):
+    def test_skill_v060_contract_and_metadata_are_consistent(self):
         skill = (SCRIPT.parents[1] / "SKILL.md").read_text(encoding="utf-8")
         metadata = (SCRIPT.parents[1] / "agents" / "openai.yaml").read_text(encoding="utf-8")
-        self.assertIn('claudagt.version: "0.5.1"', skill)
+        self.assertIn('claudagt.version: "0.6.0"', skill)
         self.assertIn('claudagt.aliases: "x api,twitter-api"', skill)
         self.assertIn("license: MIT. See LICENSE.txt", skill)
         self.assertTrue((SCRIPT.parents[1] / "LICENSE.txt").is_file())
-        for term in ("prepare", "send", "reconcile", "expected_user_id", "x-posts.sqlite3"):
+        for term in ("prepare", "send", "reconcile", "resolve", "expected_user_id", "x-posts.sqlite3"):
             self.assertIn(term, skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
         parser = x_api.build_parser()
         choices = parser._subparsers._group_actions[0].choices
-        self.assertTrue({"prepare", "send", "reconcile", "usage"}.issubset(choices))
+        self.assertTrue({"prepare", "send", "reconcile", "resolve", "usage"}.issubset(choices))
 
 
 if __name__ == "__main__":

@@ -43,12 +43,23 @@ reconcileはcanonical ledgerのunknown intentだけを対象にする。
 
 1. ledgerからaccount、hash、attempt timeを取得する。
 2. `/2/users/me`で同じaccountを再確認する。
-3. accountのrecent original postsを最大100件取得する。
-4. postの`created_at`がattemptの30秒前から5分後に入り、normalized text hashも一致するときだけ`confirmed_success`としてpost IDを記録する。古い同文postは一致に使わない。
-5. URLを含まない本文に限り、errorのない取得timelineの最古・最新時刻がattempt timeを挟み、その範囲に一致postがなければ`confirmed_absent`とする。X側のURL短縮・表示変換でexact hashが変わり得る本文は不在確定しない。
+3. accountのrecent original postsを`entities`付きで最大100件取得する。
+4. postの`created_at`がattemptの30秒前から5分後に入り、normalized text hashが一致するときだけ`confirmed_success`としてpost IDを記録する。X APIのtextはHTML escape(`&amp;` / `&lt;` / `&gt;`)とt.co短縮を含むため、hash照合はraw text、unescape後text、`entities.urls`のexpanded URLで復元したtextの候補すべてに対して行う。古い同文postは一致に使わない。
+5. URLを含まない本文に限り、errorのない取得timelineの最古・最新時刻がattempt timeを挟み、その範囲に一致postがなければ`confirmed_absent`とする。t.co展開が元textを完全復元できるとは限らないため、URL入り本文は自動では不在確定しない。
 6. window coverageを証明できなければ`unresolved`を維持する。
 
 `failed`または`confirmed_absent`だけが、新しい`approval_id`を持つ署名済みmanifestによる再attemptを許す。timelineのempty response、partial error、URL変換、狭いwindowを「投稿なし」と推測しない。
+
+## Manual resolve
+
+reconcileを繰り返しても証明できない`unknown`(典型例はURL入り本文のtimeout)は、放置すると同一accountの新規sendを恒久停止させる。この場合だけ、`resolve`コマンドを唯一の正規脱出路として使う。
+
+- 権限条件はgateway-owned `X_API_MANIFEST_SIGNING_KEY`の保持である。一般Agentには鍵を渡さないため実行できない。
+- 実postの有無をX UIなど帯域外で確認し、その証拠を必須`--reason`へ記述する。
+- 実在を確認したら`--outcome sent --post-id <実ID>`で記録し、以後は永続duplicate拒否になる。
+- 不在を確認したら`--outcome confirmed_absent`で記録し、新しい署名済み`approval_id`による再attemptだけを許す。
+- どちらも`manual-resolve` eventとしてoutcome / reasonをevent tableへ監査記録する。
+- `unknown`以外のintentには適用できない。SQLite fileの直接編集・削除・差し替えでこの手順を代替しない。
 
 ## Secrets and transport
 

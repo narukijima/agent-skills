@@ -127,9 +127,11 @@ lines[insert_at:insert_at] = projection
 projected = "---\n" + "\n".join(lines) + "\n---\n" + text[match.end():]
 path.write_text(projected, encoding="utf-8")
 PY
+escaped_repository="${source_repository//\\/\\\\}"
+escaped_repository="${escaped_repository//\"/\\\"}"
 mkdir -p "$temporary_dir/$skill_name/agents"
 cat > "$temporary_dir/$skill_name/agents/upstream.yaml" <<EOF
-source_repository: "$source_repository"
+source_repository: "$escaped_repository"
 source_skill: "skills/$skill_name"
 source_commit: "$source_commit"
 source_version: "$source_version"

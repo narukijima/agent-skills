@@ -127,14 +127,31 @@ def resolve_workspace_root(script_path: Optional[Path] = None) -> Tuple[Path, st
     )
 
 
-WORKSPACE_ROOT, WORKSPACE_ROOT_RESOLUTION = resolve_workspace_root()
-CANONICAL_LEDGER_PATH = WORKSPACE_ROOT / "state/x-api/x-posts.sqlite3"
+WORKSPACE_ROOT: Optional[Path] = None
+WORKSPACE_ROOT_RESOLUTION: Optional[str] = None
+CANONICAL_LEDGER_PATH: Optional[Path] = None
+
+
+def workspace_root_info() -> Tuple[Path, str]:
+    """Resolve and cache the workspace root on first use, never at import time."""
+    global WORKSPACE_ROOT, WORKSPACE_ROOT_RESOLUTION
+    if WORKSPACE_ROOT is None or WORKSPACE_ROOT_RESOLUTION is None:
+        WORKSPACE_ROOT, WORKSPACE_ROOT_RESOLUTION = resolve_workspace_root()
+    return WORKSPACE_ROOT, WORKSPACE_ROOT_RESOLUTION
+
+
+def canonical_ledger_path() -> Path:
+    global CANONICAL_LEDGER_PATH
+    if CANONICAL_LEDGER_PATH is None:
+        CANONICAL_LEDGER_PATH = workspace_root_info()[0] / "state/x-api/x-posts.sqlite3"
+    return CANONICAL_LEDGER_PATH
 
 
 def workspace_metadata() -> Dict[str, str]:
+    root, resolution = workspace_root_info()
     return {
-        "workspace_root": str(WORKSPACE_ROOT),
-        "workspace_root_resolution": WORKSPACE_ROOT_RESOLUTION,
+        "workspace_root": str(root),
+        "workspace_root_resolution": resolution,
     }
 
 
@@ -447,6 +464,10 @@ def authorization_for_credentials(method: str, url: str, params: Optional[Dict[s
 def choose_auth(operation: str, requested: str) -> str:
     if operation in {"me", "send", "reconcile"} and requested == "app":
         raise ApiFailure(operation + " requires user-context authentication; do not use --auth app")
+    if operation == "usage":
+        if requested == "user":
+            raise ApiFailure("usage requires app-only authentication; set X_BEARER_TOKEN and do not use --auth user")
+        return "app"
     if requested in {"user", "app"}:
         return requested
     if operation in {"me", "send", "reconcile"}:
@@ -753,6 +774,8 @@ def configured_app_fingerprint(user_credentials: Tuple[str, Dict[str, str]]) -> 
 
 
 def prepare_manifest(args: argparse.Namespace) -> Any:
+    workspace = workspace_metadata()  # fail closed before writing any manifest
+    require_numeric_user_id(args.expected_user_id, "expected_user_id")
     if args.text is not None and args.file is not None:
         raise ApiFailure("use either --text or --file, not both")
     if args.text is None and args.file is None:
@@ -784,7 +807,7 @@ def prepare_manifest(args: argparse.Namespace) -> Any:
         "manifest": str(Path(args.manifest)),
         "validation": validation,
         **manifest,
-        **workspace_metadata(),
+        **workspace,
     }
 
 
@@ -851,7 +874,7 @@ def reserve_daily_calls(kind: str, planned_calls: int) -> Dict[str, Any]:
         raise ApiFailure(variable + " must be an integer") from exc
     if daily_limit < planned_calls:
         raise ApiFailure(variable + " is smaller than the planned API calls")
-    path = CANONICAL_LEDGER_PATH.with_name("x-usage.sqlite3")
+    path = canonical_ledger_path().with_name("x-usage.sqlite3")
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30, isolation_level=None)
     connection.row_factory = sqlite3.Row
@@ -900,8 +923,9 @@ def reserve_daily_calls(kind: str, planned_calls: int) -> Dict[str, Any]:
 
 
 def open_ledger() -> sqlite3.Connection:
-    CANONICAL_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(CANONICAL_LEDGER_PATH, timeout=30, isolation_level=None)
+    ledger_path = canonical_ledger_path()
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(ledger_path, timeout=30, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=30000")
     try:
@@ -1087,7 +1111,7 @@ def send_manifest(args: argparse.Namespace) -> Any:
         "app_id": manifest["app_id"],
         "content_id": manifest["content_id"],
         "content_sha256": manifest["content_sha256"],
-        "ledger": str(CANONICAL_LEDGER_PATH),
+        "ledger": str(canonical_ledger_path()),
         **workspace_metadata(),
         "post_id": post_id,
         "url": "https://x.com/i/web/status/" + post_id,
@@ -1101,6 +1125,12 @@ def validate_max_results(requested: int, minimum: int, maximum: int) -> str:
     return str(requested)
 
 
+def require_numeric_user_id(value: Any, label: str) -> str:
+    if not str(value).isdigit():
+        raise ApiFailure(label + " must be a stable numeric X user ID")
+    return str(value)
+
+
 def _ledger_intent(account_id: str, content_id: str) -> sqlite3.Row:
     connection = open_ledger()
     try:
@@ -1112,8 +1142,31 @@ def _ledger_intent(account_id: str, content_id: str) -> sqlite3.Row:
         connection.close()
 
 
+def _unescape_provider_text(text: str) -> str:
+    """X API v2 returns post text with &, <, and > HTML-escaped; undo exactly those."""
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _provider_text_variants(post: Dict[str, Any]) -> List[str]:
+    """Candidate texts for canonical-hash comparison: raw, HTML-unescaped, t.co-expanded."""
+    raw = str(post.get("text", ""))
+    unescaped = _unescape_provider_text(raw)
+    expanded = unescaped
+    entities = post.get("entities")
+    url_items = entities.get("urls") if isinstance(entities, dict) else None
+    for item in url_items or []:
+        if isinstance(item, dict) and item.get("url") and item.get("expanded_url"):
+            expanded = expanded.replace(str(item["url"]), str(item["expanded_url"]))
+    variants: List[str] = []
+    for variant in (raw, unescaped, expanded):
+        if variant not in variants:
+            variants.append(variant)
+    return variants
+
+
 def reconcile(args: argparse.Namespace) -> Any:
     require_read_budget(3)
+    require_numeric_user_id(args.expected_user_id, "expected_user_id")
     row = _ledger_intent(args.expected_user_id, args.content_id)
     if row["status"] != "unknown":
         return {"status": row["status"], "content_id": args.content_id, "account_id": args.expected_user_id, "reconciled": False}
@@ -1126,7 +1179,7 @@ def reconcile(args: argparse.Namespace) -> Any:
         raise ApiFailure("authenticated X account does not match reconciliation account")
     status, payload, metadata = api_request(
         "GET", "/2/users/" + quote(args.expected_user_id, safe="") + "/tweets", "user",
-        params={"max_results": "100", "tweet.fields": "created_at", "exclude": "replies,retweets"},
+        params={"max_results": "100", "tweet.fields": "created_at,entities", "exclude": "replies,retweets"},
         user_credentials=user_credentials,
     )
     posts = payload.get("data") if isinstance(payload, dict) else None
@@ -1138,9 +1191,9 @@ def reconcile(args: argparse.Namespace) -> Any:
         if not isinstance(post, dict) or not post.get("created_at"):
             continue
         created_at = parse_timestamp(str(post["created_at"]), "post created_at")
-        if (
-            match_window_start <= created_at <= match_window_end
-            and content_sha256(str(post.get("text", ""))) == row["content_sha256"]
+        if match_window_start <= created_at <= match_window_end and any(
+            content_sha256(variant) == row["content_sha256"]
+            for variant in _provider_text_variants(post)
         ):
             match = post
             break
@@ -1170,6 +1223,42 @@ def reconcile(args: argparse.Namespace) -> Any:
     }
     record_result(int(row["id"]), "unknown", status, detail=evidence, event="reconcile")
     return {"status": "unresolved", "content_id": args.content_id, "account_id": args.expected_user_id, "_meta": {"budget": budget_record, "reconciliation": evidence, **metadata}}
+
+
+def resolve_manual(args: argparse.Namespace) -> Any:
+    """Resolve an unknown intent from out-of-band evidence; gated by the gateway-owned signing key."""
+    manifest_signing_key()
+    require_numeric_user_id(args.expected_user_id, "expected_user_id")
+    reason = args.reason.strip()
+    if not reason:
+        raise ApiFailure("resolve requires a non-empty --reason describing the out-of-band verification")
+    if args.outcome == "sent":
+        if not args.post_id or not str(args.post_id).isdigit():
+            raise ApiFailure("resolve --outcome sent requires the verified numeric --post-id")
+    elif args.post_id:
+        raise ApiFailure("--post-id is only valid with --outcome sent")
+    row = _ledger_intent(args.expected_user_id, args.content_id)
+    if row["status"] != "unknown":
+        raise ApiFailure("manual resolve only applies to an unknown intent; current status: " + str(row["status"]))
+    post_id = str(args.post_id) if args.outcome == "sent" else None
+    record_result(
+        int(row["id"]), args.outcome, post_id=post_id,
+        detail={"manual_resolve": args.outcome, "reason": reason},
+        event="manual-resolve",
+    )
+    result = {
+        "status": args.outcome,
+        "event": "manual-resolve",
+        "content_id": args.content_id,
+        "account_id": args.expected_user_id,
+        "reason": reason,
+        "ledger": str(canonical_ledger_path()),
+        **workspace_metadata(),
+    }
+    if post_id:
+        result["post_id"] = post_id
+        result["url"] = "https://x.com/i/web/status/" + post_id
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1210,11 +1299,22 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser = sub.add_parser("reconcile", help="resolve an unknown canonical-ledger result before retry")
     reconcile_parser.add_argument("--content-id", required=True)
     reconcile_parser.add_argument("--expected-user-id", required=True)
+    resolve_parser = sub.add_parser(
+        "resolve",
+        help="manually resolve an unknown intent that reconcile cannot prove, using the gateway-owned signing key and out-of-band evidence",
+    )
+    resolve_parser.add_argument("--content-id", required=True)
+    resolve_parser.add_argument("--expected-user-id", required=True)
+    resolve_parser.add_argument("--outcome", required=True, choices=["sent", "confirmed_absent"])
+    resolve_parser.add_argument("--post-id", help="verified post ID; required for --outcome sent")
+    resolve_parser.add_argument("--reason", required=True, help="out-of-band verification evidence recorded to the audit event")
     return parser
 
 
 def dispatch(args: argparse.Namespace) -> Any:
     auth = choose_auth(args.command, args.auth)
+    if args.command in {"user-by-id", "posts"}:
+        require_numeric_user_id(args.user_id, "--user-id")
     if args.command == "posts":
         validate_max_results(args.max_results, 5, 100)
     if args.command == "search-recent":
@@ -1256,6 +1356,8 @@ def dispatch(args: argparse.Namespace) -> Any:
         return send_manifest(args)
     if args.command == "reconcile":
         return reconcile(args)
+    if args.command == "resolve":
+        return resolve_manual(args)
     raise ApiFailure("unsupported command")
 
 

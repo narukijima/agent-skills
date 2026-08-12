@@ -84,7 +84,7 @@ python3 skills/seo/scripts/seo_evidence.py audit-inventory --input inventory.jso
 python3 skills/seo/scripts/seo_evidence.py extract-html --url https://example.test/page --html saved.html
 ```
 
-`crawler_role: "search"` and `scope: "site"` must come from a verified measurement, not a guessed User-Agent. The output uses `severity_candidate` and `needs_diagnosis`; the Agent still confirms population, impact, root cause and final Finding.
+`crawler_role: "search"` and `scope: "site"` must come from a verified measurement, not a guessed User-Agent. The output marks every signal `evidence_state: observed` with `severity_candidate` and `needs_diagnosis`; a signal is a recorded observation, not a `Confirmed` diagnosis on the Skill's claim scale. The Agent still confirms population, impact, root cause and final Finding.
 
 ## Index-state diagnosis
 

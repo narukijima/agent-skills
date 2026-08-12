@@ -1,9 +1,9 @@
 ---
 name: ai-native-design
-description: AI固有の状態や操作を含むWeb UIを調査・設計・実装・review・改善するときに使う。対象はchat、reasoning summary、tool call、approval、streaming、sources、artifact、multi-agent、generative UI、AI dashboard。一般的なLP、ブランドサイト、通常Web UI、backendだけの変更には使わない。
+description: AI固有の状態や操作を含むWeb UIの調査・設計・実装・review・改善に使う。対象はchat、reasoning summary、tool call、approval、streaming、sources、artifact、multi-agent、generative UI、AI dashboard。LP、ブランドサイト、通常Web UI、backendだけの変更には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.2.0"
+  claudagt.version: "0.2.1"
   claudagt.status: "active"
   claudagt.aliases: "ai native design,ai ui"
 ---
