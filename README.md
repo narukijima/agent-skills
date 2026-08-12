@@ -33,6 +33,10 @@ canonical SkillはAgent Skills仕様に従い、version / status / aliasesを`me
 
 既存design systemを先に調査し、一般UIは既存component / shadcn/ui、AI-native UIはVercel AI Elements、tool-heavy UIは21st Agent Elements、一般の21st.dev Marketplaceは規約に沿ったdesign discoveryとして比較します。AI固有state、untrusted generated content、server-side approval、accessibility、responsive、検証証拠までを一つの実行protocolで扱います。
 
+### seo
+
+対象Project、Search Console、HTTP / rendered output、crawler logを優先し、`Observe → Measure → Diagnose → Fix → Verify`でTechnical SEO、検索流入低下、structured data、programmatic SEO、AI検索可視性を扱います。固定bot一覧、任意の文字数rule、単一tool scoreを正本にせず、実装検証と外部再crawlを分離します。
+
 ### x-api
 
 X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。本文中のX status URLもquoteとして既定拒否し、ledger rootは`.git` markerから解決します。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
@@ -62,10 +66,11 @@ X_POSTING_ENABLED=true X_API_WRITE_MAX_CALLS=3 X_API_APP_ID=x-production \
 bash tools/validate-skills.sh
 python3 -m unittest discover -s tests -v
 python3 tools/score-behavior-eval.py --cases evals/ai-native-design/cases.json
+python3 tools/score-behavior-eval.py --cases evals/seo/cases.json
 ```
 
 CIでは上記に加えて、公式 `skills-ref` validatorを全Skillへ実行します。
-最後のcommandはeval定義だけを検証し、`behavior_run: false` を返します。実behaviorをpassにするには、各promptを独立Agentで実行し、semantic criterionごとの判定と証拠を `--judgments` で採点します。keyword出現だけではpassにしません。
+2つのscore commandはeval定義だけを検証し、`behavior_run: false` を返します。実behaviorをpassにするには、各promptを独立Agentで実行し、semantic criterionごとの判定と証拠を `--judgments` で採点します。keyword出現だけではpassにしません。
 
 ## 位置づけ
 

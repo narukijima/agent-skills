@@ -1,0 +1,6 @@
+interface:
+  display_name: "SEO"
+  short_description: "証拠優先で検索障害を診断・修正・再検証する実行Skill"
+  default_prompt: "Use $seo to investigate this search visibility problem from evidence, make only diagnosed changes, and verify every affected surface."
+policy:
+  allow_implicit_invocation: true

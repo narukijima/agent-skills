@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "skill": "seo",
+  "cases": [
+    {
+      "id": "negative-paid-ad-optimization",
+      "prompt": "Google広告の入札と広告文だけを改善して。自然検索は対象外です。",
+      "expected_activation": false,
+      "criteria": [
+        {"id": "no-false-positive", "requirement": "自然検索・AI検索の目的がない広告運用だけなので、このSkillを発動しない。"}
+      ],
+      "forbidden_behaviors": ["SEO監査やcanonical変更へscopeを広げる。"]
+    },
+    {
+      "id": "waf-blocks-search-crawler",
+      "prompt": "通常ブラウザは200ですが、verified Googlebotが全公開URLでCDNから403です。原因を調べて直して。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "critical-crawl-blocker", "requirement": "重要population全体のverified search crawler 403をCritical crawl blockerとして扱う。"},
+        {"id": "verify-identity-and-layers", "requirement": "User-Agentだけでなく公式方法でcrawler identityを確認し、CDN / WAF / originを分離する。"},
+        {"id": "safe-fix-verification", "requirement": "原因を確定して最小WAF修正を提案し、browserとverified crawlerの両方で再検証する。"}
+      ],
+      "forbidden_behaviors": ["User-Agent文字列だけを無条件allowlistする。"]
+    },
+    {
+      "id": "wrong-cross-canonical",
+      "prompt": "商品詳細Aのcanonicalが無関係な商品Bを指しています。Aは独立してindexさせる設計です。修正してください。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "canonical-evidence", "requirement": "requested / final / declared / expected canonicalと内部link・sitemapを比較する。"},
+        {"id": "confirmed-indexation-issue", "requirement": "Projectの期待状態と直接矛盾するcanonicalを証拠付きindexation issueとして確定する。"},
+        {"id": "verify-deployed-and-recrawl", "requirement": "source、rendered output、deployed HTTPを検証し、外部再crawlをpendingとして分離する。"}
+      ],
+      "forbidden_behaviors": ["canonicalは常にself-referenceすべきという一般論だけで変更する。"]
+    },
+    {
+      "id": "dirty-sitemap-population",
+      "prompt": "sitemap 8万URLのうちredirect、noindex、別canonicalが大量に混ざっている疑いがあります。監査して修正方針を出して。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "population-join", "requirement": "sitemap全URLをstatus、index controls、final URL、canonicalへjoinし、cohort別に数える。"},
+        {"id": "integrity-finding", "requirement": "redirect / noindex / non-canonical populationをsitemap integrity issueとして証拠化する。"},
+        {"id": "owner-level-fix", "requirement": "URLごとの手修正ではなくgenerator / data / template ownerで最小修正し、再生成後に同じ監査を行う。"}
+      ],
+      "forbidden_behaviors": ["少数sampleだけで8万URL全体の件数を断定する。"]
+    },
+    {
+      "id": "organic-traffic-drop",
+      "prompt": "先月から自然検索流入が急に35%落ちました。サイトを見て改善案をください。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "locate-break-first", "requirement": "generic改善案より先にSearch Consoleでbreakpointとclick / impression差を確認する。"},
+        {"id": "segment-loss", "requirement": "query、page、country、device、search typeと期間比較で損失populationを特定する。"},
+        {"id": "timeline-hypotheses", "requirement": "deploy、migration、robots / canonical、CDN / WAF、downtime、manual action、seasonalityとの時系列を比較する。"}
+      ],
+      "forbidden_behaviors": ["単にtitleや本文を改善すれば戻ると断定する。"]
+    },
+    {
+      "id": "javascript-injected-jsonld",
+      "prompt": "curlではJSON-LDが見つかりませんが、アプリがhydration後にinjectします。Schemaがないか監査して。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "static-scope-only", "requirement": "curl結果をstatic HTMLの観測として限定する。"},
+        {"id": "render-before-absence", "requirement": "rendered DOMとprovider validatorを確認してから存在判断する。"},
+        {"id": "validate-separately", "requirement": "Schema.org validityと現在のrich-result eligibilityを別々に評価する。"}
+      ],
+      "forbidden_behaviors": ["static fetchだけでSchemaなしとFindingを確定する。"]
+    },
+    {
+      "id": "current-ai-crawler-controls",
+      "prompt": "OpenAI、Google、Microsoft、Anthropic、PerplexityのAI crawlerをrobots.txtでどう制御すべき？",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "current-official-docs", "requirement": "各providerの現在の公式documentationを実行時に確認する。"},
+        {"id": "role-separation", "requirement": "search / indexing、training、user-triggered fetch、別product crawlerを区別する。"},
+        {"id": "no-cross-product-inference", "requirement": "同じ会社の一つのbot制御から全productの挙動を推測しない。"}
+      ],
+      "forbidden_behaviors": ["Skill内の固定bot一覧だけで回答する。"]
+    },
+    {
+      "id": "llms-txt-ranking-claim",
+      "prompt": "llms.txtを置けばChatGPTやGoogleのAI順位とcitationは上がりますか？今すぐ入れて。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "four-claim-separation", "requirement": "proposal存在、tool採用、provider公式support、効果実証を別の主張として扱う。"},
+        {"id": "provider-specific-evidence", "requirement": "対象providerの現在の公式仕様とevidence levelを示す。"},
+        {"id": "no-guaranteed-lift", "requirement": "ranking / citation効果を保証せずexperimentalまたはunsupported-effectを明示する。"}
+      ],
+      "forbidden_behaviors": ["ファイル設置を確認済みranking factorとして実装する。"]
+    },
+    {
+      "id": "hundred-thousand-pseo-pages",
+      "prompt": "都市×サービスの組合せで10万pSEOページを一括生成して公開して。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "ordered-gates", "requirement": "demand、intent、entity / data、URL population、unique utility、quality、linking、crawl、indexation、measurementの順にgateする。"},
+        {"id": "scaled-content-risk", "requirement": "doorway / scaled content riskとproviderの現在のspam policyを確認する。"},
+        {"id": "pilot-before-scale", "requirement": "代表cohortの上限付きpilotと拡大条件を先に設計する。"}
+      ],
+      "forbidden_behaviors": ["変数差し替えだけで10万URLを生成・公開する。"]
+    },
+    {
+      "id": "schema-implementation",
+      "prompt": "このProductページにSchemaを実装してrich resultを出してください。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "visible-data-source", "requirement": "visible contentとauthoritative product dataから正確な値を取得する。"},
+        {"id": "vocabulary-vs-eligibility", "requirement": "Schema.org validityと現在のconsumer rich-result eligibility / propertiesを分離する。"},
+        {"id": "no-display-guarantee", "requirement": "valid markupでもdisplayやrankingは保証されないと扱う。"}
+      ],
+      "forbidden_behaviors": ["架空のratingや固定property表を埋めて表示を保証する。"]
+    },
+    {
+      "id": "post-fix-verification",
+      "prompt": "canonical修正のcodeはcommit済みです。SEO対応DONEとして報告して。",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "implementation-surfaces", "requirement": "build、deployed HTTP、static / rendered canonical、影響populationのregressionを確認する。"},
+        {"id": "external-state-separation", "requirement": "verified implementationとpending external recrawlを分離する。"},
+        {"id": "truthful-completion", "requirement": "未deploy・未検証surfaceをDONEにしない。"}
+      ],
+      "forbidden_behaviors": ["code commitだけを検索engine側修復の完了証拠にする。"]
+    },
+    {
+      "id": "field-vs-lab-performance",
+      "prompt": "Lighthouseは100点ですがSearch ConsoleのINPがPoorです。問題なしですよね？",
+      "expected_activation": true,
+      "criteria": [
+        {"id": "field-lab-separation", "requirement": "CrUX / field dataとLighthouse / lab dataの対象・期間・測定方法を区別する。"},
+        {"id": "reproduce-interactions", "requirement": "affected URL groupとdeviceを特定し、実interactionやRUMから原因候補を再現する。"},
+        {"id": "pending-field-recovery", "requirement": "local fix後もfield windowの更新をpendingとして扱う。"}
+      ],
+      "forbidden_behaviors": ["Lighthouse scoreだけでfield INPを否定する。"]
+    }
+  ]
+}
