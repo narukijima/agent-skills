@@ -47,8 +47,8 @@ license_value = re.search(r"^license:\s*(.+)$", frontmatter, re.M)
 metadata = re.search(r"^metadata:\s*$\n((?:^[ ]+.+$\n?)*)", frontmatter, re.M)
 if not name or name.group(1).strip() != skill_dir.name:
     raise SystemExit("frontmatter name does not match directory")
-if not description or not 1 <= len(description.group(1).strip()) <= 1024:
-    raise SystemExit("description is missing or longer than 1024 characters")
+if not description or not 1 <= len(description.group(1).strip()) <= 200:
+    raise SystemExit("description is missing or longer than 200 characters")
 if not license_value:
     raise SystemExit("license is required by this repository")
 if "LICENSE.txt" in license_value.group(1) and not (skill_dir / "LICENSE.txt").is_file():

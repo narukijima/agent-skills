@@ -1,6 +1,6 @@
 ---
 name: seo
-description: SEO、Technical SEO、検索順位・流入低下、crawl/indexing、robots.txt、sitemap、canonical、noindex、Search Console、Core Web Vitals、structured data/schema、internal linking・site architecture、hreflang・migration、programmatic SEO、AIO/AEO/GEO、AI search・AI citation・AI crawler・llms.txtの調査、実装、検証に使う。広告運用、SNS運用、SEO目的のないcopywritingや一般UI改善だけには使わない。
+description: SEO、検索順位・流入低下、crawl/indexing、robots、sitemap、canonical、Search Console、Core Web Vitals、structured data、internal linking、pSEO、AIO/AEO/GEO、AI searchの調査・実装・検証に使う。広告、SNS、SEO目的のないcopywritingや一般UI改善には使わない。
 license: MIT. See LICENSE.txt
 metadata:
   claudagt.version: "0.1.0"

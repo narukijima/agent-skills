@@ -65,12 +65,16 @@ frontmatter = match.group(1).splitlines()
 metadata_indent = None
 version = None
 legacy_version = None
+description = None
 for line in frontmatter:
     if not line.strip() or line.lstrip().startswith("#"):
         continue
     indent = len(line) - len(line.lstrip(" "))
     if indent == 0:
         metadata_indent = 0 if line.strip() == "metadata:" else None
+        description_match = re.fullmatch(r'description:\s*(.+?)\s*', line)
+        if description_match:
+            description = description_match.group(1).strip()
         legacy = re.fullmatch(r'version:\s*["\']?([^"\']+?)["\']?\s*', line)
         if legacy:
             legacy_version = legacy.group(1).strip()
@@ -81,6 +85,8 @@ for line in frontmatter:
             version = item.group(1)
             break
 
+if description is None or not 1 <= len(description) <= 200:
+    raise SystemExit("ERROR: source Skill description is missing or longer than 200 characters")
 Path(sys.argv[2]).write_text(version or legacy_version or "", encoding="utf-8")
 PY
 source_version="$(<"$source_version_file")"

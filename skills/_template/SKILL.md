@@ -1,6 +1,6 @@
 ---
 name: <skill-name>
-description: <1024文字以内。何を行い、どの依頼で使うか、誤発動を避ける境界が分かる説明>
+description: <200文字以内。何を行い、どの依頼で使うか、誤発動を避ける境界が分かる説明>
 license: MIT. See LICENSE.txt
 metadata:
   claudagt.version: "0.1.0"
