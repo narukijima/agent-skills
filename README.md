@@ -1,6 +1,6 @@
 # agent-skills
 
-`agent-directory` で作った複数のAgentが共有できるSkillの公式配布元です。SkillはAgent Workspaceへ直接組み込まず、必要なSkillのディレクトリだけを導入します。
+`agent-directory` で構築した複数Agentが共通利用するSkillの公式配布元です。Skillは必要なものだけを明示的にvendored copyとして導入します。
 
 - 利用側: [`claudagt/agent-directory`](https://github.com/claudagt/agent-directory)
 - 配布元: [`claudagt/agent-skills`](https://github.com/claudagt/agent-skills)
@@ -9,56 +9,62 @@
 
 ```text
 skills/<skill-name>/
-├── SKILL.md                 # 発動条件、手順、出力契約
-├── agents/openai.yaml       # UI表示情報
-├── references/              # 必要時に読む詳細仕様
-└── scripts/                 # 決定的な実行コード
+├── SKILL.md                 # 発動契約と入口
+├── LICENSE.txt
+├── agents/openai.yaml       # UI metadata
+├── references/              # 条件付きで読む詳細
+└── scripts/                 # 決定的な実行処理
 ```
 
-`SKILL.md` は短い入口、`references/` は条件付き詳細、`scripts/` は再実装を防ぐ固定処理です。利用側はリポジトリ全体ではなく、必要なSkillだけをインポートします。
+`SKILL.md` は短い入口、詳細仕様は `references/`、再実装を避ける固定処理は `scripts/` に置きます。
 
 ## 導入
 
 ```bash
-bash tools/import-skill.sh x-api --target /path/to/agent-directory
+bash tools/import-skill.sh sns-api --target /path/to/agent-directory
 ```
 
-初期状態で自動インポート・自動同期は行いません。必要になったAgentの作業時だけ、利用側リポジトリのrootを指定して実行します。
-
-canonical SkillはAgent Skills仕様に従い、version / status / aliasesを`metadata.claudagt.*`に置きます。インポート時だけ、agent-directory v1の検索・検証契約に必要なtop-level `status` / `aliases`を同じmetadataから決定的に投影します。それ以外はvendored copyで、既存の同名Skillは自動上書きしません。コピー元のrepository、commit SHA、`metadata.claudagt.version`、frontmatter projection、インポート時刻を `skills/x-api/agents/upstream.yaml` に記録します。Skill内の `LICENSE.txt` とthird-party noticeもコピー対象です。更新は利用側で差分を確認してから、明示的に再インポートします。
+自動import・fleet-wide自動同期はしません。既存の同名Skillを上書きせず、copy元repository、commit SHA、version、frontmatter projection、import時刻を `skills/sns-api/agents/upstream.yaml` に記録します。更新は利用側で差分を確認してから明示的に再importします。
 
 ## 公式Skill
 
 ### ai-native-design
 
-既存design systemを先に調査し、一般UIは既存component / shadcn/ui、AI-native UIはVercel AI Elements、tool-heavy UIは21st Agent Elements、一般の21st.dev Marketplaceは規約に沿ったdesign discoveryとして比較します。AI固有state、untrusted generated content、server-side approval、accessibility、responsive、検証証拠までを一つの実行protocolで扱います。
+既存design systemを調査し、AI固有state、untrusted generated content、server-side approval、accessibility、responsive、検証証拠まで扱います。
 
 ### seo
 
-対象Project、Search Console、HTTP / rendered output、crawler logを優先し、`Observe → Measure → Diagnose → Fix → Verify`でTechnical SEO、検索流入低下、structured data、programmatic SEO、AI検索可視性を扱います。固定bot一覧、任意の文字数rule、単一tool scoreを正本にせず、実装検証と外部再crawlを分離します。
+対象Project、Search Console、HTTP/rendered output、crawler logを優先し、`Observe → Measure → Diagnose → Fix → Verify`で検索・AI可視性を扱います。
 
-### x-api
+### sns-api
 
-X API v2の明示予算付きreadと、manifest / expected account / canonical SQLite ledgerでguardした通常テキスト投稿です。本文中のX status URLもquoteとして既定拒否し、ledger rootは`.git` markerから解決します。結果不明の投稿は`reconcile`がHTML escapeとt.co展開を復元して照合し、それでも証明できない`unknown`だけをgateway署名鍵と帯域外検証を条件とする`resolve`で監査付き手動解決します。reply・quote・like・follow・DM・delete・media・browser操作は含めません。write capabilityは同一workspaceのsingle-writer betaで、複数machineの完全無人運用には専用gatewayが必要です。
+X / YouTube / Facebook Pages / Instagram Professional / Threadsの公式APIを、Common Safety Core + Provider Adapterで扱います。署名manifest、stable account/app/credential binding、Project/Agent call budget、canonical SQLite、media hash、write-ahead unknown、duplicate防止、Provider固有status/reconcileを共通化します。TikTokはplannedで、runtime未対応です。
 
 ```bash
-X_API_READ_ENABLED=true X_API_READ_MAX_CALLS=1 \
-  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_READ_CALL_LIMIT=100 \
-  python3 skills/x-api/scripts/x_api.py --pretty user --username XDevelopers
+python3 skills/sns-api/scripts/sns_api.py capabilities
+python3 skills/sns-api/scripts/sns_api.py capabilities --platform x
 
-X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
-python3 skills/x-api/scripts/x_api.py --pretty prepare \
-  --manifest .tmp/approved-post.json --content-id c-1 \
-  --expected-user-id 123456789 --app-id x-production \
-  --expected-app-fingerprint '<64-char-sha256>' \
-  --approval-id approval-1 --text '確定済み本文'
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py prepare \
+  --platform x --operation publish.text \
+  --payload '{"text":"approved text"}' \
+  --manifest .tmp/approved-x.json \
+  --content-id c-1 --expected-account-id 123456789 \
+  --account-type user --app-id x-production \
+  --expected-credential-fingerprint '<sha256>' \
+  --approval-id approval-1
 
-X_POSTING_ENABLED=true X_API_WRITE_MAX_CALLS=3 X_API_APP_ID=x-production \
-  X_API_MANIFEST_SIGNING_KEY='<gateway-owned-32-byte-minimum-secret>' \
-  X_API_PROJECT_ID=project-1 X_API_AGENT_ID=agent-1 X_API_DAILY_WRITE_CALL_LIMIT=20 \
-  python3 skills/x-api/scripts/x_api.py --pretty send \
-  --manifest .tmp/approved-post.json
+SNS_API_WRITE_ENABLED=true SNS_API_WRITE_MAX_CALLS=3 \
+SNS_API_PROJECT_ID=project-1 SNS_API_AGENT_ID=agent-1 \
+SNS_API_DAILY_WRITE_CALL_LIMIT=20 \
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py send \
+  --manifest .tmp/approved-x.json
 ```
+
+`send` はmanifest以外のplatform/text/media/account/ledger overrideを受け取りません。SQLiteは同一workspace/hostのcooperating processを直列化しますが、複数machineのglobal uniquenessは保証しません。完全無人のmulti-machine運用はdedicated single-writer gateway/central stateを使います。
+
+Migration: 旧canonical `x-api` は `sns-api` にsupersedeされました。`x-api` / `x api` / `twitter-api` はactivation migration aliasとして残し、旧 `X_*` environmentは新 `SNS_*` と同値の場合だけ互換読取します。canonical implementation、path、state、CI、evalは `sns-api` 一つです。旧ledgerは自動変換せず、未解決intentを旧workflowで解消してから新しい`state/sns-api/`を開始します。
 
 ## 検証
 
@@ -67,12 +73,9 @@ bash tools/validate-skills.sh
 python3 -m unittest discover -s tests -v
 python3 tools/score-behavior-eval.py --cases evals/ai-native-design/cases.json
 python3 tools/score-behavior-eval.py --cases evals/seo/cases.json
-python3 tools/score-behavior-eval.py --cases evals/x-api/cases.json
+python3 tools/score-behavior-eval.py --cases evals/sns-api/cases.json
 ```
 
-CIでは上記に加えて、公式 `skills-ref` validatorを全Skillへ実行します。
-score commandはeval定義だけを検証し、`behavior_run: false` を返します。実behaviorをpassにするには、各promptを独立Agentで実行し、semantic criterionごとの判定と証拠を `--judgments` で採点します。keyword出現だけではpassにしません。
+CIではcompile、全unit test、behavior eval schema、secret scanも実行します。score commandは定義検証では `behavior_run: false` を返します。実behavior評価は各promptを独立Agentで実行し、semantic judgmentと証拠を `--judgments` で採点します。
 
-## 位置づけ
-
-このリポジトリは、Agentの業務方針やXアカウントごとの文体を所有しません。それらは利用側のProjectで管理し、ここでは安全な共通能力だけをバージョン管理します。
+このRepositoryは投稿内容、文体、時刻、account固有人格、caption生成、戦略、schedulerを所有しません。利用側Projectが意思決定し、Skillは公式APIを安全に実行します。

@@ -1,0 +1,49 @@
+name: SNS API Skill CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sns-api-ci.yml"
+      - ".gitignore"
+      - "README.md"
+      - "skills/SKILLS.md"
+      - "skills/sns-api/**"
+      - "evals/sns-api/**"
+      - "tests/test_sns_api_*.py"
+      - "tests/sns_api_helpers.py"
+      - "tools/score-behavior-eval.py"
+      - "tools/validate-skills.sh"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sns-api-ci.yml"
+      - ".gitignore"
+      - "README.md"
+      - "skills/SKILLS.md"
+      - "skills/sns-api/**"
+      - "evals/sns-api/**"
+      - "tests/test_sns_api_*.py"
+      - "tests/sns_api_helpers.py"
+      - "tools/score-behavior-eval.py"
+      - "tools/validate-skills.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-sns-api:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Validate Skill contracts
+        run: bash tools/validate-skills.sh
+      - name: Compile deterministic stdlib runtime
+        run: python3 -m compileall -q skills/sns-api/scripts tests
+      - name: Run all repository tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate SNS behavior eval cases
+        run: python3 tools/score-behavior-eval.py --cases evals/sns-api/cases.json
+      - name: Basic secret scan
+        run: |
+          ! git grep -nE '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]{20,})' -- . ':!.github/workflows/sns-api-ci.yml'

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`ai-native-design`](ai-native-design/SKILL.md) | active | AI-native UIの既存Project調査、source探索、選定、統合、品質検証 |
 | [`seo`](seo/SKILL.md) | active | 検索・AI可視性を実測し、crawl / index / content / schema / pSEOの原因修正を再検証 |
-| [`x-api`](x-api/SKILL.md) | active | 明示予算付きX API v2 readと署名manifest / account-app binding / SQLite付き通常投稿 |
+| [`sns-api`](sns-api/SKILL.md) | active | X / YouTube / Facebook Pages / Instagram Professional / Threads公式APIの署名manifest・account binding・canonical ledger実行 |
 
 ## 新しいSkill
 

@@ -1,7 +1,0 @@
-interface:
-  display_name: "X API"
-  short_description: "明示予算付きX API readとmanifest限定投稿"
-  default_prompt: "Use $x-api explicitly to retrieve budgeted X data or prepare, send, and reconcile one guarded text post through an expected-account manifest."
-
-policy:
-  allow_implicit_invocation: false
