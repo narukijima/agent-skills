@@ -1,6 +1,8 @@
 import importlib.util
+import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,14 @@ class PublicRepoScanTests(unittest.TestCase):
         self.assertIsNotNone(public_repo_scan.NOREPLY.fullmatch(noreply))
         private = "owner" + "@" + "private.test"
         self.assertIsNone(public_repo_scan.NOREPLY.fullmatch(private))
+
+    def test_force_pushed_unreachable_base_falls_back_to_scanning_new_head(self):
+        noreply = b"123+public-user" + b"@" + b"users.noreply.github.com"
+        log_row = b"a" * 40 + b"\0" + noreply + b"\0" + noreply + b"\0"
+        missing_base = subprocess.CalledProcessError(128, ("git", "log"))
+        with mock.patch.object(public_repo_scan, "git", side_effect=(missing_base, log_row)) as git_mock:
+            self.assertEqual(public_repo_scan.scan_commits("old..new"), [])
+        self.assertEqual(git_mock.call_args_list[1].args[1], "new")
 
 
 if __name__ == "__main__":

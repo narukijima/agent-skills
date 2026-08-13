@@ -27,7 +27,12 @@ SECRET_PATTERNS = (
 
 
 def git(*args: str) -> bytes:
-    return subprocess.run(("git", *args), check=True, stdout=subprocess.PIPE).stdout
+    return subprocess.run(
+        ("git", *args),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ).stdout
 
 
 def tracked_files() -> list[Path]:
@@ -59,7 +64,16 @@ def scan_worktree() -> list[str]:
 def scan_commits(revision_range: str) -> list[str]:
     if not revision_range or revision_range.startswith("0000000000000000000000000000000000000000.."):
         revision_range = "HEAD"
-    rows = git("log", revision_range, "--format=%H%x00%ae%x00%ce%x00").split(b"\0")
+    try:
+        raw_rows = git("log", revision_range, "--format=%H%x00%ae%x00%ce%x00")
+    except subprocess.CalledProcessError:
+        # A force-push can make github.event.before unreachable in the fresh
+        # checkout. Falling back to the new head scans more history, not less.
+        _, separator, new_head = revision_range.rpartition("..")
+        if not separator or not new_head:
+            raise
+        raw_rows = git("log", new_head, "--format=%H%x00%ae%x00%ce%x00")
+    rows = raw_rows.split(b"\0")
     findings: list[str] = []
     for index in range(0, len(rows) - 2, 3):
         commit = rows[index].decode("ascii", "replace")[:12]
