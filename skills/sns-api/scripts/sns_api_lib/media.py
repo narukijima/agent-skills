@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 from urllib.parse import urlsplit
@@ -67,7 +68,16 @@ def remote_asset(value: Dict[str, Any]) -> Dict[str, Any]:
     }
     if not isinstance(value.get("mime"), str) or "/" not in value["mime"]:
         raise ApiFailure("remote asset requires expected MIME metadata", code="INVALID_MEDIA")
-    for key in ("mime", "size", "sha256", "etag", "last_modified"):
+    if value.get("size") is not None and (isinstance(value["size"], bool) or not isinstance(value["size"], int) or value["size"] <= 0):
+        raise ApiFailure("remote asset expected size must be a positive integer", code="INVALID_MEDIA")
+    if value.get("sha256") is not None and not re.fullmatch(r"[0-9a-f]{64}", str(value["sha256"])):
+        raise ApiFailure("remote asset expected sha256 must be lowercase hex", code="INVALID_MEDIA")
+    for key in ("container", "video_codec", "audio_codec"):
+        if value.get(key) is not None and (not isinstance(value[key], str) or not value[key].strip()):
+            raise ApiFailure("remote asset expected media metadata is invalid", code="INVALID_MEDIA")
+    if value.get("fps") is not None and (isinstance(value["fps"], bool) or not isinstance(value["fps"], (int, float)) or value["fps"] <= 0):
+        raise ApiFailure("remote asset expected fps must be positive", code="INVALID_MEDIA")
+    for key in ("mime", "size", "sha256", "etag", "last_modified", "container", "video_codec", "audio_codec", "fps"):
         if value.get(key) is not None:
             result[key] = value[key]
     return result

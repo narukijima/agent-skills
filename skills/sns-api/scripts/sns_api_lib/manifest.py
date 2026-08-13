@@ -109,6 +109,31 @@ def create_manifest(provider: Any, args: Any) -> Dict[str, Any]:
     }
 
 
+def create_resume_manifest(original_path: Path, output_path: Path, approval_id: str, expires_in: int,
+                           row: Dict[str, Any]) -> Dict[str, Any]:
+    original = load_manifest(original_path, allow_expired=True)
+    if row.get("status") != "submitted" or row.get("manifest_hash") != original.get("manifest_hash"):
+        raise ApiFailure("resume authorization requires the current submitted manifest", code="INVALID_RESUME_STATE")
+    if row.get("payload_hash") != original.get("payload_hash") or row.get("intent_hash") != original.get("intent_hash"):
+        raise ApiFailure("resume authorization payload does not match canonical ledger", code="RESUME_BINDING_MISMATCH")
+    if not isinstance(approval_id, str) or not approval_id.strip() or approval_id == row.get("approval_id"):
+        raise ApiFailure("resume authorization requires a new approval_id", code="NEW_APPROVAL_REQUIRED")
+    if not 60 <= int(expires_in) <= 3600:
+        raise ApiFailure("resume authorization expiry must be 60-3600 seconds", code="INVALID_MANIFEST")
+    created = datetime.now(timezone.utc)
+    value = {key: item for key, item in original.items() if key not in {"manifest_hash", "hmac_signature"}}
+    value.update(
+        approval_id=approval_id.strip(), created_at=created.isoformat().replace("+00:00", "Z"),
+        expires_at=(created + timedelta(seconds=int(expires_in))).isoformat().replace("+00:00", "Z"),
+        authorization_type="resume", resume_of_manifest_hash=str(row["manifest_hash"]),
+        resume_state_hash=sha256_json(row.get("provider_state") or {}),
+    )
+    value["manifest_hash"] = manifest_hash(value)
+    value["hmac_signature"] = signature(value)
+    _write_private(output_path, value)
+    return value
+
+
 def load_manifest(path: Path, *, allow_expired: bool = False) -> Dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -134,6 +159,11 @@ def load_manifest(path: Path, *, allow_expired: bool = False) -> Dict[str, Any]:
             or value["asset_hash"] != sha256_json(value["assets"])
             or value["intent_hash"] != sha256_json({"provider_payload": value["provider_payload"], "assets": value["assets"]})):
         raise ApiFailure("manifest payload or asset hash check failed", code="MANIFEST_TAMPERED")
+    if value.get("authorization_type") is not None:
+        if (value.get("authorization_type") != "resume"
+                or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("resume_of_manifest_hash", "")))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("resume_state_hash", "")))):
+            raise ApiFailure("resume authorization binding is invalid", code="INVALID_MANIFEST")
     if not allow_expired and datetime.now(timezone.utc) >= parse_time(str(value["expires_at"]), "manifest expires_at"):
         raise ApiFailure("publish manifest has expired", code="MANIFEST_EXPIRED")
     return value

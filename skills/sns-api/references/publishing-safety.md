@@ -17,7 +17,7 @@ Schema v2 binds:
 
 ## Media
 
-For local assets, resolve a canonical non-symlink regular file and record MIME, size, and SHA-256. Re-resolve and re-hash before credential use or send. The duplicate intent hash binds normalized provider payload and asset metadata, so equal captions with different assets remain distinct intents. YouTube streams the verified file to its resumable session without reading the whole asset into memory. Treat its resumable session URI as capability-sensitive: store only its SHA-256 checkpoint, never the URI itself.
+For local assets, resolve a canonical non-symlink regular file and record MIME, size, and SHA-256. Re-resolve and re-hash before credential use or send. The duplicate intent hash binds normalized provider payload and asset metadata, so equal captions with different assets remain distinct intents. YouTube streams the verified file in bounded ranges without loading the whole asset. Every session probe/media PUT is authenticated. Treat the session URI as capability-sensitive: keep it only in canonical 0700/0600 private state, while SQLite stores an opaque handle/hash/offset and never the URI.
 
 X accepts only local media for this Skill. Images use the fixed v2 simple upload; video and GIF use initialize/append/finalize/status with bounded base64 chunks. Record only media IDs, media keys, segment count, processing state, metadata progress, and whether Post creation durably started. Reverify every asset after upload and before `POST /2/tweets`, detecting mutation during a long upload. Optional image `alt_texts` are approval-bound and written through `/2/media/metadata`; `made_with_ai` is also approval-bound. Never accept pre-uploaded caller media IDs because they are not bound to the manifest asset hashes.
 
@@ -33,7 +33,7 @@ Identity and credential checks happen before the attempt. The irreversible lifec
 2. Commit `unknown` attempt and audit event.
 3. Provider may checkpoint a session/container ID without secrets.
 4. Dispatch the write.
-5. Record definite `published`, `submitted`, `failed`, or `rate_limited`; keep uncertain results `unknown`.
+5. Record definite `published`, `submitted`, `failed`, or `rate_limited`; keep uncertainty after a public/final write as `unknown`.
 
 Process death after step 2 leaves `unknown`, so another process cannot duplicate the post. Any `unknown` for a platform/account blocks other new content for that same platform/account.
 
@@ -41,8 +41,12 @@ Process death after step 2 leaves `unknown`, so another process cannot duplicate
 
 Do not retry timeout, disconnect, authenticated redirect, 5xx, malformed success, or missing Provider ID. Run `reconcile`. A definite 4xx becomes `failed`; retry requires a newly signed approval ID. A 429 does not consume the publish attempt but still consumes the conservative daily call reservation; retry only after external rate policy allows it.
 
-Instagram/Threads `submitted` containers and X media still in `pending`/`in_progress` may be resumed by the same exact signed manifest because the durable checkpoint prevents recreation. Other Providers reject repeated sends after `submitted`. Once a final publish request becomes unknown, resume is disabled and reconcile is mandatory. An X crash durably known to precede `POST /2/tweets` can reconcile as `confirmed_absent`; once the `post_create_started` checkpoint is written, timeline reconciliation or audited manual resolve is required.
+YouTube upload, Instagram/Threads containers, and X media may be resumed by the exact signed manifest while it is valid. YouTube probes the same private session and obeys the Provider `Range`; Instagram/Threads reuse every checkpointed child/parent container. A pre-publish container request may have created an orphan object, but it cannot have published content: after a five-minute anti-race grace window, `reconcile` may convert that `unknown` to resumable `submitted`. The final `media_publish`/`threads_publish` checkpoint is a hard boundary; after it, official recent-content reconciliation is required and blind retry stays forbidden.
+
+Do not weaken manifest expiry. If processing outlives it, `authorize-resume` requires the current submitted ledger row, an expired-or-current signed manifest matching the row, a new approval ID, and a hash of the exact Provider state. The resume manifest carries no content/media override and cannot create a new intent. State drift after approval fails closed.
+
+An X crash durably known to precede `POST /2/tweets` can reconcile as `confirmed_absent`; once the `post_create_started` checkpoint is written, timeline reconciliation or audited manual resolve is required. Facebook Page writes checkpoint their attempt timestamp; lost responses are compared against recent Page content where possible.
 
 ## Manual resolve
 
-Only X declares `manual.resolve`. Require the gateway-owned signing key, an `unknown` ledger row, detailed out-of-band evidence/reason, and a numeric post ID for `published`. Store an immutable `manual-resolve` audit event. Never edit/delete/replace SQLite to bypass the gate.
+Only X and Facebook Pages declare `manual.resolve`. Require the gateway-owned signing key, an `unknown` ledger row, detailed out-of-band evidence/reason, and a Provider-valid ID for `published`. Store an immutable `manual-resolve` audit event. Never edit/delete/replace SQLite to bypass the gate. Instagram/Threads pre-publish uncertainty uses stage-aware reconciliation; their final-publish uncertainty uses owned-content reconciliation, not generic manual clearing.

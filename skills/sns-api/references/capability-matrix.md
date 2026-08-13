@@ -6,7 +6,7 @@ The runtime registry is authoritative; inspect it with `capabilities`. This docu
 | --- | --- | --- | --- | --- |
 | X | supported | `identity.read`, `user.lookup`, `post.lookup`, `user.posts`, `post.search.recent`, `usage.read` | `publish.text`, `publish.quote`, `publish.image`, `publish.video`, `publish.gif`, `media.upload.chunked` | `publish.status`, `reconcile`, `manual.resolve` |
 | YouTube | supported | `identity.read`, `video.lookup`, `own.videos` | `publish.video`, `media.upload.resumable` | `publish.status` |
-| Facebook | supported | `identity.read`, `page.content` | `publish.text`, `publish.image`, `publish.video` | `publish.status` |
+| Facebook | supported | `identity.read`, `page.content` | `publish.text`, `publish.image`, `publish.video` | `publish.status`, `manual.resolve` |
 | Instagram | supported | `identity.read`, `media.read` | `publish.image`, `publish.video`, `publish.reel`, `publish.carousel` | `publish.status` |
 | Threads | supported | `identity.read`, `own.posts` | `publish.text`, `publish.image`, `publish.video`, `publish.carousel` | `publish.status` |
 | TikTok | planned | planned only | planned only | runtime unsupported |

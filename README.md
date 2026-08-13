@@ -38,7 +38,7 @@ bash tools/import-skill.sh sns-api --target /path/to/agent-directory
 
 ### sns-api
 
-X / YouTube / Facebook Pages / Instagram Professional / Threadsの公式APIを、Common Safety Core + Provider Adapterで扱います。署名manifest、stable account/app/credential binding、Project/Agent call budget、canonical SQLite、media hash、write-ahead unknown、duplicate防止、Provider固有status/reconcileを共通化します。Xは承認済みURLを本文へ固定する引用、画像、動画、GIFを公式v2 APIで扱います。TikTokはplannedで、runtime未対応です。
+X / YouTube / Facebook Pages / Instagram Professional / Threadsの公式APIを、Common Safety Core + Provider Adapterで扱います。署名manifest、stable account/app/credential binding、Project/Agent call budget、canonical SQLite、media hash、write-ahead unknown、duplicate防止、Provider固有status/reconcileを共通化します。XはURL引用・画像・動画・GIF、YouTubeは認証付きresumable upload、Instagram/Threadsはstage-aware container recoveryを扱います。TikTokはplannedで、runtime未対応です。
 
 ```bash
 python3 skills/sns-api/scripts/sns_api.py capabilities
@@ -89,6 +89,16 @@ python3 skills/sns-api/scripts/sns_api.py prepare \
 ```
 
 `send` はmanifest以外のplatform/text/media/account/ledger overrideを受け取りません。X mediaの正確な `SNS_API_WRITE_MAX_CALLS` はasset数・chunk数・alt textからmanifestの `provider_call_plan.max_calls` に固定されます。SQLiteは同一workspace/hostのcooperating processを直列化しますが、複数machineのglobal uniquenessは保証しません。完全無人のmulti-machine運用はdedicated single-writer gateway/central stateを使います。
+
+YouTubeのsession URLはSQLiteや出力へ保存せず、canonical workspaceの0600 private stateへ保持します。Instagram/Threadsのcontainer作成中断はreconcile後に同じintentとして再開し、final publish開始後の不明状態とは分離します。`submitted`中にmanifestが期限切れになった場合は、payloadと現provider stateを変えずに新しい承認を発行します。
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py authorize-resume \
+  --manifest .tmp/expired-submitted.json \
+  --resume-manifest .tmp/approved-resume.json \
+  --approval-id approval-resume-2
+```
 
 Migration: 旧canonical `x-api` は `sns-api` にsupersedeされました。`x-api` / `x api` / `twitter-api` はactivation migration aliasとして残し、旧 `X_*` environmentは新 `SNS_*` と同値の場合だけ互換読取します。canonical implementation、path、state、CI、evalは `sns-api` 一つです。旧runtimeを停止後、`python3 skills/sns-api/scripts/sns_api.py migrate-legacy-x` でcanonical `state/x-api/` の投稿・unknown・重複・usage安全状態を監査付きで移行してください。最初のX write/recoveryと各budgeted X callも対応するguardを自動実行し、旧stateが不正または移行後に変更された場合はfail closedにします。
 

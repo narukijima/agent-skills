@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "1.1.0"
+  claudagt.version: "1.2.0"
   claudagt.status: "active"
   claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -60,12 +60,14 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 - Before any X write/recovery operation, detect canonical legacy `state/x-api/` post state; before every budgeted X call, detect legacy usage state. Migrate duplicate, unknown, result, and call-budget state once with audit records. Block the affected X operation if legacy state is invalid or changes after migration; never silently start with empty safety state.
 - Write the attempt as `unknown` before the first irreversible provider request.
 - Block blind retry of `unknown`, and block new sends to the same platform/account while an unknown remains.
-- Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID as `unknown`; treat 4xx as `failed`; preserve 429/rate metadata without automatic sleep.
+- Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID after an irreversible/public request as `unknown`; treat definite 4xx as `failed`; preserve 429/rate metadata without automatic sleep. A Provider may return resumable `submitted` only when its checkpoint proves no public publish started or preserves a recoverable upload session.
 - Reconcile through the provider's official status/read surface. Never infer `confirmed_absent` unless the provider-specific evidence proves absence.
-- Enable audited manual resolve only for X, with gateway privilege, out-of-band evidence, reason, and provider ID when resolving as published.
+- Enable audited manual resolve only for X and Facebook Pages, with gateway privilege, out-of-band evidence, reason, and provider ID when resolving as published.
 - Verify local asset canonical path, MIME, size, and SHA-256 immediately before send. Refuse mutation.
 - For X, upload only manifest-bound local images/video/GIF through the fixed `/2/media/*` surface, checkpoint non-secret media IDs/keys, and reverify bytes before `POST /2/tweets`. Never accept caller-supplied media IDs.
 - For X quotes, require `publish.quote` with an approved `quote_url`; canonicalize that URL into the signed Post text. Do not expose reply automation or the dedicated `quote_tweet_id` field.
+- Keep YouTube resumable session URLs only in canonical 0700/0600 private state; store only an opaque handle/hash in SQLite. Authenticate every session PUT, probe with empty PUT plus `Content-Range: bytes */TOTAL`, and resume from the server `Range`.
+- For Instagram and Threads, persist explicit pre-publish and final-publish stages. A pre-publish container uncertainty may become resumable only after reconciliation; uncertainty after `media_publish`/`threads_publish` starts remains `unknown`.
 - Treat remote media as mutable after prepare. Record URL, scheme, host, expected MIME and optional expected metadata; do not claim byte-level assurance when the provider fetches it.
 - Reject authenticated redirects and non-allowlisted credential destinations. Do not expose a generic URL or endpoint CLI.
 - Keep local SQLite's boundary explicit: it serializes cooperating processes on one workspace/host; it is not global uniqueness across machines. Use a dedicated single-writer gateway/central state for unattended multi-machine operation.
@@ -146,7 +148,7 @@ python3 skills/sns-api/scripts/sns_api.py prepare \
 
 ### Send
 
-Set the exact signed call-plan budget for the manifest. `send` may safely resume an already-created Instagram/Threads container or an X media object still processing from canonical state; it never recreates content after a final publish request became unknown.
+Set the exact signed call-plan budget for the manifest. `send` may safely resume a recoverable YouTube upload session, an already-created Instagram/Threads container, or an X media object still processing from canonical state; it never recreates content after a final publish request became unknown.
 
 ```bash
 SNS_API_WRITE_ENABLED=true SNS_API_WRITE_MAX_CALLS=4 \
@@ -155,6 +157,16 @@ SNS_API_DAILY_WRITE_CALL_LIMIT=50 \
 SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
 python3 skills/sns-api/scripts/sns_api.py send \
   --manifest .tmp/approved-threads.json
+```
+
+If a submitted upload/container outlives its manifest, issue a new Project approval bound to the current canonical Provider state. This command accepts no content override and cannot create a new intent.
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py authorize-resume \
+  --manifest .tmp/expired-submitted.json \
+  --resume-manifest .tmp/approved-resume.json \
+  --approval-id approval-resume-2026-08-14-002
 ```
 
 ### Status and reconcile

@@ -31,7 +31,9 @@ X OAuth 2.0 refresh uses a private store, file lock, write-ahead non-secret rota
 
 X media upload requires User Context. For OAuth 2.0, provision the existing read/write scopes plus `media.write`; keep `offline.access` optional and only for the private refresh-store flow. App-only bearer credentials are never used for media upload or upload status. OAuth 1.0a remains supported through a user Access Token with the App's current read/write permission. Reconfirm scopes, App permissions, plan access, and token grants in the official console before live use.
 
-YouTube uses a pre-provisioned OAuth 2.0 user access token and client ID. The surrounding private token service owns refresh/rotation. Facebook uses a Page Access Token. Instagram requires explicit `SNS_INSTAGRAM_AUTH_MODE=facebook-login|instagram-login`; the modes have different hosts, permissions, and token issuance. Threads uses a Threads OAuth 2.0 user token.
+YouTube uses a pre-provisioned OAuth 2.0 user access token and client ID. The surrounding private token service owns refresh/rotation. Every resumable-session status/media PUT carries the current Bearer token. The returned session URL is a capability URL: persist it only in owner-controlled `state/sns-api/private/youtube-upload-sessions/` files (0700 directory, 0600 file), while SQLite stores an opaque random handle and SHA-256. Never place the URL in a manifest, audit event, stdout, or stderr.
+
+Facebook uses a Page Access Token. Instagram requires explicit `SNS_INSTAGRAM_AUTH_MODE=facebook-login|instagram-login`; the modes have different hosts, permissions, and token issuance. Threads uses a Threads OAuth 2.0 user token.
 
 ## Secret boundary
 

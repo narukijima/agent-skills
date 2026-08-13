@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import http.client
 import os
 import re
 import socket
@@ -156,50 +155,6 @@ def request(method: str, url: str, *, allowed_hosts: Iterable[str], token: Optio
         ) from exc
     except (URLError, TimeoutError, socket.timeout) as exc:
         raise ApiFailure("provider request result is unknown", code="PROVIDER_RESULT_UNKNOWN", outcome="unknown") from exc
-
-
-def upload_file(url: str, path: Any, *, allowed_hosts: Iterable[str], mime: str,
-                start: int = 0, end: Optional[int] = None, total: Optional[int] = None,
-                timeout: int = 120) -> HttpResult:
-    """Stream one resumable-upload range without loading the asset into memory."""
-    validate_url(url, allowed_hosts, authenticated=False)
-    parsed = urlsplit(url)
-    size = int(path.stat().st_size)
-    total_size = total if total is not None else size
-    final = (size - 1) if end is None else end
-    length = final - start + 1
-    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=timeout)
-    target = parsed.path + (("?" + parsed.query) if parsed.query else "")
-    try:
-        connection.putrequest("PUT", target, skip_accept_encoding=True)
-        connection.putheader("Content-Type", mime)
-        connection.putheader("Content-Length", str(length))
-        connection.putheader("Content-Range", f"bytes {start}-{final}/{total_size}")
-        connection.endheaders()
-        with path.open("rb") as handle:
-            handle.seek(start)
-            remaining = length
-            while remaining:
-                chunk = handle.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    raise ApiFailure("local asset ended during upload", code="ASSET_MUTATED", outcome="unknown")
-                connection.send(chunk)
-                remaining -= len(chunk)
-        response = connection.getresponse()
-        raw = _read_limited(response)
-        headers = _headers(response.headers)
-        body = _parse(raw) if raw else {}
-        if response.status not in {200, 201, 308}:
-            outcome = "rate_limited" if response.status == 429 else "failed" if 400 <= response.status < 500 else "unknown"
-            raise ApiFailure("upload endpoint returned an HTTP error", code="PROVIDER_HTTP_ERROR",
-                             status=response.status, payload=redact(body), outcome=outcome)
-        return HttpResult(response.status, body, headers)
-    except ApiFailure:
-        raise
-    except (OSError, TimeoutError, socket.timeout, http.client.HTTPException) as exc:
-        raise ApiFailure("upload result is unknown", code="PROVIDER_RESULT_UNKNOWN", outcome="unknown") from exc
-    finally:
-        connection.close()
 
 
 def classify(body: Any) -> str:

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
-from ..core import ApiFailure
+from ..core import ApiFailure, parse_time
 from ..http import classify, request
+from datetime import datetime, timedelta, timezone
 
 META_VERSION = "v26.0"
 META_HOST = "graph.facebook.com"
@@ -43,3 +44,24 @@ def require_remote(assets: list[Dict[str, Any]], *, count: Optional[int] = None,
             raise ApiFailure("provider requires HTTPS remote media; this Skill does not host local files", code="INVALID_MEDIA")
         if media_prefix and asset.get("mime") and not str(asset["mime"]).startswith(media_prefix):
             raise ApiFailure("remote media MIME does not match publish type", code="INVALID_MEDIA")
+
+
+def prepublish_call(call: Callable[[], Any], state: Dict[str, Any], checkpoint: Any, stage: str) -> Any:
+    """Persist a non-public stage; an uncertain container request is safe to repeat."""
+    state.update(stage=stage, final_publish_started=False, provider_status=stage)
+    checkpoint(dict(state))
+    try:
+        return call()
+    except ApiFailure as exc:
+        if exc.outcome not in {"failed", "rate_limited"} and not (exc.status is not None and 400 <= exc.status < 500):
+            raise ApiFailure(
+                "Meta pre-publish container result is uncertain; exact-manifest resume may recreate only a non-public container",
+                code=exc.code, status=exc.status, payload=exc.payload, outcome="submitted", meta=exc.meta,
+            ) from exc
+        raise
+
+
+def prepublish_resume_ready(row: Dict[str, Any], grace_seconds: int = 300) -> bool:
+    """Avoid racing a still-running request before converting unknown to resumable."""
+    attempted = parse_time(str(row.get("attempted_at", "")), "attempted_at")
+    return datetime.now(timezone.utc) >= attempted + timedelta(seconds=grace_seconds)

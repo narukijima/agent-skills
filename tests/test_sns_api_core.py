@@ -11,9 +11,9 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request
 
-from tests.sns_api_helpers import base_env, core, credentials, make_manifest
+from tests.sns_api_helpers import base_env, core, credentials, make_manifest, signed
 from sns_api_lib import http
-from sns_api_lib.ledger import get_intent
+from sns_api_lib.ledger import get_intent, reserve_attempt
 
 
 class SnsApiCoreTests(unittest.TestCase):
@@ -138,6 +138,43 @@ class SnsApiCoreTests(unittest.TestCase):
         with self.assertRaises(core.ApiFailure): self._send(path, publish=lambda *_: (_ for _ in ()).throw(failure))
         self.assertEqual(get_intent("x", "42", "content-1")["status"], "failed")
 
+    def test_provider_resumable_uncertainty_is_submitted_not_account_blocking_unknown(self):
+        path = Path(self.temp.name) / "submitted.json"; make_manifest(path)
+        failure = core.ApiFailure("prepublish timeout", code="PROVIDER_RESULT_UNKNOWN", outcome="submitted")
+        with self.assertRaises(core.ApiFailure): self._send(path, publish=lambda *_: (_ for _ in ()).throw(failure))
+        self.assertEqual(get_intent("x", "42", "content-1")["status"], "submitted")
+
+    def test_reconcile_resume_safe_changes_unknown_to_submitted(self):
+        path = Path(self.temp.name) / "threads.json"
+        make_manifest(path, platform="threads", operation="publish.text", payload={"text": "hello"},
+                      account_type="threads-user")
+        manifest = signed(path)
+        reserve_attempt(manifest)
+        provider = core.provider("threads")
+        with patch.dict(os.environ, base_env(), clear=True), \
+                patch.object(provider, "credentials", return_value=credentials("threads")), \
+                patch.object(provider, "identity", return_value={"id": "42", "account_type": "threads-user"}), \
+                patch.object(provider, "reconcile", return_value={
+                    "status": "resume_safe", "provider": {"public_publish_started": False},
+                }):
+            result = core.reconcile("threads", "content-1", "42")
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(result["data"]["reconcile_outcome"], "resume_safe")
+        self.assertEqual(get_intent("threads", "42", "content-1")["status"], "submitted")
+
+    def test_facebook_unknown_supports_evidence_bound_manual_resolve(self):
+        path = Path(self.temp.name) / "facebook.json"
+        make_manifest(path, platform="facebook", operation="publish.text", payload={"message": "hello"},
+                      account_type="page")
+        reserve_attempt(signed(path))
+        with patch.dict(os.environ, base_env(), clear=True):
+            result = core.resolve("facebook", "content-1", "42", "published",
+                                  "verified in Page activity log", "42_9001")
+        self.assertEqual(result["status"], "published")
+        row = get_intent("facebook", "42", "content-1")
+        self.assertEqual(row["status"], "published")
+        self.assertEqual(row["provider_id"], "42_9001")
+
     def test_429_refunds_attempt_and_same_approval_can_retry(self):
         path = Path(self.temp.name) / "rate.json"; make_manifest(path)
         failure = core.ApiFailure("rate", status=429, outcome="rate_limited")
@@ -247,7 +284,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("authorization", value); self.assertEqual(value["nested"], {})
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.1.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.2.0")
 
 
 if __name__ == "__main__": unittest.main()

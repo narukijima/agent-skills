@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from tests.sns_api_helpers import credentials
@@ -27,6 +28,34 @@ class ThreadsTests(unittest.TestCase):
         assets = [{"url": "https://cdn.test/1", "mime": "image/jpeg"}, {"url": "https://cdn.test/2", "mime": "video/mp4"}]
         normalized = provider.normalize_publish("publish.carousel", {"text": "caption"}, [{"kind": "remote", **a} for a in assets])
         self.assertEqual(normalized["text"], "caption")
+
+    def test_carousel_resume_reuses_checkpointed_children(self):
+        provider = threads.ThreadsProvider(); cred = credentials("threads", "threads-oauth2")
+        assets = [{"url": "https://cdn.test/1", "mime": "image/jpeg"}, {"url": "https://cdn.test/2", "mime": "video/mp4"}]
+        state = {"stage": "creating_children", "child_container_ids": ["101"], "next_child_index": 1,
+                 "provider_status": "creating_children", "final_publish_started": False}
+        manifest = {"expected_account_id": "42", "operation": "publish.carousel", "provider_payload": {"text": "caption", "alt_text": ""},
+                    "assets": assets, "_resume_state": state}
+        response = type("R", (), {"status": 200, "rate_limit": {}})(); ids = iter(("102", "201", "301")); forms = []
+        def graph(*_args, **kwargs): forms.append(kwargs.get("form", {})); return response, {"id": next(ids)}
+        with patch.object(provider, "read", return_value={"data": {"status": "FINISHED"}}), patch.object(threads, "graph_call", side_effect=graph):
+            result = provider.publish(cred, manifest, lambda _: None)
+        self.assertEqual(result["provider_id"], "301"); self.assertEqual(forms[0]["video_url"], "https://cdn.test/2")
+        self.assertEqual(forms[1]["children"], "101,102")
+
+    def test_container_timeout_is_submitted_and_reconcile_unlocks_prepublish_stage(self):
+        provider = threads.ThreadsProvider(); cred = credentials("threads", "threads-oauth2")
+        manifest = {"expected_account_id": "42", "operation": "publish.text", "provider_payload": {"text": "hello", "alt_text": ""},
+                    "assets": [], "_resume_state": {}}
+        states = []
+        with patch.object(threads, "graph_call", side_effect=core.ApiFailure("timeout", outcome="unknown")), self.assertRaises(core.ApiFailure) as raised:
+            provider.publish(cred, manifest, states.append)
+        self.assertEqual(raised.exception.outcome, "submitted"); self.assertEqual(states[-1]["stage"], "creating_container")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        row = {"status": "unknown", "attempted_at": old, "provider_state": states[-1]}
+        with patch.object(provider, "read") as read:
+            reconciled = provider.reconcile(cred, row)
+        self.assertEqual(reconciled["status"], "resume_safe"); read.assert_not_called()
 
     def test_async_states_are_not_hidden_as_success(self):
         provider = threads.ThreadsProvider(); cred = credentials("threads", "threads-oauth2")

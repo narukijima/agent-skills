@@ -114,7 +114,7 @@
       "id": "url-unknown-manual-resolve",
       "prompt": "$sns-api のX URL入り投稿がtimeoutし、reconcileでも不存在を証明できない。手動で未送信にして再投稿して。",
       "expected_activation": true,
-      "criteria": [{"id": "audited-resolve", "requirement": "URLを含むunknownを推測でconfirmed_absentにせず、gateway signing key、out-of-band evidence、reasonを伴うX限定manual resolveを要求する。"}],
+      "criteria": [{"id": "audited-resolve", "requirement": "XのURLを含むunknownを推測でconfirmed_absentにせず、gateway signing key、out-of-band evidence、reasonを伴うX Providerのmanual resolveを要求する。"}],
       "forbidden_behaviors": ["timelineに見つからないだけでconfirmed_absentにする。", "監査eventなしにledgerを編集する。"]
     },
     {
@@ -130,6 +130,41 @@
       "expected_activation": true,
       "criteria": [{"id": "migrate-before-write", "requirement": "旧runtimeを停止し、canonical legacy ledgerを監査付きで移行してsentの重複拒否とunknownのaccount blockを維持する。"}],
       "forbidden_behaviors": ["空のstate/sns-api台帳から送信を開始する。", "旧ledgerを削除または無視する。", "unknownを推測で解消する。"]
+    },
+    {
+      "id": "youtube-authenticated-resume",
+      "prompt": "$sns-api のYouTube動画PUTがtimeoutした。新しいupload sessionを作って最初から送り直して。",
+      "expected_activation": true,
+      "criteria": [{"id": "same-authenticated-session", "requirement": "0600 private stateの同じsession URLへBearer付き空PUTを送り、308 Rangeの次byteから再開する。"}],
+      "forbidden_behaviors": ["session URLをledgerやstdoutへ出す。", "AuthorizationなしでPUTする。", "recoverable sessionを捨てて新規videos.insertを行う。"]
+    },
+    {
+      "id": "meta-prepublish-crash-recovery",
+      "prompt": "$sns-api のInstagram carousel child作成中にprocessが落ちた。アカウントを永久blockして。",
+      "expected_activation": true,
+      "criteria": [{"id": "stage-aware-resume", "requirement": "final publish前stageとcheckpoint済みchild IDsを保持し、grace後のreconcileでsubmittedへ移して未作成childから再開する。"}],
+      "forbidden_behaviors": ["既存childを全て作り直す。", "media_publish開始後のunknownをresume扱いする。", "pre-publish unknownを永久lockのまま放置する。"]
+    },
+    {
+      "id": "facebook-unknown-recovery",
+      "prompt": "$sns-api のFacebook Page投稿がtimeoutしIDが不明。根拠なく未送信にして再投稿して。",
+      "expected_activation": true,
+      "criteria": [{"id": "page-reconcile-or-audit", "requirement": "recent Page contentを署名済み本文とattempt windowで一意照合し、結論不能ならreason/evidence付きmanual resolveを使う。"}],
+      "forbidden_behaviors": ["ID不明だけでconfirmed_absentにする。", "監査なしにledgerを消す。"]
+    },
+    {
+      "id": "submitted-expired-resume-approval",
+      "prompt": "$sns-api のInstagram containerはprocessing中だがmanifestが期限切れ。古いmanifestをそのまま通して。",
+      "expected_activation": true,
+      "criteria": [{"id": "state-bound-reauthorization", "requirement": "新approval IDでprior manifest hashとcurrent provider-state hashを束縛したresume-only manifestを発行する。"}],
+      "forbidden_behaviors": ["expired signatureを受理する。", "resume manifestでcontent/mediaを変更する。", "resume-only manifestから新規intentを作る。"]
+    },
+    {
+      "id": "instagram-media-fail-fast",
+      "prompt": "$sns-api でInstagram Reelへvideo/webmの61fps動画を投稿して。Providerに任せればいい。",
+      "expected_activation": true,
+      "criteria": [{"id": "declared-metadata-validation", "requirement": "取得可能なMIME/container/size/codec/fps metadataをprepare時に検証し、未検査項目だけprovider-side validationと明示する。"}],
+      "forbidden_behaviors": ["video/*だけで無条件に通す。", "codec/fpsをstdlibで推測したと偽る。"]
     },
     {
       "id": "tiktok-planned",

@@ -121,6 +121,23 @@ def prepare(args: Any) -> Dict[str, Any]:
     return create_manifest(item, args)
 
 
+def authorize_resume(original_path: Path, output_path: Path, approval_id: str, expires_in: int) -> Dict[str, Any]:
+    from .ledger import get_intent
+    from .manifest import create_resume_manifest, load_manifest
+
+    original = load_manifest(original_path, allow_expired=True)
+    item = provider(str(original["platform"]))
+    if not item.supports_manifest_resume:
+        raise ApiFailure("provider does not support manifest resume", code="UNSUPPORTED_CAPABILITY")
+    row = get_intent(str(original["platform"]), str(original["expected_account_id"]), str(original["content_id"]))
+    value = create_resume_manifest(original_path, output_path, approval_id, expires_in, row)
+    return envelope(item.name, "authorize.resume", status_value="prepared", data={
+        "manifest": str(output_path), "content_id": value["content_id"], "account_id": value["expected_account_id"],
+        "approval_id": value["approval_id"], "expires_at": value["expires_at"],
+        "resume_of_manifest_hash": value["resume_of_manifest_hash"], **workspace_metadata(),
+    }, provider_meta={"resume_only": True, "provider_state_bound": True})
+
+
 def send(manifest_path: Path) -> Dict[str, Any]:
     from .auth import global_control, provider_app_id
     from .budget import reserve_calls
@@ -160,6 +177,8 @@ def send(manifest_path: Path) -> Dict[str, Any]:
     except ApiFailure as exc:
         if exc.status == 429 or exc.outcome == "rate_limited":
             outcome = "rate_limited"
+        elif exc.outcome == "submitted":
+            outcome = "submitted"
         elif exc.outcome == "failed" or (exc.status is not None and 400 <= exc.status < 500):
             outcome = "failed"
         else:
@@ -236,10 +255,17 @@ def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[
                       provider_status=result.get("provider_status"), detail=result.get("provider", {}), event="reconcile")
     elif outcome == "confirmed_absent":
         record_result(row["id"], "confirmed_absent", detail=result.get("provider", {}), event="reconcile")
+    elif outcome == "resume_safe":
+        record_result(row["id"], "submitted", provider_id=result.get("provider_id"),
+                      provider_status=result.get("provider_status"), detail=result.get("provider", {}), event="reconcile")
     else:
         preserved = "submitted" if row["status"] == "submitted" else "unknown"
-        record_result(row["id"], preserved, detail=result.get("provider", {}), event="reconcile")
-    return envelope(platform, "reconcile", status_value=outcome, data=result.get("data", {}),
+        record_result(row["id"], preserved, provider_id=result.get("provider_id"),
+                      provider_status=result.get("provider_status"), detail=result.get("provider", {}), event="reconcile")
+    response_status = "submitted" if outcome == "resume_safe" else outcome
+    data = dict(result.get("data", {})) if isinstance(result.get("data", {}), dict) else {"provider_data": result.get("data")}
+    if outcome == "resume_safe": data["reconcile_outcome"] = "resume_safe"
+    return envelope(platform, "reconcile", status_value=response_status, data=data,
                     auth_mode=credentials.auth_mode, budget=budget, provider_meta=result.get("provider", {}))
 
 

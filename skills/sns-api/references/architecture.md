@@ -21,11 +21,13 @@ The runtime is a Common Safety Core plus static, thin Provider adapters. The Cor
 3. `prepare` normalizes one provider payload, captures asset evidence and call plan, and creates a short-lived signed manifest.
 4. `send` verifies manifest/HMAC/expiry/assets, write gate, exact call budget, app ID, credential fingerprint, authenticated identity, and account type.
 5. The ledger transaction records `unknown` before the first irreversible request.
-6. Provider checkpoints persist non-secret container IDs or one-way session hashes before later phases.
+6. Provider checkpoints persist non-secret stage/container IDs or an opaque private-session handle before later phases. Capability-sensitive session URLs stay outside SQLite.
 7. A definite response becomes `published`, `submitted`, `failed`, or `rate_limited`. An uncertain response remains `unknown`.
 8. `status` exposes native async state. `reconcile` uses official Provider evidence and never blindly resends.
 
-Instagram and Threads may return `submitted` while a container is `IN_PROGRESS`; X video/GIF may do the same while uploaded media is processing. A second `send --manifest` is allowed only for the exact same signed manifest and only when the canonical checkpoint proves that the same container/media object already exists; the adapter checks/finalizes it without recreating content. A timeout during the final publish call becomes `unknown`, which disables this resume path and requires reconciliation.
+YouTube, Instagram, Threads, and X media may return `submitted`. YouTube resumes the same private session URL from the Provider-acknowledged byte offset. Instagram/Threads persist `creating_children`, `creating_parent`/`creating_container`, `processing`, `ready`, `final_publish_started`, and `published`; checkpointed carousel children are reused. A pre-publish uncertainty can be converted from `unknown` to resumable `submitted` only by reconciliation after a grace window. A timeout during the final publish call remains `unknown` and requires official recent-content/status reconciliation.
+
+If the original approval expires during `submitted`, `authorize-resume` creates a fresh short-lived HMAC manifest with a new approval ID. It binds the prior manifest hash and the current Provider-state hash, carries no content override, and cannot create a new intent. Any state change between authorization and send fails closed.
 
 ## State and outcomes
 
@@ -33,6 +35,7 @@ Canonical files:
 
 - `state/sns-api/ledger.sqlite3`: publish intents, attempts, Provider checkpoints, and audit events.
 - `state/sns-api/usage.sqlite3`: UTC-day call reservations keyed by platform, Project, Agent, and read/write kind.
+- `state/sns-api/private/youtube-upload-sessions/*.json`: owner-only 0600 capability state under 0700 directories; never manifest/SQLite/output content.
 
 ### Legacy X upgrade guard
 

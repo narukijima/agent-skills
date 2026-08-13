@@ -310,6 +310,8 @@ def reserve_attempt(manifest: Dict[str, Any]) -> int:
             "SELECT content_id FROM intents WHERE platform=? AND account_id=? AND status='unknown' LIMIT 1",
             (manifest["platform"], manifest["expected_account_id"]),
         ).fetchone()
+        if manifest.get("authorization_type") == "resume" and (row is None or row["status"] != "submitted"):
+            raise ApiFailure("resume-only manifest cannot create or retry a publish intent", code="INVALID_RESUME_STATE")
         if unresolved and (row is None or unresolved["content_id"] != row["content_id"]):
             raise ApiFailure("account has an unresolved unknown intent; reconcile before any new send", code="ACCOUNT_BLOCKED")
         now = utc_now()
@@ -322,6 +324,26 @@ def reserve_attempt(manifest: Dict[str, Any]) -> int:
                 raise ApiFailure("content_id is already bound to different media", code="DUPLICATE")
             if row["status"] == "submitted" and manifest.get("_allow_resume") and row["manifest_hash"] == manifest["manifest_hash"] and row["provider_state"]:
                 _event(connection, int(row["id"]), "resume", "submitted")
+                connection.commit()
+                return int(row["id"])
+            if row["status"] == "submitted" and manifest.get("_allow_resume") and manifest.get("authorization_type") == "resume":
+                try:
+                    provider_state = json.loads(row["provider_state"] or "{}")
+                except json.JSONDecodeError as exc:
+                    raise ApiFailure("submitted provider state is corrupt", code="UNSAFE_PROVIDER_STATE") from exc
+                if (manifest.get("resume_of_manifest_hash") != row["manifest_hash"]
+                        or manifest.get("resume_state_hash") != _sha256_json(provider_state)):
+                    raise ApiFailure("submitted provider state changed after resume approval", code="RESUME_STATE_CHANGED")
+                if manifest.get("approval_id") == row["approval_id"]:
+                    raise ApiFailure("resume requires a new signed approval_id", code="NEW_APPROVAL_REQUIRED")
+                connection.execute(
+                    "UPDATE intents SET manifest_hash=?,approval_id=?,updated_at=? WHERE id=?",
+                    (manifest["manifest_hash"], manifest["approval_id"], now, row["id"]),
+                )
+                _event(connection, int(row["id"]), "resume-reauthorized", "submitted", detail={
+                    "resume_of_manifest_hash": manifest["resume_of_manifest_hash"],
+                    "resume_state_hash": manifest["resume_state_hash"], "approval_id": manifest["approval_id"],
+                })
                 connection.commit()
                 return int(row["id"])
             if row["status"] in {"published", "submitted", "submitting"}:

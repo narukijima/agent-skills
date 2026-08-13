@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.sns_api_helpers import base_env, core, make_manifest, manifest, prepare_args, signed
+from sns_api_lib import ledger
 
 
 class ManifestTests(unittest.TestCase):
@@ -81,6 +82,40 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--platform", "x"])
             with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--payload", "{}"])
             with self.assertRaises(SystemExit): parser.parse_args(["migrate-legacy-x", "--ledger", "/tmp/other.sqlite3"])
+
+    def test_expired_submitted_manifest_can_only_resume_with_new_state_bound_approval(self):
+        original_path = Path(self.temp.name) / "expired.json"
+        make_manifest(original_path, platform="threads", operation="publish.text", account_type="threads-user",
+                      payload={"text": "approved"}, expires_in=-1)
+        with patch.dict(os.environ, base_env(), clear=True):
+            original = manifest.load_manifest(original_path, allow_expired=True)
+        intent = ledger.reserve_attempt({**original, "_allow_resume": True})
+        ledger.update_provider_state(intent, {"stage": "processing", "container_id": "101", "provider_id": "101",
+                                              "provider_status": "IN_PROGRESS", "final_publish_started": False})
+        ledger.record_result(intent, "submitted", provider_id="101", provider_status="IN_PROGRESS")
+        resume_path = Path(self.temp.name) / "resume.json"
+        with patch.dict(os.environ, base_env(), clear=True):
+            result = core.authorize_resume(original_path, resume_path, "approval-resume-2", 900)
+            resumed = manifest.load_manifest(resume_path)
+        self.assertEqual(result["status"], "prepared"); self.assertEqual(resumed["authorization_type"], "resume")
+        self.assertEqual(resumed["resume_of_manifest_hash"], original["manifest_hash"])
+        self.assertEqual(resumed["provider_payload"], original["provider_payload"])
+        self.assertEqual(ledger.reserve_attempt({**resumed, "_allow_resume": True}), intent)
+        row = ledger.get_intent("threads", "42", "content-1")
+        self.assertEqual(row["approval_id"], "approval-resume-2"); self.assertEqual(row["manifest_hash"], resumed["manifest_hash"])
+
+    def test_resume_manifest_refuses_changed_provider_state(self):
+        original_path = Path(self.temp.name) / "original.json"
+        make_manifest(original_path, platform="threads", operation="publish.text", account_type="threads-user", payload={"text": "approved"})
+        original = signed(original_path); intent = ledger.reserve_attempt({**original, "_allow_resume": True})
+        ledger.update_provider_state(intent, {"stage": "processing", "container_id": "101", "final_publish_started": False})
+        ledger.record_result(intent, "submitted")
+        resume_path = Path(self.temp.name) / "resume.json"
+        with patch.dict(os.environ, base_env(), clear=True): core.authorize_resume(original_path, resume_path, "approval-2", 900)
+        ledger.update_provider_state(intent, {"stage": "ready", "container_id": "101", "final_publish_started": False})
+        with patch.dict(os.environ, base_env(), clear=True): resumed = manifest.load_manifest(resume_path)
+        with self.assertRaises(core.ApiFailure) as raised: ledger.reserve_attempt({**resumed, "_allow_resume": True})
+        self.assertEqual(raised.exception.code, "RESUME_STATE_CHANGED")
 
     def test_workspace_resolution_uses_nearest_git_marker_and_fails_closed(self):
         root = Path(self.temp.name) / "repo"; script = root / "deep/scripts/file.py"; script.parent.mkdir(parents=True); script.write_text("")

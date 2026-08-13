@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from tests.sns_api_helpers import credentials
@@ -46,10 +47,62 @@ class InstagramTests(unittest.TestCase):
             result = provider.publish(cred, manifest, lambda _: None)
         self.assertEqual(result["provider_id"], "post"); self.assertEqual(forms[2]["media_type"], "CAROUSEL"); self.assertEqual(forms[2]["children"], "child1,child2")
 
+    def test_carousel_resume_reuses_checkpointed_children(self):
+        provider = instagram.InstagramProvider(); cred = credentials("instagram", "facebook-login")
+        assets = [{"url": "https://cdn.test/1.jpg", "mime": "image/jpeg"}, {"url": "https://cdn.test/2.mp4", "mime": "video/mp4"}]
+        state = {"stage": "creating_children", "child_container_ids": ["101"], "next_child_index": 1,
+                 "provider_status": "creating_children", "final_publish_started": False}
+        manifest = {"expected_account_id": "42", "operation": "publish.carousel", "provider_payload": {"caption": "c", "share_to_feed": False},
+                    "assets": assets, "_resume_state": state}
+        response = type("R", (), {"status": 200, "rate_limit": {}})(); ids = iter(("102", "201", "301")); forms = []
+        def graph(*_args, **kwargs): forms.append(kwargs.get("form", {})); return response, {"id": next(ids)}
+        with patch.object(provider, "_host", return_value="graph.facebook.com"), patch.object(provider, "read", return_value={"data": {"status_code": "FINISHED"}}), patch.object(instagram, "graph_call", side_effect=graph):
+            result = provider.publish(cred, manifest, lambda _: None)
+        self.assertEqual(result["provider_id"], "301")
+        self.assertEqual(forms[0]["video_url"], "https://cdn.test/2.mp4")
+        self.assertEqual(forms[1]["children"], "101,102")
+
+    def test_container_timeout_is_submitted_and_reconcile_unlocks_only_prepublish_stage(self):
+        provider = instagram.InstagramProvider(); cred = credentials("instagram", "instagram-login")
+        manifest = {"expected_account_id": "42", "operation": "publish.image", "provider_payload": {"caption": "", "share_to_feed": False},
+                    "assets": [{"url": "https://cdn.test/i.jpg", "mime": "image/jpeg"}], "_resume_state": {}}
+        states = []
+        with patch.object(provider, "_host", return_value="graph.instagram.com"), \
+                patch.object(instagram, "graph_call", side_effect=core.ApiFailure("timeout", outcome="unknown")), \
+                self.assertRaises(core.ApiFailure) as raised:
+            provider.publish(cred, manifest, states.append)
+        self.assertEqual(raised.exception.outcome, "submitted")
+        self.assertEqual(states[-1]["stage"], "creating_container"); self.assertFalse(states[-1]["final_publish_started"])
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        row = {"status": "unknown", "attempted_at": old, "provider_state": states[-1]}
+        with patch.object(provider, "read") as read:
+            reconciled = provider.reconcile(cred, row)
+        self.assertEqual(reconciled["status"], "resume_safe"); read.assert_not_called()
+        with patch.object(provider, "read") as read:
+            empty_checkpoint = provider.reconcile(cred, {"status": "unknown", "attempted_at": old, "provider_state": {}})
+        self.assertEqual(empty_checkpoint["status"], "resume_safe"); read.assert_not_called()
+
+    def test_final_publish_timeout_is_not_resume_safe(self):
+        provider = instagram.InstagramProvider(); cred = credentials("instagram", "instagram-login")
+        manifest = {"expected_account_id": "42", "operation": "publish.image", "provider_payload": {"caption": "c", "share_to_feed": False},
+                    "assets": [{"url": "https://cdn.test/i.jpg", "mime": "image/jpeg"}],
+                    "_resume_state": {"stage": "container_created", "container_id": "101", "provider_id": "101", "final_publish_started": False}}
+        states = []
+        with patch.object(provider, "read", return_value={"data": {"status_code": "FINISHED"}}), \
+                patch.object(instagram, "graph_call", side_effect=core.ApiFailure("timeout", outcome="unknown")), \
+                self.assertRaises(core.ApiFailure):
+            provider.publish(cred, manifest, states.append)
+        self.assertTrue(states[-1]["final_publish_started"]); self.assertEqual(states[-1]["stage"], "final_publish_started")
+
     def test_professional_account_and_media_limits_are_enforced(self):
         provider = instagram.InstagramProvider()
         with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.carousel", {}, [{"kind": "remote", "mime": "image/jpeg"}])
         with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.image", {"caption": "x" * 2201}, [{"kind": "remote", "mime": "image/jpeg"}])
+        with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.image", {}, [{"kind": "remote", "mime": "image/png"}])
+        with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.reel", {}, [{"kind": "remote", "mime": "video/mp4", "fps": 61}])
+        normalized = provider.normalize_publish("publish.reel", {}, [{"kind": "remote", "mime": "video/mp4", "size": 100,
+                                                                       "container": "mp4", "video_codec": "h264", "audio_codec": "aac", "fps": 30}])
+        self.assertEqual(normalized["caption"], "")
 
     def test_reconcile_checks_container_but_preserves_final_media_id(self):
         provider = instagram.InstagramProvider(); row = {"provider_id": "media1", "provider_state": {"container_id": "container1", "provider_id": "media1"}}
