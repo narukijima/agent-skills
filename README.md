@@ -38,7 +38,7 @@ bash tools/import-skill.sh sns-api --target /path/to/agent-directory
 
 ### sns-api
 
-X / YouTube / Facebook Pages / Instagram Professional / Threadsの公式APIを、Common Safety Core + Provider Adapterで扱います。署名manifest、stable account/app/credential binding、Project/Agent call budget、canonical SQLite、media hash、write-ahead unknown、duplicate防止、Provider固有status/reconcileを共通化します。TikTokはplannedで、runtime未対応です。
+X / YouTube / Facebook Pages / Instagram Professional / Threadsの公式APIを、Common Safety Core + Provider Adapterで扱います。署名manifest、stable account/app/credential binding、Project/Agent call budget、canonical SQLite、media hash、write-ahead unknown、duplicate防止、Provider固有status/reconcileを共通化します。Xは承認済みURLを本文へ固定する引用、画像、動画、GIFを公式v2 APIで扱います。TikTokはplannedで、runtime未対応です。
 
 ```bash
 python3 skills/sns-api/scripts/sns_api.py capabilities
@@ -62,7 +62,33 @@ python3 skills/sns-api/scripts/sns_api.py send \
   --manifest .tmp/approved-x.json
 ```
 
-`send` はmanifest以外のplatform/text/media/account/ledger overrideを受け取りません。SQLiteは同一workspace/hostのcooperating processを直列化しますが、複数machineのglobal uniquenessは保証しません。完全無人のmulti-machine運用はdedicated single-writer gateway/central stateを使います。
+Xの引用はreplyや自動コメントではなく、`publish.quote` の `quote_url` を署名済み本文へ正規化して含めます。画像は1–4個のlocal asset、動画はlocal MP4、GIFはlocal GIFを指定します。以下の画像例ではlocal path/MIME/size/SHA-256とalt textがmanifestへ固定され、upload後にもasset hashを再検証してから `media_ids` 付きPostを作成します。
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py prepare \
+  --platform x --operation publish.quote \
+  --payload '{"text":"approved comment","quote_url":"https://x.com/example/status/123456789"}' \
+  --manifest .tmp/approved-x-quote.json \
+  --content-id c-quote-1 --expected-account-id 123456789 \
+  --account-type user --app-id x-production \
+  --expected-credential-fingerprint '<sha256>' \
+  --approval-id approval-quote-1
+```
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py prepare \
+  --platform x --operation publish.image \
+  --payload '{"text":"approved caption","assets":[{"kind":"local","path":"/absolute/photo.png","mime":"image/png"}],"alt_texts":["Approved image description"]}' \
+  --manifest .tmp/approved-x-image.json \
+  --content-id c-image-1 --expected-account-id 123456789 \
+  --account-type user --app-id x-production \
+  --expected-credential-fingerprint '<sha256>' \
+  --approval-id approval-image-1
+```
+
+`send` はmanifest以外のplatform/text/media/account/ledger overrideを受け取りません。X mediaの正確な `SNS_API_WRITE_MAX_CALLS` はasset数・chunk数・alt textからmanifestの `provider_call_plan.max_calls` に固定されます。SQLiteは同一workspace/hostのcooperating processを直列化しますが、複数machineのglobal uniquenessは保証しません。完全無人のmulti-machine運用はdedicated single-writer gateway/central stateを使います。
 
 Migration: 旧canonical `x-api` は `sns-api` にsupersedeされました。`x-api` / `x api` / `twitter-api` はactivation migration aliasとして残し、旧 `X_*` environmentは新 `SNS_*` と同値の場合だけ互換読取します。canonical implementation、path、state、CI、evalは `sns-api` 一つです。旧runtimeを停止後、`python3 skills/sns-api/scripts/sns_api.py migrate-legacy-x` でcanonical `state/x-api/` の投稿・unknown・重複・usage安全状態を監査付きで移行してください。最初のX write/recoveryと各budgeted X callも対応するguardを自動実行し、旧stateが不正または移行後に変更された場合はfail closedにします。
 

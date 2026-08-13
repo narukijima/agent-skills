@@ -4,7 +4,7 @@ The runtime registry is authoritative; inspect it with `capabilities`. This docu
 
 | Platform | Status | Read | Publish | Status/recovery |
 | --- | --- | --- | --- | --- |
-| X | supported | `identity.read`, `user.lookup`, `post.lookup`, `user.posts`, `post.search.recent`, `usage.read` | `publish.text` | `reconcile`, `manual.resolve` |
+| X | supported | `identity.read`, `user.lookup`, `post.lookup`, `user.posts`, `post.search.recent`, `usage.read` | `publish.text`, `publish.quote`, `publish.image`, `publish.video`, `publish.gif`, `media.upload.chunked` | `publish.status`, `reconcile`, `manual.resolve` |
 | YouTube | supported | `identity.read`, `video.lookup`, `own.videos` | `publish.video`, `media.upload.resumable` | `publish.status` |
 | Facebook | supported | `identity.read`, `page.content` | `publish.text`, `publish.image`, `publish.video` | `publish.status` |
 | Instagram | supported | `identity.read`, `media.read` | `publish.image`, `publish.video`, `publish.reel`, `publish.carousel` | `publish.status` |

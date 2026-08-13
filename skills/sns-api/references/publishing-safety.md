@@ -19,6 +19,8 @@ Schema v2 binds:
 
 For local assets, resolve a canonical non-symlink regular file and record MIME, size, and SHA-256. Re-resolve and re-hash before credential use or send. The duplicate intent hash binds normalized provider payload and asset metadata, so equal captions with different assets remain distinct intents. YouTube streams the verified file to its resumable session without reading the whole asset into memory. Treat its resumable session URI as capability-sensitive: store only its SHA-256 checkpoint, never the URI itself.
 
+X accepts only local media for this Skill. Images use the fixed v2 simple upload; video and GIF use initialize/append/finalize/status with bounded base64 chunks. Record only media IDs, media keys, segment count, processing state, metadata progress, and whether Post creation durably started. Reverify every asset after upload and before `POST /2/tweets`, detecting mutation during a long upload. Optional image `alt_texts` are approval-bound and written through `/2/media/metadata`; `made_with_ai` is also approval-bound. Never accept pre-uploaded caller media IDs because they are not bound to the manifest asset hashes.
+
 For remote assets, require HTTPS without URL userinfo, record host and expected MIME, and optionally record size/hash/ETag/Last-Modified supplied by the Project. Instagram, Threads, and supported Facebook media operations let the Provider fetch the URL. The Skill cannot prove the fetched bytes remained identical after prepare; `mutable_after_prepare: true` documents this limit. Do not add generic hosting.
 
 ## Attempt lifecycle
@@ -39,7 +41,7 @@ Process death after step 2 leaves `unknown`, so another process cannot duplicate
 
 Do not retry timeout, disconnect, authenticated redirect, 5xx, malformed success, or missing Provider ID. Run `reconcile`. A definite 4xx becomes `failed`; retry requires a newly signed approval ID. A 429 does not consume the publish attempt but still consumes the conservative daily call reservation; retry only after external rate policy allows it.
 
-Instagram/Threads `submitted` containers may be resumed by the same exact signed manifest because the container ID is durable and the adapter does not recreate it. Other Providers reject repeated sends after `submitted`. Once a final publish request becomes unknown, resume is disabled and reconcile is mandatory.
+Instagram/Threads `submitted` containers and X media still in `pending`/`in_progress` may be resumed by the same exact signed manifest because the durable checkpoint prevents recreation. Other Providers reject repeated sends after `submitted`. Once a final publish request becomes unknown, resume is disabled and reconcile is mandatory. An X crash durably known to precede `POST /2/tweets` can reconcile as `confirmed_absent`; once the `post_create_started` checkpoint is written, timeline reconciliation or audited manual resolve is required.
 
 ## Manual resolve
 

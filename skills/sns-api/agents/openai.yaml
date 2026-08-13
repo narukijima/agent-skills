@@ -1,6 +1,6 @@
 interface:
   display_name: "SNS API"
-  short_description: "5 SNS公式APIを署名manifestとcanonical ledgerで安全に実行"
-  default_prompt: "Use $sns-api explicitly to inspect capabilities or execute one budgeted, account-bound official SNS API intent through prepare, manifest-only send, status, and reconcile."
+  short_description: "5 SNS公式APIとX引用・mediaを署名manifestで安全に実行"
+  default_prompt: "Use $sns-api explicitly to inspect capabilities or execute one budgeted, account-bound official SNS API intent, including X URL quotes and local media, through prepare, manifest-only send, status, and reconcile."
 policy:
   allow_implicit_invocation: false

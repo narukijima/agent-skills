@@ -1,9 +1,9 @@
 ---
 name: sns-api
-description: Use only when explicitly requested to read or safely publish via official X, YouTube, Facebook Pages, Instagram Professional, or Threads APIs with signed manifests and reconciliation.
+description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "1.0.1"
+  claudagt.version: "1.1.0"
   claudagt.status: "active"
   claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -64,6 +64,8 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 - Reconcile through the provider's official status/read surface. Never infer `confirmed_absent` unless the provider-specific evidence proves absence.
 - Enable audited manual resolve only for X, with gateway privilege, out-of-band evidence, reason, and provider ID when resolving as published.
 - Verify local asset canonical path, MIME, size, and SHA-256 immediately before send. Refuse mutation.
+- For X, upload only manifest-bound local images/video/GIF through the fixed `/2/media/*` surface, checkpoint non-secret media IDs/keys, and reverify bytes before `POST /2/tweets`. Never accept caller-supplied media IDs.
+- For X quotes, require `publish.quote` with an approved `quote_url`; canonicalize that URL into the signed Post text. Do not expose reply automation or the dedicated `quote_tweet_id` field.
 - Treat remote media as mutable after prepare. Record URL, scheme, host, expected MIME and optional expected metadata; do not claim byte-level assurance when the provider fetches it.
 - Reject authenticated redirects and non-allowlisted credential destinations. Do not expose a generic URL or endpoint CLI.
 - Keep local SQLite's boundary explicit: it serializes cooperating processes on one workspace/host; it is not global uniqueness across machines. Use a dedicated single-writer gateway/central state for unattended multi-machine operation.
@@ -116,9 +118,35 @@ python3 skills/sns-api/scripts/sns_api.py prepare \
   --approval-id approval-2026-08-13-001
 ```
 
+For an X URL quote, use `publish.quote`; `prepare` appends the canonical Post URL to the signed text. For X media, provide local assets. Images may include matching `alt_texts`; videos and GIFs use chunked upload and may return `submitted` while X processing continues.
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py prepare \
+  --platform x --operation publish.quote \
+  --payload '{"text":"approved comment","quote_url":"https://x.com/example/status/123456789"}' \
+  --manifest .tmp/approved-x-quote.json \
+  --content-id content-2026-08-14-quote \
+  --expected-account-id 123456789 --account-type user \
+  --app-id x-production --expected-credential-fingerprint '<sha256>' \
+  --approval-id approval-2026-08-14-quote
+```
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py prepare \
+  --platform x --operation publish.image \
+  --payload '{"text":"approved caption","assets":[{"kind":"local","path":"/absolute/photo.png","mime":"image/png"}],"alt_texts":["Approved image description"]}' \
+  --manifest .tmp/approved-x-image.json \
+  --content-id content-2026-08-14-001 \
+  --expected-account-id 123456789 --account-type user \
+  --app-id x-production --expected-credential-fingerprint '<sha256>' \
+  --approval-id approval-2026-08-14-001
+```
+
 ### Send
 
-Set the exact signed call-plan budget for the manifest. `send` may safely resume an already-created Instagram/Threads container from canonical state; it never recreates a container after a final publish result became unknown.
+Set the exact signed call-plan budget for the manifest. `send` may safely resume an already-created Instagram/Threads container or an X media object still processing from canonical state; it never recreates content after a final publish request became unknown.
 
 ```bash
 SNS_API_WRITE_ENABLED=true SNS_API_WRITE_MAX_CALLS=4 \

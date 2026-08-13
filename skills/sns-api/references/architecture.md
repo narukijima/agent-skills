@@ -12,7 +12,7 @@
 
 The runtime is a Common Safety Core plus static, thin Provider adapters. The Core owns workspace resolution, manifests, approval/account/app/credential binding, budgets, ledger transactions, duplicate control, audit events, secret redaction, HTTP safety, media evidence, response envelopes, and dispatch. A Provider owns hosts, pinned version policy, credentials, authenticated identity, capability validation, API request shape, pagination, upload/publish protocol, native status, response normalization, reconciliation, and rate/quota metadata.
 
-`scripts/sns_api.py` is only the CLI. `scripts/sns_api_lib/core.py` orchestrates the lifecycle. `providers/base.py` is a shallow contract, not an inheritance framework. `providers/__init__.py` is a fixed registry; it never dynamically imports caller-selected code.
+`scripts/sns_api.py` is only the CLI. `scripts/sns_api_lib/core.py` orchestrates the lifecycle. `providers/base.py` is a shallow contract, not an inheritance framework. `providers/__init__.py` is a fixed registry; it never dynamically imports caller-selected code. X keeps auth/text/reconcile in `providers/x.py` and its upload/checkpoint protocol in the provider-owned `providers/x_media.py`; this is a static responsibility split, not a plugin system.
 
 ## Common lifecycle
 
@@ -25,7 +25,7 @@ The runtime is a Common Safety Core plus static, thin Provider adapters. The Cor
 7. A definite response becomes `published`, `submitted`, `failed`, or `rate_limited`. An uncertain response remains `unknown`.
 8. `status` exposes native async state. `reconcile` uses official Provider evidence and never blindly resends.
 
-Instagram and Threads may return `submitted` while a container is `IN_PROGRESS`. A second `send --manifest` is allowed only for the exact same signed manifest and only when the canonical checkpoint proves that the same container already exists; the adapter checks/finalizes it without recreating content. A timeout during the final publish call becomes `unknown`, which disables this resume path and requires reconciliation.
+Instagram and Threads may return `submitted` while a container is `IN_PROGRESS`; X video/GIF may do the same while uploaded media is processing. A second `send --manifest` is allowed only for the exact same signed manifest and only when the canonical checkpoint proves that the same container/media object already exists; the adapter checks/finalizes it without recreating content. A timeout during the final publish call becomes `unknown`, which disables this resume path and requires reconciliation.
 
 ## State and outcomes
 

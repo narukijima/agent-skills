@@ -53,6 +53,27 @@ class ManifestTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), self.assertRaises(core.ApiFailure) as raised: core.prepare(args)
         self.assertEqual(raised.exception.code, "SECRET_IN_MANIFEST"); self.assertFalse(path.exists())
 
+    def test_x_quote_and_image_assets_are_normalized_and_signed_at_prepare(self):
+        quote_path = Path(self.temp.name) / "quote.json"
+        make_manifest(quote_path, operation="publish.quote", payload={
+            "text": "approved comment", "quote_url": "https://twitter.com/example/status/123?tracking=1",
+        })
+        quote = signed(quote_path)
+        self.assertEqual(quote["provider_payload"]["quote_url"], "https://x.com/i/web/status/123")
+        self.assertTrue(quote["provider_payload"]["text"].endswith("https://x.com/i/web/status/123"))
+        image = Path(self.temp.name) / "photo.png"; image.write_bytes(b"approved-image-bytes")
+        image_path = Path(self.temp.name) / "image.json"
+        make_manifest(image_path, operation="publish.image", content_id="image-1", approval_id="image-approval", payload={
+            "text": "approved caption", "alt_texts": ["approved description"],
+            "assets": [{"kind": "local", "path": str(image), "mime": "image/png"}],
+        })
+        value = signed(image_path)
+        self.assertEqual(value["assets"][0]["path"], str(image.resolve()))
+        self.assertEqual(value["assets"][0]["size"], len(b"approved-image-bytes"))
+        self.assertEqual(len(value["assets"][0]["sha256"]), 64)
+        self.assertEqual(value["provider_payload"]["alt_texts"], ["approved description"])
+        self.assertEqual(value["provider_call_plan"]["max_calls"], 6)
+
     def test_send_parser_surface_has_manifest_only(self):
         import sns_api
         parser = sns_api.parser()

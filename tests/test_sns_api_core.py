@@ -62,6 +62,23 @@ class SnsApiCoreTests(unittest.TestCase):
             with self.assertRaises(core.ApiFailure): core.send(path)
         self.assertFalse((Path(self.temp.name) / "state/sns-api/ledger.sqlite3").exists())
 
+    def test_x_image_mutation_stops_before_budget_credentials_and_attempt(self):
+        image = Path(self.temp.name) / "photo.png"; image.write_bytes(b"approved")
+        path = Path(self.temp.name) / "image.json"
+        make_manifest(path, operation="publish.image", payload={
+            "text": "caption", "alt_texts": ["description"],
+            "assets": [{"kind": "local", "path": str(image), "mime": "image/png"}],
+        })
+        image.write_bytes(b"mutated")
+        provider = core.provider("x")
+        with patch.dict(os.environ, base_env(SNS_API_WRITE_MAX_CALLS="6"), clear=True), patch.object(provider, "credentials") as called:
+            with self.assertRaises(core.ApiFailure) as raised:
+                core.send(path)
+        self.assertEqual(raised.exception.code, "ASSET_MUTATED")
+        called.assert_not_called()
+        self.assertFalse((Path(self.temp.name) / "state/sns-api/usage.sqlite3").exists())
+        self.assertFalse((Path(self.temp.name) / "state/sns-api/ledger.sqlite3").exists())
+
     def test_unsafe_legacy_x_state_blocks_before_budget_or_credentials(self):
         path = Path(self.temp.name) / "m.json"; make_manifest(path)
         legacy = Path(self.temp.name) / "state/x-api/x-posts.sqlite3"
@@ -164,7 +181,7 @@ class SnsApiCoreTests(unittest.TestCase):
     def test_unsupported_provider_and_capability_fail_closed(self):
         with self.assertRaises(core.ApiFailure) as provider: core.provider("mastodon")
         self.assertEqual(provider.exception.code, "UNSUPPORTED_PROVIDER")
-        with self.assertRaises(core.ApiFailure) as capability: core.provider("x").require_capability("publish.image")
+        with self.assertRaises(core.ApiFailure) as capability: core.provider("x").require_capability("reply.create")
         self.assertEqual(capability.exception.code, "UNSUPPORTED_CAPABILITY")
 
     def test_budget_plan_mismatch_and_daily_exhaustion_stop_before_credentials(self):
@@ -230,7 +247,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("authorization", value); self.assertEqual(value["nested"], {})
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.0.1")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.1.0")
 
 
 if __name__ == "__main__": unittest.main()

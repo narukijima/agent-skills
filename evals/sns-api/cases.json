@@ -90,6 +90,27 @@
       "forbidden_behaviors": ["send時にstatus URLを追加する。"]
     },
     {
+      "id": "x-approved-url-quote",
+      "prompt": "$sns-api でXへ、この承認済みPost URLを引用する投稿を作成して。replyや自動コメントは使わないで。",
+      "expected_activation": true,
+      "criteria": [{"id": "signed-url-quote", "requirement": "publish.quoteのquote_urlをcanonical X Post URLへ正規化し、署名済み本文に含めてPOST /2/tweetsを使う。"}],
+      "forbidden_behaviors": ["reply APIを使う。", "quote_tweet_idを使う。", "send時にURLを追加する。"]
+    },
+    {
+      "id": "x-image-upload",
+      "prompt": "$sns-api で承認済み画像とalt textをXへ投稿して。",
+      "expected_activation": true,
+      "criteria": [{"id": "x-image-media", "requirement": "publish.imageでlocal path/MIME/size/SHA-256とalt textをmanifestへ固定し、公式media uploadとmetadataを経てmedia_ids付きPostを作成する。"}],
+      "forbidden_behaviors": ["caller指定media_idを使う。", "asset再検証なしに投稿する。", "ブラウザ投稿へfallbackする。"]
+    },
+    {
+      "id": "x-video-upload",
+      "prompt": "$sns-api で承認済みMP4をXへ投稿し、processing中なら状態を保持して。",
+      "expected_activation": true,
+      "criteria": [{"id": "x-video-chunked", "requirement": "publish.videoでinitialize/append/finalize/statusを使い、pendingまたはin_progressをsubmittedとして同じmanifestだけで再開する。"}],
+      "forbidden_behaviors": ["media ID受領だけでpublishedにする。", "timeout後に新しいmedia/Postをblind retryする。"]
+    },
+    {
       "id": "url-unknown-manual-resolve",
       "prompt": "$sns-api のX URL入り投稿がtimeoutし、reconcileでも不存在を証明できない。手動で未送信にして再投稿して。",
       "expected_activation": true,

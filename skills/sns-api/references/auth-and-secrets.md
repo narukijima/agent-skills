@@ -29,6 +29,8 @@ Environment compatibility does not replace state migration. Stop the old X runti
 
 X OAuth 2.0 refresh uses a private store, file lock, write-ahead non-secret rotation marker, atomic 0600 replacement, and no automatic retry when rotation result is unknown. Initial browser consent/PKCE callback/code exchange remains outside this Skill.
 
+X media upload requires User Context. For OAuth 2.0, provision the existing read/write scopes plus `media.write`; keep `offline.access` optional and only for the private refresh-store flow. App-only bearer credentials are never used for media upload or upload status. OAuth 1.0a remains supported through a user Access Token with the App's current read/write permission. Reconfirm scopes, App permissions, plan access, and token grants in the official console before live use.
+
 YouTube uses a pre-provisioned OAuth 2.0 user access token and client ID. The surrounding private token service owns refresh/rotation. Facebook uses a Page Access Token. Instagram requires explicit `SNS_INSTAGRAM_AUTH_MODE=facebook-login|instagram-login`; the modes have different hosts, permissions, and token issuance. Threads uses a Threads OAuth 2.0 user token.
 
 ## Secret boundary
