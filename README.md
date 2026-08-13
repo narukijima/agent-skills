@@ -64,7 +64,7 @@ python3 skills/sns-api/scripts/sns_api.py send \
 
 `send` はmanifest以外のplatform/text/media/account/ledger overrideを受け取りません。SQLiteは同一workspace/hostのcooperating processを直列化しますが、複数machineのglobal uniquenessは保証しません。完全無人のmulti-machine運用はdedicated single-writer gateway/central stateを使います。
 
-Migration: 旧canonical `x-api` は `sns-api` にsupersedeされました。`x-api` / `x api` / `twitter-api` はactivation migration aliasとして残し、旧 `X_*` environmentは新 `SNS_*` と同値の場合だけ互換読取します。canonical implementation、path、state、CI、evalは `sns-api` 一つです。旧ledgerは自動変換せず、未解決intentを旧workflowで解消してから新しい`state/sns-api/`を開始します。
+Migration: 旧canonical `x-api` は `sns-api` にsupersedeされました。`x-api` / `x api` / `twitter-api` はactivation migration aliasとして残し、旧 `X_*` environmentは新 `SNS_*` と同値の場合だけ互換読取します。canonical implementation、path、state、CI、evalは `sns-api` 一つです。旧runtimeを停止後、`python3 skills/sns-api/scripts/sns_api.py migrate-legacy-x` でcanonical `state/x-api/` の投稿・unknown・重複・usage安全状態を監査付きで移行してください。最初のX write/recoveryと各budgeted X callも対応するguardを自動実行し、旧stateが不正または移行後に変更された場合はfail closedにします。
 
 ## 検証
 

@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .core import ApiFailure, redact, state_path, utc_now
+from .core import ApiFailure, parse_time, redact, state_path, utc_now, workspace_info
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+LEGACY_SCHEMA_VERSION = "2"
+LEGACY_LEDGER = Path("state/x-api/x-posts.sqlite3")
+LEGACY_COLUMNS = {
+    "id", "account_id", "app_id", "app_fingerprint", "content_id", "content_sha256",
+    "text", "approval_id", "status", "attempts", "attempted_at", "updated_at", "post_id",
+    "http_status",
+}
+LEGACY_STATUS = {
+    "sent": "published",
+    "unknown": "unknown",
+    "failed": "failed",
+    "confirmed_absent": "confirmed_absent",
+    "rate_limited": "rate_limited",
+}
+SNS_COLUMNS = {
+    "id", "platform", "account_id", "account_type", "app_id", "credential_fingerprint",
+    "operation", "content_id", "payload_hash", "intent_hash", "provider_payload", "manifest_hash",
+    "approval_id", "status", "attempts", "attempted_at", "updated_at", "provider_id",
+    "provider_status", "provider_state", "http_status",
+}
 
 
 def open_ledger() -> sqlite3.Connection:
@@ -21,7 +43,7 @@ def open_ledger() -> sqlite3.Connection:
     schema = (
         """
         CREATE TABLE IF NOT EXISTS ledger_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-        INSERT OR IGNORE INTO ledger_meta VALUES('schema_version','2');
+        INSERT OR IGNORE INTO ledger_meta VALUES('schema_version','3');
         CREATE TABLE IF NOT EXISTS intents(
           id INTEGER PRIMARY KEY,
           platform TEXT NOT NULL,
@@ -52,6 +74,12 @@ def open_ledger() -> sqlite3.Connection:
           event TEXT NOT NULL,status TEXT NOT NULL,recorded_at TEXT NOT NULL,
           http_status INTEGER,detail TEXT
         );
+        CREATE TABLE IF NOT EXISTS legacy_x_migrations(
+          legacy_intent_id INTEGER PRIMARY KEY,
+          intent_id INTEGER NOT NULL UNIQUE REFERENCES intents(id),
+          source_row_hash TEXT NOT NULL,
+          migrated_at TEXT NOT NULL
+        );
         """
     )
     try:
@@ -66,13 +94,198 @@ def open_ledger() -> sqlite3.Connection:
                     raise
                 time.sleep(0.01)
         row = connection.execute("SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
+        columns = {item[1] for item in connection.execute("PRAGMA table_info(intents)")}
+        if row is not None and row[0] == "2" and SNS_COLUMNS.issubset(columns):
+            connection.execute("UPDATE ledger_meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+            row = connection.execute("SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
     except Exception:
         connection.close()
         raise
-    if row is None or row[0] != str(SCHEMA_VERSION):
+    if row is None or row[0] != str(SCHEMA_VERSION) or not SNS_COLUMNS.issubset(columns):
         connection.close()
         raise ApiFailure("unsupported canonical ledger schema_version", code="LEDGER_SCHEMA")
     return connection
+
+
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_snapshot(path: Path) -> tuple[str, list[Dict[str, Any]]]:
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("BEGIN")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        schema = connection.execute("SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(intents)")}
+        if integrity is None or integrity[0] != "ok" or schema is None or schema[0] != LEGACY_SCHEMA_VERSION:
+            raise ApiFailure("legacy X ledger is not a supported, intact schema", code="LEGACY_X_STATE_UNSAFE")
+        if not LEGACY_COLUMNS.issubset(columns):
+            raise ApiFailure("legacy X ledger is missing required safety fields", code="LEGACY_X_STATE_UNSAFE")
+        rows = [dict(row) for row in connection.execute(
+            "SELECT id,account_id,app_id,app_fingerprint,content_id,content_sha256,text,approval_id,status,attempts,attempted_at,updated_at,post_id,http_status FROM intents ORDER BY id"
+        )]
+        connection.rollback()
+    except ApiFailure:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise ApiFailure("legacy X ledger cannot be read safely; X operations are blocked", code="LEGACY_X_STATE_UNSAFE") from exc
+    finally:
+        try:
+            connection.close()
+        except UnboundLocalError:
+            pass
+    for row in rows:
+        if row["status"] not in LEGACY_STATUS:
+            raise ApiFailure("legacy X ledger contains an unsupported intent state", code="LEGACY_X_STATE_UNSAFE")
+        if (not str(row["account_id"]).isdigit() or not str(row["content_id"]).strip()
+                or not str(row["approval_id"]).strip() or not str(row["app_id"]).strip()
+                or not isinstance(row["text"], str) or not row["text"]
+                or not isinstance(row["attempts"], int) or row["attempts"] < 0
+                or not isinstance(row["id"], int) or row["id"] < 1
+                or (row["http_status"] is not None and not isinstance(row["http_status"], int))
+                or (row["status"] == "sent" and not str(row["post_id"] or "").isdigit())
+                or (row["status"] == "unknown" and row["attempted_at"] is None)):
+            raise ApiFailure("legacy X ledger contains an invalid intent", code="LEGACY_X_STATE_UNSAFE")
+        try:
+            parse_time(str(row["updated_at"]), "legacy updated_at")
+            if row["attempted_at"] is not None:
+                parse_time(str(row["attempted_at"]), "legacy attempted_at")
+        except ApiFailure as exc:
+            raise ApiFailure("legacy X ledger contains an invalid timestamp", code="LEGACY_X_STATE_UNSAFE") from exc
+        expected = hashlib.sha256(row["text"].encode("utf-8")).hexdigest()
+        if (expected != row["content_sha256"] or not isinstance(row["app_fingerprint"], str)
+                or len(row["app_fingerprint"]) != 64
+                or any(char not in "0123456789abcdef" for char in row["app_fingerprint"])):
+            raise ApiFailure("legacy X ledger intent integrity check failed", code="LEGACY_X_STATE_UNSAFE")
+    snapshot = {"schema_version": LEGACY_SCHEMA_VERSION, "rows": rows}
+    return _sha256_json(snapshot), rows
+
+
+def _combined_status(current: str, legacy: str) -> str:
+    if "unknown" in {current, legacy}:
+        return "unknown"
+    if current in {"submitting", "submitted"}:
+        return current
+    if legacy == "published" or current == "published":
+        return "published"
+    return current
+
+
+def ensure_legacy_x_migrated() -> Dict[str, Any]:
+    root, _ = workspace_info()
+    legacy_path = root / LEGACY_LEDGER
+    if not legacy_path.exists():
+        canonical = state_path("ledger.sqlite3")
+        if canonical.exists():
+            try:
+                check = sqlite3.connect(canonical.as_uri() + "?mode=ro", uri=True)
+                marker = check.execute(
+                    "SELECT value FROM ledger_meta WHERE key='legacy_x_ledger_digest'"
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise ApiFailure("canonical SNS ledger cannot be read safely", code="LEDGER_SCHEMA") from exc
+            finally:
+                try:
+                    check.close()
+                except UnboundLocalError:
+                    pass
+            if marker is not None:
+                raise ApiFailure("legacy X ledger disappeared after migration", code="LEGACY_X_STATE_CHANGED")
+        return {"status": "absent", "source": str(LEGACY_LEDGER), "imported": 0}
+    cursor = root
+    redirected = False
+    for component in LEGACY_LEDGER.parts:
+        cursor = cursor / component
+        redirected = redirected or cursor.is_symlink()
+    if not legacy_path.is_file() or redirected:
+        raise ApiFailure("legacy X ledger path is not a regular canonical file", code="LEGACY_X_STATE_UNSAFE")
+    digest, rows = _legacy_snapshot(legacy_path)
+    connection = open_ledger()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        marker = connection.execute(
+            "SELECT value FROM ledger_meta WHERE key='legacy_x_ledger_digest'"
+        ).fetchone()
+        if marker is not None:
+            if marker[0] != digest:
+                raise ApiFailure(
+                    "legacy X ledger changed after migration; retire the legacy runtime before X operations",
+                    code="LEGACY_X_STATE_CHANGED",
+                )
+            imported = connection.execute("SELECT COUNT(*) FROM legacy_x_migrations").fetchone()[0]
+            connection.commit()
+            return {"status": "already_migrated", "source": str(LEGACY_LEDGER), "imported": int(imported), "digest": digest}
+        imported = 0
+        for legacy in rows:
+            normalized = {"text": legacy["text"]}
+            payload_hash = _sha256_json(normalized)
+            intent_hash = _sha256_json({"provider_payload": normalized, "assets": []})
+            source_hash = _sha256_json(legacy)
+            mapped_status = LEGACY_STATUS[legacy["status"]]
+            existing = connection.execute(
+                "SELECT * FROM intents WHERE platform='x' AND account_id=? AND (content_id=? OR intent_hash=?)",
+                (str(legacy["account_id"]), legacy["content_id"], intent_hash),
+            ).fetchone()
+            legacy_state = json.dumps(
+                {"legacy_source": str(LEGACY_LEDGER), "legacy_schema_version": 2, "legacy_intent_id": legacy["id"]},
+                sort_keys=True,
+            )
+            if existing is not None:
+                if (existing["content_id"] != legacy["content_id"] or existing["payload_hash"] != payload_hash
+                        or existing["intent_hash"] != intent_hash):
+                    raise ApiFailure("legacy X intent conflicts with canonical SNS state", code="LEGACY_X_STATE_CONFLICT")
+                status = _combined_status(str(existing["status"]), mapped_status)
+                use_legacy_unknown = mapped_status == "unknown" and existing["status"] != "unknown"
+                connection.execute(
+                    "UPDATE intents SET status=?,attempts=?,app_id=?,credential_fingerprint=?,approval_id=?,attempted_at=?,updated_at=?,provider_id=COALESCE(?,provider_id),provider_status=?,provider_state=? WHERE id=?",
+                    (
+                        status, int(existing["attempts"]) + int(legacy["attempts"]),
+                        legacy["app_id"] if use_legacy_unknown else existing["app_id"],
+                        legacy["app_fingerprint"] if use_legacy_unknown else existing["credential_fingerprint"],
+                        legacy["approval_id"] if use_legacy_unknown else existing["approval_id"],
+                        legacy["attempted_at"] if use_legacy_unknown else existing["attempted_at"],
+                        max(str(existing["updated_at"]), str(legacy["updated_at"])),
+                        legacy["post_id"], "legacy-x-api:" + legacy["status"],
+                        legacy_state if use_legacy_unknown else existing["provider_state"], existing["id"],
+                    ),
+                )
+                intent_id = int(existing["id"])
+            else:
+                cursor = connection.execute(
+                    "INSERT INTO intents(platform,account_id,account_type,app_id,credential_fingerprint,operation,content_id,payload_hash,intent_hash,provider_payload,manifest_hash,approval_id,status,attempts,attempted_at,updated_at,provider_id,provider_status,provider_state,http_status) VALUES('x',?,?,?,?, 'publish.text',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(legacy["account_id"]), "user", legacy["app_id"], legacy["app_fingerprint"],
+                        legacy["content_id"], payload_hash, intent_hash,
+                        json.dumps(normalized, ensure_ascii=False, sort_keys=True),
+                        hashlib.sha256(("legacy-x-api-v2:" + source_hash).encode()).hexdigest(),
+                        legacy["approval_id"], mapped_status, legacy["attempts"], legacy["attempted_at"],
+                        legacy["updated_at"], legacy["post_id"], "legacy-x-api:" + legacy["status"], legacy_state,
+                        legacy["http_status"],
+                    ),
+                )
+                intent_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO legacy_x_migrations(legacy_intent_id,intent_id,source_row_hash,migrated_at) VALUES(?,?,?,?)",
+                (legacy["id"], intent_id, source_hash, utc_now()),
+            )
+            _event(connection, intent_id, "legacy-x-migration", mapped_status, legacy["http_status"], {
+                "source": str(LEGACY_LEDGER), "source_schema_version": 2,
+                "legacy_intent_id": legacy["id"], "legacy_status": legacy["status"],
+            })
+            imported += 1
+        connection.execute("INSERT INTO ledger_meta(key,value) VALUES('legacy_x_ledger_digest',?)", (digest,))
+        connection.execute("INSERT INTO ledger_meta(key,value) VALUES('legacy_x_migrated_at',?)", (utc_now(),))
+        connection.commit()
+        return {"status": "migrated", "source": str(LEGACY_LEDGER), "imported": imported, "digest": digest}
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _event(connection: sqlite3.Connection, intent_id: int, event: str, status: str,

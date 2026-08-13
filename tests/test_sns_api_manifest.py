@@ -59,6 +59,7 @@ class ManifestTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--platform", "x"])
             with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--payload", "{}"])
+            with self.assertRaises(SystemExit): parser.parse_args(["migrate-legacy-x", "--ledger", "/tmp/other.sqlite3"])
 
     def test_workspace_resolution_uses_nearest_git_marker_and_fails_closed(self):
         root = Path(self.temp.name) / "repo"; script = root / "deep/scripts/file.py"; script.parent.mkdir(parents=True); script.write_text("")

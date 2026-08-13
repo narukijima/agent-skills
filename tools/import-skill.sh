@@ -94,6 +94,7 @@ source_version="$(<"$source_version_file")"
 
 mkdir -p "$target_root/skills"
 cp -R "$source_dir" "$temporary_dir/$skill_name"
+chmod -R u+w "$temporary_dir/$skill_name"
 find "$temporary_dir/$skill_name" \( -type d -name '__pycache__' \) -prune -exec rm -rf {} +
 find "$temporary_dir/$skill_name" -type f \( -name '*.pyc' -o -name '.DS_Store' \) -delete
 python3 - "$temporary_dir/$skill_name/SKILL.md" <<'PY'

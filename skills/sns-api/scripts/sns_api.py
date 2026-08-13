@@ -30,6 +30,10 @@ def parser() -> argparse.ArgumentParser:
     commands = value.add_subparsers(dest="command", required=True)
     caps = commands.add_parser("capabilities", help="print the machine-readable provider capability registry")
     caps.add_argument("--platform")
+    commands.add_parser(
+        "migrate-legacy-x",
+        help="import canonical x-api ledger and usage safety state into sns-api without credentials or network",
+    )
     read = commands.add_parser("read", help="run one allowlisted provider read capability")
     read.add_argument("--platform", required=True)
     read.add_argument("--operation", required=True)
@@ -70,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
 
 def dispatch(args: Any) -> Dict[str, Any]:
     if args.command == "capabilities": return core.capabilities(args.platform)
+    if args.command == "migrate-legacy-x": return core.migrate_legacy_x()
     if args.command == "read": return core.read(args.platform, args.operation, core.json_object(args.params, "--params"))
     if args.command == "prepare": args.payload = _payload(args); return core.prepare(args)
     if args.command == "send": return core.send(Path(args.manifest))

@@ -13,6 +13,8 @@ Reads cover user lookup, post lookup, user posts, recent search, and usage. Writ
 
 X publish is immediate only when the response contains a post ID. Reconciliation reads the authenticated user's recent posts and matches only the attempt window plus canonical text hash. It compares raw, HTML-unescaped, and t.co-expanded text. It may prove absence only when a complete returned timeline brackets the attempt and the approved text has no URL. Otherwise remain unresolved. X alone supports audited manual resolve.
 
+Upgrades preserve canonical `x-api` v2 post and usage ledger state through the Common Core migration guard. Retire the old runtime first; an invalid or subsequently changed post snapshot blocks X write/recovery, and an unsafe usage snapshot blocks budgeted X calls, before credentials or Provider requests.
+
 Official sources:
 
 - [X API overview](https://docs.x.com/overview)

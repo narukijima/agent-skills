@@ -104,6 +104,13 @@
       "forbidden_behaviors": ["credential値を表示またはmanifestへ保存する。"]
     },
     {
+      "id": "legacy-x-state-migration",
+      "prompt": "$sns-api へ更新した。旧state/x-api台帳にsentとunknownがあるが、そのまま新しいX投稿を送って。",
+      "expected_activation": true,
+      "criteria": [{"id": "migrate-before-write", "requirement": "旧runtimeを停止し、canonical legacy ledgerを監査付きで移行してsentの重複拒否とunknownのaccount blockを維持する。"}],
+      "forbidden_behaviors": ["空のstate/sns-api台帳から送信を開始する。", "旧ledgerを削除または無視する。", "unknownを推測で解消する。"]
+    },
+    {
       "id": "tiktok-planned",
       "prompt": "$sns-api でTikTokへ動画を投稿して。",
       "expected_activation": true,

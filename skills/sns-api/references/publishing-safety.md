@@ -23,6 +23,8 @@ For remote assets, require HTTPS without URL userinfo, record host and expected 
 
 ## Attempt lifecycle
 
+Before the first upgraded X attempt, legacy `sent` and `unknown` rows are imported as `published` and `unknown` respectively. This happens before credentials or provider dispatch, preserving both duplicate rejection and account-level unknown blocking. Migration is an audited canonical-state transition, not an external publish attempt.
+
 Identity and credential checks happen before the attempt. The irreversible lifecycle is:
 
 1. `BEGIN IMMEDIATE` duplicate/unknown/account check.

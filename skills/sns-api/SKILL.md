@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X, YouTube, Facebook Pages, Instagram Professional, or Threads APIs with signed manifests and reconciliation.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "1.0.0"
+  claudagt.version: "1.0.1"
   claudagt.status: "active"
   claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -57,6 +57,7 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 - Let `prepare` accept provider JSON. Let `send` accept only `--manifest`; never add send-time platform, account, text, caption, media, or ledger overrides.
 - Verify authenticated identity, account type, app label, and credential fingerprint before writing an attempt.
 - Store canonical single-host state only under `state/sns-api/ledger.sqlite3` and `state/sns-api/usage.sqlite3`, resolved from the nearest `.git` marker. Do not accept arbitrary state paths.
+- Before any X write/recovery operation, detect canonical legacy `state/x-api/` post state; before every budgeted X call, detect legacy usage state. Migrate duplicate, unknown, result, and call-budget state once with audit records. Block the affected X operation if legacy state is invalid or changes after migration; never silently start with empty safety state.
 - Write the attempt as `unknown` before the first irreversible provider request.
 - Block blind retry of `unknown`, and block new sends to the same platform/account while an unknown remains.
 - Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID as `unknown`; treat 4xx as `failed`; preserve 429/rate metadata without automatic sleep.
@@ -74,6 +75,14 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 ```bash
 python3 skills/sns-api/scripts/sns_api.py capabilities
 python3 skills/sns-api/scripts/sns_api.py capabilities --platform instagram
+```
+
+### Upgrade legacy X safety state
+
+Retire the legacy runtime, then run this local, credential-free migration before the first X operation. X runtime paths also enforce the same migration guard automatically.
+
+```bash
+python3 skills/sns-api/scripts/sns_api.py migrate-legacy-x
 ```
 
 ### Read

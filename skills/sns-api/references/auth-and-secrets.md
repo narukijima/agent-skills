@@ -25,6 +25,8 @@ Every write Provider requires `SNS_<PROVIDER>_APP_ID` for the operator label and
 
 X supports migration aliases for the former `X_*` variables. New names win only when the old value is absent or identical; conflicting old/new values fail closed without printing either value. Deprecated controls include `X_API_READ_ENABLED`, `X_POSTING_ENABLED`, `X_API_*_MAX_CALLS`, Project/Agent/daily limits, `X_API_APP_ID`, `X_API_MANIFEST_SIGNING_KEY`, OAuth 1.0a variables, bearer token, and OAuth 2.0 variables.
 
+Environment compatibility does not replace state migration. Stop the old X runtime and run `sns_api.py migrate-legacy-x`. This credential-free command reads no caller-selected path: it imports only the canonical legacy post and usage ledgers, records audit mappings/digests, and is safe to repeat. X write/recovery entry points enforce the post-ledger check, and budgeted X calls enforce the usage-ledger check, before credentials or Provider requests. Do not delete, rename, edit, or acknowledge away an old ledger to unblock the guard.
+
 X OAuth 2.0 refresh uses a private store, file lock, write-ahead non-secret rotation marker, atomic 0600 replacement, and no automatic retry when rotation result is unknown. Initial browser consent/PKCE callback/code exchange remains outside this Skill.
 
 YouTube uses a pre-provisioned OAuth 2.0 user access token and client ID. The surrounding private token service owns refresh/rotation. Facebook uses a Page Access Token. Instagram requires explicit `SNS_INSTAGRAM_AUTH_MODE=facebook-login|instagram-login`; the modes have different hosts, permissions, and token issuance. Threads uses a Threads OAuth 2.0 user token.

@@ -62,6 +62,17 @@ class SnsApiCoreTests(unittest.TestCase):
             with self.assertRaises(core.ApiFailure): core.send(path)
         self.assertFalse((Path(self.temp.name) / "state/sns-api/ledger.sqlite3").exists())
 
+    def test_unsafe_legacy_x_state_blocks_before_budget_or_credentials(self):
+        path = Path(self.temp.name) / "m.json"; make_manifest(path)
+        legacy = Path(self.temp.name) / "state/x-api/x-posts.sqlite3"
+        legacy.parent.mkdir(parents=True); legacy.write_bytes(b"not-a-sqlite-ledger")
+        provider = core.provider("x")
+        with patch.dict(os.environ, base_env(), clear=True), patch.object(provider, "credentials") as called:
+            with self.assertRaises(core.ApiFailure) as raised: core.send(path)
+        self.assertEqual(raised.exception.code, "LEGACY_X_STATE_UNSAFE")
+        called.assert_not_called()
+        self.assertFalse((Path(self.temp.name) / "state/sns-api/usage.sqlite3").exists())
+
     def test_one_credential_snapshot_is_reused_for_identity_and_publish(self):
         path = Path(self.temp.name) / "m.json"; make_manifest(path); provider = core.provider("x")
         snapshot = credentials(); seen = []
@@ -219,7 +230,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("authorization", value); self.assertEqual(value["nested"], {})
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.0.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.0.1")
 
 
 if __name__ == "__main__": unittest.main()

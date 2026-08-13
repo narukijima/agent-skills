@@ -124,7 +124,7 @@ def prepare(args: Any) -> Dict[str, Any]:
 def send(manifest_path: Path) -> Dict[str, Any]:
     from .auth import global_control, provider_app_id
     from .budget import reserve_calls
-    from .ledger import get_intent, record_result, reserve_attempt, update_provider_state
+    from .ledger import ensure_legacy_x_migrated, get_intent, record_result, reserve_attempt, update_provider_state
     from .manifest import load_manifest
     from .media import verify_assets
 
@@ -133,6 +133,8 @@ def send(manifest_path: Path) -> Dict[str, Any]:
     item.require_capability(manifest["operation"])
     if global_control("WRITE_ENABLED", legacy=item.legacy_write_gate) != "true":
         raise ApiFailure("external write requires SNS_API_WRITE_ENABLED=true", code="WRITE_DISABLED")
+    if item.name == "x":
+        ensure_legacy_x_migrated()
     if provider_app_id(item.name) != manifest["app_id"]:
         raise ApiFailure("configured app ID does not match manifest app_id", code="APP_MISMATCH")
     verify_assets(manifest.get("assets", []))
@@ -210,10 +212,12 @@ def status(platform: str, operation: str, resource_id: str) -> Dict[str, Any]:
 def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[str, Any]:
     from .auth import global_control
     from .budget import reserve_calls
-    from .ledger import get_intent, record_result
+    from .ledger import ensure_legacy_x_migrated, get_intent, record_result
     item = provider(platform)
     if global_control("READ_ENABLED", legacy=item.legacy_read_gate) != "true":
         raise ApiFailure("reconcile requires SNS_API_READ_ENABLED=true", code="READ_DISABLED")
+    if platform == "x":
+        ensure_legacy_x_migrated()
     row = get_intent(platform, expected_account_id, content_id)
     if row["status"] not in {"unknown", "submitted"}:
         return envelope(platform, "reconcile", status_value=row["status"], data={"reconciled": False})
@@ -242,11 +246,13 @@ def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[
 def resolve(platform: str, content_id: str, expected_account_id: str, outcome: str,
             reason: str, provider_id: Optional[str]) -> Dict[str, Any]:
     from .auth import manifest_signing_key
-    from .ledger import get_intent, manual_resolve
+    from .ledger import ensure_legacy_x_migrated, get_intent, manual_resolve
     item = provider(platform)
     if not item.supports_manual_resolve:
         raise ApiFailure("manual resolve is not supported for provider: " + platform, code="UNSUPPORTED_CAPABILITY")
     manifest_signing_key()
+    if platform == "x":
+        ensure_legacy_x_migrated()
     if not reason.strip():
         raise ApiFailure("manual resolve requires out-of-band evidence in --reason", code="EVIDENCE_REQUIRED")
     if outcome == "published" and not item.valid_provider_id(provider_id):
@@ -257,6 +263,20 @@ def resolve(platform: str, content_id: str, expected_account_id: str, outcome: s
         "content_id": content_id, "account_id": expected_account_id, "provider_id": provider_id,
         "reason": reason.strip(), "event": "manual-resolve", "ledger": str(state_path("ledger.sqlite3")),
     })
+
+
+def migrate_legacy_x() -> Dict[str, Any]:
+    from .budget import ensure_legacy_x_usage_migrated
+    from .ledger import ensure_legacy_x_migrated
+
+    ledger = ensure_legacy_x_migrated()
+    usage = ensure_legacy_x_usage_migrated()
+    status_value = "success" if ledger["status"] in {"absent", "migrated", "already_migrated"} else "failed"
+    return envelope(
+        "x", "state.migrate", status_value=status_value,
+        data={"ledger": ledger, "usage": usage, **workspace_metadata()},
+        provider_meta={"legacy_runtime_must_be_retired": True},
+    )
 
 
 def secret_values() -> list[str]:
