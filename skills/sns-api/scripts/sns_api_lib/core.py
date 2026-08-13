@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import quote, quote_plus
 
 
 class ApiFailure(RuntimeError):
@@ -309,7 +310,7 @@ def secret_values() -> list[str]:
     result = []
     for key, value in os.environ.items():
         upper = key.upper()
-        if value and any(part in upper for part in ("TOKEN", "SECRET", "SIGNING_KEY", "PASSWORD")):
+        if value and any(part in upper for part in ("TOKEN", "SECRET", "SIGNING_KEY", "PASSWORD", "API_KEY", "ACCESS_KEY", "PRIVATE_KEY")):
             result.append(value)
     return sorted(result, key=len, reverse=True)
 
@@ -319,15 +320,18 @@ def redact(value: Any) -> Any:
     if isinstance(value, dict):
         def sensitive_key(key: Any) -> bool:
             name = str(key).lower().replace("-", "_")
-            return (name in {"authorization", "cookie", "set_cookie", "password", "api_key", "signature"}
-                    or name.endswith(("_token", "_secret", "_password", "_api_key", "_signature")))
+            return (name in {"authorization", "cookie", "set_cookie", "password", "api_key", "signature",
+                             "token", "secret", "credential", "session_url", "capability_url"}
+                    or name.endswith(("_token", "_secret", "_password", "_api_key", "_signature",
+                                      "_credential", "_session_url", "_capability_url")))
         return {str(key): redact(item) for key, item in value.items() if not sensitive_key(key)}
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, str):
         text = value
         for secret in secrets_found:
-            text = text.replace(secret, "[REDACTED]")
+            for representation in {secret, quote(secret, safe=""), quote_plus(secret, safe="")}:
+                text = text.replace(representation, "[REDACTED]")
         return text[:8000]
     return value
 

@@ -69,6 +69,13 @@ class ThreadsTests(unittest.TestCase):
         with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.text", {"text": ""}, [])
         with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.image", {}, [{"kind": "local", "mime": "image/jpeg"}])
 
+    def test_status_resource_id_rejects_graph_path_escape(self):
+        provider = threads.ThreadsProvider(); cred = credentials("threads", "threads-oauth2")
+        with patch.object(threads, "_account", return_value="42"), patch.object(threads, "graph_call") as call:
+            with self.assertRaises(core.ApiFailure) as unsafe:
+                provider.read(cred, "publish.status", {"resource_id": "42/threads?fields=access_token"})
+        self.assertEqual(unsafe.exception.code, "INVALID_PARAMETER"); call.assert_not_called()
+
     def test_reconcile_checks_container_but_preserves_final_post_id(self):
         provider = threads.ThreadsProvider(); row = {"provider_id": "post1", "provider_state": {"container_id": "container1", "provider_id": "post1"}}
         with patch.object(provider, "read", return_value={"data": {"status": "PUBLISHED"}}) as called:

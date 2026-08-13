@@ -168,6 +168,9 @@ class YouTubeTests(unittest.TestCase):
         with self.assertRaises(core.ApiFailure): provider.normalize_publish("publish.video", {"title": "T"}, [])
         with self.assertRaises(core.ApiFailure): media.remote_asset({"kind": "remote", "url": "https://cdn.test/video.mp4?token=secret", "mime": "video/mp4"})
         with self.assertRaises(core.ApiFailure): media.remote_asset({"kind": "remote", "url": "https://cdn.test/video.mp4?X-Goog-Signature=secret", "mime": "video/mp4"})
+        with self.assertRaises(core.ApiFailure): media.remote_asset({"kind": "remote", "url": "https://cdn.test/video.mp4?download=1", "mime": "video/mp4"})
+        with self.assertRaises(core.ApiFailure): media.remote_asset({"kind": "remote", "url": "https://cdn.test/video.mp4#private", "mime": "video/mp4"})
+        self.assertEqual(media.remote_asset({"kind": "remote", "url": "https://cdn.test/video.mp4", "mime": "video/mp4"})["host"], "cdn.test")
 
     def test_upload_status_reconcile_distinguishes_processing_and_success(self):
         provider = youtube.YouTubeProvider(); cred = credentials("youtube"); row = {"provider_id": "v1", "provider_state": {}}

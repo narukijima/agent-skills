@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, Iterable, Optional
+from urllib.parse import quote
 
 from ..core import ApiFailure, parse_time
 from ..http import classify, request
@@ -12,6 +14,14 @@ META_VERSION = "v26.0"
 META_HOST = "graph.facebook.com"
 INSTAGRAM_HOST = "graph.instagram.com"
 THREADS_HOST = "graph.threads.net"
+GRAPH_ID = re.compile(r"[0-9]+(?:_[0-9]+)?")
+
+
+def graph_id(value: Any, label: str = "resource_id") -> str:
+    text = str(value)
+    if not GRAPH_ID.fullmatch(text):
+        raise ApiFailure(label + " must be a stable Meta object ID", code="INVALID_PARAMETER")
+    return quote(text, safe="")
 
 
 def graph_call(host: str, version: str, token: str, method: str, path: str,

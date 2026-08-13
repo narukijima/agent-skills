@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from ..auth import bearer_credentials
 from ..core import ApiFailure, parse_time, utc_now
 from .base import Provider
-from .meta_common import META_HOST, META_VERSION, graph_call, normalized, require_remote
+from .meta_common import META_HOST, META_VERSION, graph_call, graph_id, normalized, require_remote
 
 
 class FacebookProvider(Provider):
@@ -50,7 +50,7 @@ class FacebookProvider(Provider):
             result, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", account + "/feed",
                                       query={"fields": "id,message,created_time,permalink_url,attachments", "limit": _limit(params.get("limit", 25)), "after": params.get("after")})
         elif operation == "publish.status":
-            result, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", str(params.get("resource_id", "")),
+            result, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", graph_id(params.get("resource_id")),
                                       query={"fields": "id,status,permalink_url,created_time"})
         else: raise ApiFailure("unsupported Facebook read", code="UNSUPPORTED_CAPABILITY")
         return normalized(result, body)
@@ -122,7 +122,7 @@ class FacebookProvider(Provider):
 
 def _account():
     from ..auth import provider_env
-    return provider_env("facebook", "PAGE_ID", required=True)
+    return graph_id(provider_env("facebook", "PAGE_ID", required=True), "Facebook Page ID")
 
 
 def _limit(value):

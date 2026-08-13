@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,14 @@ from sns_api_lib.providers import x
 
 def result(body, status=200, rate_limit=None):
     return type("R", (), {"body": body, "status": status, "rate_limit": rate_limit or {}})()
+
+
+@contextmanager
+def private_store():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "state" / "sns-api" / "private" / "x-oauth2"
+        with patch.object(x, "state_path", return_value=root):
+            yield root / "tokens.json"
 
 
 class XProviderTests(unittest.TestCase):
@@ -202,8 +211,7 @@ class XProviderTests(unittest.TestCase):
             with self.assertRaises(core.ApiFailure): x.XProvider().credentials(True)
 
     def test_oauth2_refresh_rotates_private_store_and_caches(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Path(directory) / "tokens.json"
+        with private_store() as store:
             response = type("R", (), {"body": {"access_token": "at1", "refresh_token": "rt2", "expires_in": 7200}})()
             with patch.object(x, "request", return_value=response) as called:
                 self.assertEqual(x._refresh_token("cid", "secret", str(store), "rt1"), "at1")
@@ -215,8 +223,8 @@ class XProviderTests(unittest.TestCase):
 
     @unittest.skipIf(x.fcntl is None, "fcntl is required for the runtime contract")
     def test_oauth2_refresh_lock_allows_only_one_rotation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Path(directory) / "tokens.json"; calls = []; results = []
+        with private_store() as store:
+            calls = []; results = []
             response = type("R", (), {"body": {"access_token": "at1", "refresh_token": "rt2", "expires_in": 7200}})()
             def slow(*_args, **_kwargs): calls.append(1); time.sleep(.1); return response
             def run(): results.append(x._refresh_token("cid", "secret", str(store), "rt1"))
@@ -227,8 +235,8 @@ class XProviderTests(unittest.TestCase):
             self.assertEqual(calls, [1]); self.assertEqual(results, ["at1", "at1"])
 
     def test_oauth2_store_failure_after_rotation_leaves_nonsecret_marker(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Path(directory) / "tokens.json"; marker = store.with_name(store.name + ".refresh-pending")
+        with private_store() as store:
+            marker = store.with_name(store.name + ".refresh-pending")
             response = type("R", (), {"body": {"access_token": "at1", "refresh_token": "rt2", "expires_in": 7200}})()
             original = x._atomic_private
             def fail_store(path, value):
@@ -243,16 +251,16 @@ class XProviderTests(unittest.TestCase):
             self.assertEqual(unresolved.exception.code, "CREDENTIAL_STATE_UNKNOWN")
 
     def test_oauth2_rejected_refresh_clears_marker(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Path(directory) / "tokens.json"; marker = store.with_name(store.name + ".refresh-pending")
+        with private_store() as store:
+            marker = store.with_name(store.name + ".refresh-pending")
             rejected = core.ApiFailure("rejected", status=400)
             with patch.object(x, "request", side_effect=rejected), self.assertRaises(core.ApiFailure):
                 x._refresh_token("cid", "secret", str(store), "rt1")
             self.assertFalse(marker.exists())
 
     def test_oauth2_committed_store_recovers_matching_stale_marker(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Path(directory) / "tokens.json"; marker = store.with_name(store.name + ".refresh-pending")
+        with private_store() as store:
+            marker = store.with_name(store.name + ".refresh-pending")
             x._atomic_private(store, {"access_token": "at1", "expires_at": time.time() + 3600,
                                       "refresh_token": "rt2", "last_rotation_id": "rotation-1"})
             x._atomic_private(marker, {"rotation_id": "rotation-1", "started_at": x.utc_now()})
@@ -261,8 +269,8 @@ class XProviderTests(unittest.TestCase):
             called.assert_not_called(); self.assertFalse(marker.exists())
 
     def test_oauth2_unknown_refresh_requires_reauthorization_without_retry(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Path(directory) / "tokens.json"; marker = store.with_name(store.name + ".refresh-pending")
+        with private_store() as store:
+            marker = store.with_name(store.name + ".refresh-pending")
             failure = core.ApiFailure("unavailable", status=503)
             with patch.object(x, "request", side_effect=failure) as called, self.assertRaises(core.ApiFailure) as raised:
                 x._refresh_token("cid", "secret", str(store), "rt1")
@@ -271,6 +279,35 @@ class XProviderTests(unittest.TestCase):
             with patch.object(x, "request") as retry, self.assertRaises(core.ApiFailure):
                 x._refresh_token("cid", "secret", str(store), "rt1")
             retry.assert_not_called(); self.assertEqual(called.call_count, 1)
+
+    def test_oauth2_store_rejects_outside_symlink_and_permissive_state(self):
+        with private_store() as store:
+            outside = store.parents[3] / "tokens.json"
+            with self.assertRaises(core.ApiFailure) as escaped:
+                x._refresh_token("cid", "secret", str(outside), "rt1")
+            self.assertEqual(escaped.exception.code, "PRIVATE_STATE_UNSAFE")
+
+            store.parent.mkdir(parents=True, exist_ok=True)
+            target = store.parent / "target.json"
+            target.write_text("{}")
+            store.symlink_to(target)
+            with self.assertRaises(core.ApiFailure) as symlinked:
+                x._refresh_token("cid", "secret", str(store), "rt1")
+            self.assertEqual(symlinked.exception.code, "PRIVATE_STATE_UNSAFE")
+            store.unlink()
+
+            lock = store.with_name(store.name + ".lock")
+            lock.symlink_to(target)
+            with self.assertRaises(core.ApiFailure) as unsafe_lock:
+                x._refresh_token("cid", "secret", str(store), "rt1")
+            self.assertEqual(unsafe_lock.exception.code, "PRIVATE_STATE_UNSAFE")
+            lock.unlink()
+
+            x._atomic_private(store, {"access_token": "cached", "expires_at": time.time() + 3600})
+            store.chmod(0o644)
+            with self.assertRaises(core.ApiFailure) as permissive:
+                x._refresh_token("cid", "secret", str(store), "rt1")
+            self.assertEqual(permissive.exception.code, "PRIVATE_STATE_UNSAFE")
 
     def test_app_bearer_is_used_for_eligible_reads_but_not_identity(self):
         provider = x.XProvider(); env = {"SNS_X_BEARER_TOKEN": "bearer", "SNS_X_APP_PUBLIC_ID": "app"}

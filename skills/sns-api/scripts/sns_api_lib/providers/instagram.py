@@ -8,7 +8,7 @@ from ..auth import bearer_credentials, provider_env
 from ..core import ApiFailure, parse_time, utc_now
 from .base import Provider
 from .meta_common import (
-    INSTAGRAM_HOST, META_HOST, META_VERSION, graph_call, normalized, prepublish_call,
+    INSTAGRAM_HOST, META_HOST, META_VERSION, graph_call, graph_id, normalized, prepublish_call,
     prepublish_resume_ready, require_remote,
 )
 
@@ -69,7 +69,7 @@ class InstagramProvider(Provider):
             result, body = graph_call(host, META_VERSION, credentials.token, "GET", account + "/media",
                                       query={"fields": "id,caption,media_type,media_product_type,permalink,timestamp,username", "limit": _limit(params.get("limit", 25)), "after": params.get("after")})
         elif operation == "publish.status":
-            result, body = graph_call(host, META_VERSION, credentials.token, "GET", str(params.get("resource_id", "")),
+            result, body = graph_call(host, META_VERSION, credentials.token, "GET", graph_id(params.get("resource_id")),
                                       query={"fields": "id,status_code,status"})
         else: raise ApiFailure("unsupported Instagram read", code="UNSUPPORTED_CAPABILITY")
         return normalized(result, body)
@@ -163,7 +163,7 @@ class InstagramProvider(Provider):
         return candidates[0] if len(candidates) == 1 else None
 
 
-def _account(): return provider_env("instagram", "ACCOUNT_ID", required=True)
+def _account(): return graph_id(provider_env("instagram", "ACCOUNT_ID", required=True), "Instagram account ID")
 
 
 def _limit(value):

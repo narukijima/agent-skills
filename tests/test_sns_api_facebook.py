@@ -33,6 +33,18 @@ class FacebookTests(unittest.TestCase):
             result = provider.read(credentials("facebook", "page-token"), "page.content", {})
         self.assertEqual(result["status"], "partial")
 
+    def test_status_resource_id_is_one_validated_graph_segment(self):
+        provider = facebook.FacebookProvider(); cred = credentials("facebook", "page-token")
+        with patch.object(facebook, "_account", return_value="42"), patch.object(facebook, "graph_call") as call:
+            with self.assertRaises(core.ApiFailure) as unsafe:
+                provider.read(cred, "publish.status", {"resource_id": "42/insights?fields=access_token"})
+        self.assertEqual(unsafe.exception.code, "INVALID_PARAMETER"); call.assert_not_called()
+        response = type("R", (), {"rate_limit": {}})()
+        with patch.object(facebook, "_account", return_value="42"), \
+                patch.object(facebook, "graph_call", return_value=(response, {"id": "42_99"})) as call:
+            provider.read(cred, "publish.status", {"resource_id": "42_99"})
+        self.assertEqual(call.call_args.args[4], "42_99")
+
     def test_video_reconcile_preserves_processing_and_requires_ready_evidence(self):
         provider = facebook.FacebookProvider(); cred = credentials("facebook", "page-token")
         row = {"provider_id": "v1", "provider_state": {}}

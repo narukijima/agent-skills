@@ -104,6 +104,15 @@ class InstagramTests(unittest.TestCase):
                                                                        "container": "mp4", "video_codec": "h264", "audio_codec": "aac", "fps": 30}])
         self.assertEqual(normalized["caption"], "")
 
+    def test_status_resource_id_rejects_graph_path_escape(self):
+        provider = instagram.InstagramProvider(); cred = credentials("instagram", "instagram-login")
+        with patch.object(instagram, "_account", return_value="42"), \
+                patch.object(provider, "_host", return_value=instagram.INSTAGRAM_HOST), \
+                patch.object(instagram, "graph_call") as call:
+            with self.assertRaises(core.ApiFailure) as unsafe:
+                provider.read(cred, "publish.status", {"resource_id": "../me?fields=access_token"})
+        self.assertEqual(unsafe.exception.code, "INVALID_PARAMETER"); call.assert_not_called()
+
     def test_reconcile_checks_container_but_preserves_final_media_id(self):
         provider = instagram.InstagramProvider(); row = {"provider_id": "media1", "provider_state": {"container_id": "container1", "provider_id": "media1"}}
         with patch.object(provider, "read", return_value={"data": {"status_code": "PUBLISHED"}}) as called:

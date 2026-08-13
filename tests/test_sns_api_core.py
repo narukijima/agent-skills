@@ -283,8 +283,19 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("super-secret-token", str(value)); self.assertNotIn("access_token", value)
         self.assertNotIn("authorization", value); self.assertEqual(value["nested"], {})
 
+    def test_secret_redaction_rejects_generic_secret_keys_and_encoded_values(self):
+        secret = "private/key value"
+        with patch.dict(os.environ, {"SNS_X_API_KEY": secret}, clear=True):
+            value = core.redact({
+                "token": "provider-echo", "secret": "provider-echo", "credential": "provider-echo",
+                "session_url": "https://upload.test/session", "message": "value=private%2Fkey%20value",
+            })
+        for key in ("token", "secret", "credential", "session_url"):
+            self.assertNotIn(key, value)
+        self.assertNotIn("private%2Fkey%20value", value["message"])
+
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.2.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.2.1")
 
 
 if __name__ == "__main__": unittest.main()

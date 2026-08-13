@@ -7,7 +7,7 @@ from datetime import timedelta
 from ..auth import bearer_credentials, provider_env
 from ..core import ApiFailure, parse_time, utc_now
 from .base import Provider
-from .meta_common import THREADS_HOST, graph_call, normalized, prepublish_call, prepublish_resume_ready, require_remote
+from .meta_common import THREADS_HOST, graph_call, graph_id, normalized, prepublish_call, prepublish_resume_ready, require_remote
 
 VERSION = "v1.0"
 
@@ -52,7 +52,7 @@ class ThreadsProvider(Provider):
             result, body = graph_call(THREADS_HOST, VERSION, credentials.token, "GET", _account() + "/threads",
                                       query={"fields": "id,media_product_type,media_type,media_url,permalink,username,text,timestamp,shortcode,children", "limit": _limit(params.get("limit", 25)), "after": params.get("after")})
         elif operation == "publish.status":
-            result, body = graph_call(THREADS_HOST, VERSION, credentials.token, "GET", str(params.get("resource_id", "")),
+            result, body = graph_call(THREADS_HOST, VERSION, credentials.token, "GET", graph_id(params.get("resource_id")),
                                       query={"fields": "id,status,error_message"})
         else: raise ApiFailure("unsupported Threads read", code="UNSUPPORTED_CAPABILITY")
         return normalized(result, body)
@@ -145,7 +145,7 @@ class ThreadsProvider(Provider):
         return candidates[0] if len(candidates) == 1 else None
 
 
-def _account(): return provider_env("threads", "ACCOUNT_ID", required=True)
+def _account(): return graph_id(provider_env("threads", "ACCOUNT_ID", required=True), "Threads account ID")
 
 
 def _limit(value):

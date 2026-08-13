@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "1.2.0"
+  claudagt.version: "1.2.1"
   claudagt.status: "active"
   claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---

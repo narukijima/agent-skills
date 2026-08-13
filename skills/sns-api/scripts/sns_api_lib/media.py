@@ -54,13 +54,8 @@ def remote_asset(value: Dict[str, Any]) -> Dict[str, Any]:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise ApiFailure("remote asset must be an HTTPS URL without userinfo", code="INVALID_MEDIA")
-    sensitive_query = {"token", "access_token", "auth", "authorization", "secret", "signature", "sig", "api_key", "key"}
-    from urllib.parse import parse_qsl
-    def sensitive(name: str) -> bool:
-        lowered = name.lower()
-        return lowered in sensitive_query or any(lowered.endswith("-" + item) or lowered.endswith("_" + item) for item in sensitive_query)
-    if any(sensitive(key) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
-        raise ApiFailure("remote asset URL must not embed credentials or signatures", code="INVALID_MEDIA")
+    if parsed.query or parsed.fragment:
+        raise ApiFailure("remote asset URL must be public and contain no query or fragment", code="INVALID_MEDIA")
     result = {
         "kind": "remote", "url": url, "scheme": parsed.scheme,
         "host": parsed.hostname.lower().rstrip("."),

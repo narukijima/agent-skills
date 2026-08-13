@@ -36,6 +36,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
       - name: Validate Skill contracts
         run: bash tools/validate-skills.sh
       - name: Compile deterministic stdlib runtime
@@ -44,6 +46,8 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Validate SNS behavior eval cases
         run: python3 tools/score-behavior-eval.py --cases evals/sns-api/cases.json
-      - name: Basic secret scan
-        run: |
-          ! git grep -nE '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]{20,})' -- . ':!.github/workflows/sns-api-ci.yml'
+      - name: Scan public repository privacy and secrets
+        env:
+          SCAN_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/public_repo_scan.py --commit-range "${SCAN_BASE}..${SCAN_HEAD}"

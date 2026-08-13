@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 import unicodedata
 from datetime import timedelta
@@ -23,7 +24,7 @@ except ImportError:
     fcntl = None
 
 from ..auth import fingerprint, provider_env
-from ..core import ApiFailure, parse_time, utc_now
+from ..core import ApiFailure, parse_time, state_path, utc_now
 from ..http import classify, request
 from .base import CredentialSnapshot, Provider
 from . import x_media
@@ -31,6 +32,7 @@ from . import x_media
 HOSTS = {"api.x.com"}
 BASE = "https://api.x.com"
 LIGHT_RANGES = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
+PRIVATE_STORE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 URL_PATTERN = re.compile(r"(?<![@A-Za-z0-9_])(?:https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?::[0-9]{1,5})?(?:/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*)?)", re.I)
 CASHTAG = re.compile(r"(?<![A-Za-z0-9_])\$[A-Za-z][A-Za-z0-9_]*")
 
@@ -167,12 +169,103 @@ def oauth1_header(method: str, url: str, params: Optional[Dict[str, str]], extra
     return "OAuth " + ", ".join(percent(k) + '=\"' + percent(v) + '\"' for k, v in sorted(oauth.items()))
 
 
+def _ensure_private_store_directory(path: Path) -> None:
+    if tuple(path.parts[-4:]) != ("state", "sns-api", "private", "x-oauth2"):
+        raise ApiFailure("X OAuth credential state path is not canonical", code="PRIVATE_STATE_UNSAFE")
+    workspace = path.parents[3]
+    chain = (
+        workspace / "state",
+        workspace / "state" / "sns-api",
+        workspace / "state" / "sns-api" / "private",
+        path,
+    )
+    for candidate in chain:
+        if candidate.exists() and candidate.is_symlink():
+            raise ApiFailure("X OAuth credential state must not traverse a symlink", code="PRIVATE_STATE_UNSAFE")
+    current = path
+    missing = []
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    if current.is_symlink():
+        raise ApiFailure("X OAuth credential state must not traverse a symlink", code="PRIVATE_STATE_UNSAFE")
+    for candidate in reversed(missing):
+        candidate.mkdir(mode=0o700, exist_ok=True)
+    for candidate in chain:
+        if not candidate.is_dir() or candidate.is_symlink() or candidate.stat().st_uid != os.getuid():
+            raise ApiFailure("X OAuth credential state directory is unsafe", code="PRIVATE_STATE_UNSAFE")
+    for candidate in chain[-2:]:
+        os.chmod(candidate, 0o700)
+
+
+def _canonical_private_store(store_name: str) -> Path:
+    directory = state_path("private/x-oauth2")
+    _ensure_private_store_directory(directory)
+    supplied = Path(store_name).expanduser()
+    if supplied.is_absolute():
+        candidate = supplied
+    else:
+        if len(supplied.parts) != 1:
+            raise ApiFailure("X OAuth token store must be one private-state filename", code="PRIVATE_STATE_UNSAFE")
+        candidate = directory / supplied
+    if candidate.parent != directory or not PRIVATE_STORE_NAME.fullmatch(candidate.name):
+        raise ApiFailure("X OAuth token store must be inside canonical private state", code="PRIVATE_STATE_UNSAFE")
+    if candidate.is_symlink():
+        raise ApiFailure("X OAuth token store must not be a symlink", code="PRIVATE_STATE_UNSAFE")
+    return candidate
+
+
+def _validate_private_file(handle: Any, path: Path) -> None:
+    metadata = os.fstat(handle.fileno())
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077):
+        raise ApiFailure("X OAuth credential state file is unsafe", code="PRIVATE_STATE_UNSAFE")
+    if path.is_symlink():
+        raise ApiFailure("X OAuth credential state file must not be a symlink", code="PRIVATE_STATE_UNSAFE")
+
+
+def _open_private(path: Path, *, create: bool = False):
+    flags = os.O_RDWR if create else os.O_RDONLY
+    if create:
+        flags |= os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ApiFailure("X OAuth credential state file is unsafe", code="PRIVATE_STATE_UNSAFE") from exc
+    handle = os.fdopen(descriptor, "a+" if create else "r", encoding="utf-8")
+    try:
+        _validate_private_file(handle, path)
+    except Exception:
+        handle.close()
+        raise
+    return handle
+
+
+def _read_private_json(path: Path) -> Dict[str, Any]:
+    try:
+        with _open_private(path) as handle:
+            value = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ApiFailure("X OAuth credential state must be a JSON object", code="CREDENTIAL_STATE_UNKNOWN")
+    return value
+
+
 def _atomic_private(path: Path, value: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_store_directory(path.parent)
     temp = path.with_name(path.name + ".tmp." + secrets.token_hex(8))
     try:
-        with temp.open("x", encoding="utf-8") as handle:
-            os.chmod(temp, 0o600); json.dump(value, handle, sort_keys=True); handle.flush(); os.fsync(handle.fileno())
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temp, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True); handle.flush(); os.fsync(handle.fileno())
         os.replace(temp, path)
     finally:
         try: temp.unlink()
@@ -182,14 +275,14 @@ def _atomic_private(path: Path, value: Dict[str, Any]) -> None:
 def _refresh_token(client_id: str, client_secret: str, store_name: str, bootstrap: str) -> str:
     if fcntl is None:
         raise ApiFailure("OAuth refresh locking unavailable", code="UNSAFE_OAUTH_REFRESH")
-    store = Path(store_name); lock = store.with_name(store.name + ".lock"); marker = store.with_name(store.name + ".refresh-pending")
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    with lock.open("a+", encoding="utf-8") as handle:
-        os.chmod(lock, 0o600); fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    store = _canonical_private_store(store_name)
+    lock = store.with_name(store.name + ".lock"); marker = store.with_name(store.name + ".refresh-pending")
+    with _open_private(lock, create=True) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             try:
-                stored = json.loads(store.read_text()) if store.exists() else {}
-                pending = json.loads(marker.read_text()) if marker.exists() else {}
+                stored = _read_private_json(store)
+                pending = _read_private_json(marker)
             except (OSError, json.JSONDecodeError) as exc:
                 raise ApiFailure("OAuth credential state is unreadable; reauthorization required", code="CREDENTIAL_STATE_UNKNOWN") from exc
             if pending and pending.get("rotation_id") != stored.get("last_rotation_id"):
