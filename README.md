@@ -30,7 +30,7 @@ Skill固有の安全境界は維持します。例えば`seo`の診断・変更s
 bash tools/import-skill.sh sns-api --target /path/to/agent-directory
 ```
 
-自動import・fleet-wide自動同期はしません。既存の同名Skillを上書きせず、copy元repository、commit SHA、version、frontmatter projection、import時刻を `skills/sns-api/agents/upstream.yaml` に記録します。更新は利用側で差分を確認してから明示的に再importします。
+自動import・fleet-wide自動同期はしません。既存の同名Skillを上書きせず、copy元repository、commit SHA、version、frontmatter projection、import時刻を `skills/sns-api/agents/upstream.yaml` に記録します。コピー対象は記録したcommitのGit treeだけで、untracked / ignored fileは含めません。更新は利用側で差分を確認してから明示的に再importします。
 
 ## 公式Skill
 

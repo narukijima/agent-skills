@@ -97,7 +97,12 @@ source_version="$(<"$source_version_file")"
 [[ -n "$source_version" ]] || { printf 'ERROR: source Skill has no version\n' >&2; exit 1; }
 
 mkdir -p "$target_root/skills"
-cp -R "$source_dir" "$temporary_dir/$skill_name"
+archive_dir="$temporary_dir/archive"
+mkdir -p "$archive_dir"
+# Copy the exact tree named by source_commit. Ignored files (for example a local
+# .env) are invisible to git status and must never enter a provenance-bound copy.
+git -C "$repo_root" archive "$source_commit" -- "skills/$skill_name" | tar -x -C "$archive_dir"
+mv "$archive_dir/skills/$skill_name" "$temporary_dir/$skill_name"
 chmod -R u+w "$temporary_dir/$skill_name"
 find "$temporary_dir/$skill_name" \( -type d -name '__pycache__' \) -prune -exec rm -rf {} +
 find "$temporary_dir/$skill_name" -type f \( -name '*.pyc' -o -name '.DS_Store' \) -delete
