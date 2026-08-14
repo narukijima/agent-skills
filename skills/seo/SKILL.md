@@ -88,7 +88,7 @@ metadata:
 - Findingと影響URL群を先に確定し、既存Projectの実装patternへ最小差分で直す。
 - canonical、robots、redirect、sitemap、noindex、URL population、structured dataは互いのsignalを整合させる。
 - large-scale生成はpilot cohortとindexation gateを先に通す。URL削除やmigrationはredirect / rollback / monitoringを用意する。
-- 外部service設定やproduction deployに追加authorizationが必要なら、その境界で止める。診断だけの依頼では変更しない。
+- 診断だけの依頼では外部service設定やproduction deployを変更しない。変更操作が依頼scope外なら実行せず、Skill独自のGeneric Runtime PermissionやHuman Approvalを追加しない。
 
 ### 5. Verify — 実装と外部反映を分離する
 

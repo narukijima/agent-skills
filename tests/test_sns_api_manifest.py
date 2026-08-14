@@ -25,7 +25,7 @@ class ManifestTests(unittest.TestCase):
         path = Path(self.temp.name) / "approved.json"; result = make_manifest(path)
         value = signed(path)
         for key in ("schema_version", "platform", "operation", "content_id", "expected_account_id", "account_type", "app_id",
-                    "expected_credential_fingerprint", "approval_id", "created_at", "expires_at", "provider_payload", "payload_hash",
+                    "expected_credential_fingerprint", "approval_id", "domain_authorization", "created_at", "expires_at", "provider_payload", "payload_hash",
                     "assets", "asset_hash", "intent_hash", "provider_call_plan", "manifest_hash", "hmac_signature"):
             self.assertIn(key, value)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -47,6 +47,20 @@ class ManifestTests(unittest.TestCase):
     def test_platform_is_signed_and_wrong_platform_tamper_fails(self):
         path = Path(self.temp.name) / "m.json"; make_manifest(path); value = json.loads(path.read_text()); value["platform"] = "threads"; path.write_text(json.dumps(value))
         with patch.dict(os.environ, base_env(), clear=True), self.assertRaises(core.ApiFailure): manifest.load_manifest(path)
+
+    def test_legacy_v2_manifest_remains_loadable_for_inflight_compatibility(self):
+        path = Path(self.temp.name) / "legacy-v2.json"; make_manifest(path)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["schema_version"] = 2
+        value.pop("domain_authorization")
+        value["manifest_hash"] = manifest.manifest_hash(value)
+        with patch.dict(os.environ, base_env(), clear=True):
+            value["hmac_signature"] = manifest.signature(value)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        with patch.dict(os.environ, base_env(), clear=True):
+            loaded = manifest.load_manifest(path)
+        self.assertEqual(loaded["schema_version"], 2)
+        self.assertNotIn("domain_authorization", loaded)
 
     def test_secret_value_in_payload_is_rejected_before_write(self):
         path = Path(self.temp.name) / "m.json"; env = base_env(SNS_PRIVATE_ACCESS_TOKEN="secret-value-12345")
@@ -83,7 +97,7 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--payload", "{}"])
             with self.assertRaises(SystemExit): parser.parse_args(["migrate-legacy-x", "--ledger", "/tmp/other.sqlite3"])
 
-    def test_expired_submitted_manifest_can_only_resume_with_new_state_bound_approval(self):
+    def test_expired_submitted_manifest_reuses_authorization_with_new_state_bound_manifest(self):
         original_path = Path(self.temp.name) / "expired.json"
         make_manifest(original_path, platform="threads", operation="publish.text", account_type="threads-user",
                       payload={"text": "approved"}, expires_in=-1)
@@ -95,14 +109,15 @@ class ManifestTests(unittest.TestCase):
         ledger.record_result(intent, "submitted", provider_id="101", provider_status="IN_PROGRESS")
         resume_path = Path(self.temp.name) / "resume.json"
         with patch.dict(os.environ, base_env(), clear=True):
-            result = core.authorize_resume(original_path, resume_path, "approval-resume-2", 900)
+            result = core.authorize_resume(original_path, resume_path, None, 900)
             resumed = manifest.load_manifest(resume_path)
         self.assertEqual(result["status"], "prepared"); self.assertEqual(resumed["authorization_type"], "resume")
         self.assertEqual(resumed["resume_of_manifest_hash"], original["manifest_hash"])
         self.assertEqual(resumed["provider_payload"], original["provider_payload"])
+        self.assertEqual(resumed["approval_id"], original["approval_id"])
         self.assertEqual(ledger.reserve_attempt({**resumed, "_allow_resume": True}), intent)
         row = ledger.get_intent("threads", "42", "content-1")
-        self.assertEqual(row["approval_id"], "approval-resume-2"); self.assertEqual(row["manifest_hash"], resumed["manifest_hash"])
+        self.assertEqual(row["approval_id"], original["approval_id"]); self.assertEqual(row["manifest_hash"], resumed["manifest_hash"])
 
     def test_resume_manifest_refuses_changed_provider_state(self):
         original_path = Path(self.temp.name) / "original.json"
@@ -111,7 +126,7 @@ class ManifestTests(unittest.TestCase):
         ledger.update_provider_state(intent, {"stage": "processing", "container_id": "101", "final_publish_started": False})
         ledger.record_result(intent, "submitted")
         resume_path = Path(self.temp.name) / "resume.json"
-        with patch.dict(os.environ, base_env(), clear=True): core.authorize_resume(original_path, resume_path, "approval-2", 900)
+        with patch.dict(os.environ, base_env(), clear=True): core.authorize_resume(original_path, resume_path, None, 900)
         ledger.update_provider_state(intent, {"stage": "ready", "container_id": "101", "final_publish_started": False})
         with patch.dict(os.environ, base_env(), clear=True): resumed = manifest.load_manifest(resume_path)
         with self.assertRaises(core.ApiFailure) as raised: ledger.reserve_attempt({**resumed, "_allow_resume": True})

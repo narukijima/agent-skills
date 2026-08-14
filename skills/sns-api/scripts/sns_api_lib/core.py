@@ -122,7 +122,7 @@ def prepare(args: Any) -> Dict[str, Any]:
     return create_manifest(item, args)
 
 
-def authorize_resume(original_path: Path, output_path: Path, approval_id: str, expires_in: int) -> Dict[str, Any]:
+def authorize_resume(original_path: Path, output_path: Path, approval_id: Optional[str], expires_in: int) -> Dict[str, Any]:
     from .ledger import get_intent
     from .manifest import create_resume_manifest, load_manifest
 
@@ -140,6 +140,7 @@ def authorize_resume(original_path: Path, output_path: Path, approval_id: str, e
 
 
 def send(manifest_path: Path) -> Dict[str, Any]:
+    from .authorization import validate_domain_authorization
     from .auth import global_control, provider_app_id
     from .budget import reserve_calls
     from .ledger import ensure_legacy_x_migrated, get_intent, record_result, reserve_attempt, update_provider_state
@@ -147,6 +148,7 @@ def send(manifest_path: Path) -> Dict[str, Any]:
     from .media import verify_assets
 
     manifest = load_manifest(manifest_path)
+    validate_domain_authorization(manifest)
     item = provider(manifest["platform"])
     item.require_capability(manifest["operation"])
     if global_control("WRITE_ENABLED", legacy=item.legacy_write_gate) != "true":
