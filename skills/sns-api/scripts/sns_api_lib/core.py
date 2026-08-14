@@ -35,18 +35,34 @@ def parse_time(value: str, label: str) -> datetime:
     return result
 
 
-def resolve_workspace_root(script_path: Optional[Path] = None) -> tuple[Path, str]:
+def resolve_workspace_root(script_path: Optional[Path] = None, *, stop_at: Optional[Path] = None) -> tuple[Path, str]:
+    override = os.environ.get("AGENT_DIRECTORY_ROOT", "").strip()
+    if override:
+        candidate = Path(override).resolve()
+        marker = candidate / ".git"
+        if marker.is_dir():
+            return candidate, ".git-directory"
+        if marker.is_file():
+            return candidate, ".git-file"
+        raise ApiFailure(
+            "workspace root is unavailable: no .git marker was found; refusing a vendor-depth-derived state path",
+            code="WORKSPACE_ROOT_UNAVAILABLE",
+        )
     current = (script_path or Path(__file__)).resolve().parent
+    stop_dir = stop_at.resolve() if stop_at else None
     for candidate in (current, *current.parents):
         marker = candidate / ".git"
         if marker.is_dir():
             return candidate, ".git-directory"
         if marker.is_file():
             return candidate, ".git-file"
+        if stop_dir is not None and candidate == stop_dir:
+            break
     raise ApiFailure(
         "workspace root is unavailable: no .git marker was found; refusing a vendor-depth-derived state path",
         code="WORKSPACE_ROOT_UNAVAILABLE",
     )
+
 
 
 _WORKSPACE: Optional[tuple[Path, str]] = None

@@ -134,9 +134,9 @@ class ManifestTests(unittest.TestCase):
     def test_workspace_resolution_uses_nearest_git_marker_and_fails_closed(self):
         root = Path(self.temp.name) / "repo"; script = root / "deep/scripts/file.py"; script.parent.mkdir(parents=True); script.write_text("")
         (root / ".git").write_text("gitdir: somewhere")
-        self.assertEqual(core.resolve_workspace_root(script), (root.resolve(), ".git-file"))
+        self.assertEqual(core.resolve_workspace_root(script, stop_at=root), (root.resolve(), ".git-file"))
         (root / ".git").unlink()
-        with self.assertRaises(core.ApiFailure): core.resolve_workspace_root(script)
+        with self.assertRaises(core.ApiFailure): core.resolve_workspace_root(script, stop_at=root)
 
     def test_vendored_cli_help_works_and_prepare_outside_git_fails_structured(self):
         source = Path(__file__).parents[1] / "skills/sns-api"
@@ -149,13 +149,14 @@ class ManifestTests(unittest.TestCase):
                    "--payload", '{"text":"hello"}', "--manifest", str(manifest_path), "--content-id", "c1",
                    "--expected-account-id", "42", "--account-type", "user", "--app-id", "a",
                    "--expected-credential-fingerprint", "0" * 64, "--approval-id", "ap1"]
-        env = {**os.environ, "SNS_API_MANIFEST_SIGNING_KEY": "a" * 32}
+        env = {**os.environ, "SNS_API_MANIFEST_SIGNING_KEY": "a" * 32, "AGENT_DIRECTORY_ROOT": self.temp.name}
         failed = subprocess.run(command, cwd=self.temp.name, env=env, text=True, capture_output=True, check=False)
         self.assertEqual(failed.returncode, 1)
         error = json.loads(failed.stderr)
         self.assertEqual(error["errors"][0]["code"], "WORKSPACE_ROOT_UNAVAILABLE")
         self.assertEqual((error["platform"], error["operation"], error["data"]), ("x", "publish.text", {}))
         self.assertFalse(manifest_path.exists())
+
 
 
 if __name__ == "__main__": unittest.main()
