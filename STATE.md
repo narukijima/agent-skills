@@ -8,6 +8,7 @@ updated_at: 2026-08-14
 
 共有Skill配布元は明示import、provenance記録、全体validator、unit test、behavior eval schemaを持つ。
 ClaudAGT AgentのIndependent Projectとして継続開発するProject契約を導入した。
+`sns-api` v1.3.1ではFacebook Page identity取得から不要な`tasks` field要求を除去した。
 
 ## 現在の目標
 
@@ -25,7 +26,7 @@ Skillの発動契約、決定的処理、test、利用側責務境界を一致�
 - 対象: `PROJECT.md#PC-01`
 - 確認日: 2026-08-14
 - 方法: `git diff --check`、`bash tools/validate-skills.sh`、`python3 -m unittest discover -s tests -q`。
-- 結果: validatorと162件のunit testが合格した。behavior eval定義8件もschema検証に合格した。
+- 結果: validatorと163件のunit testが合格した。behavior eval定義8件もschema検証に合格した。
 
 ## 未完了・ブロッカー
 

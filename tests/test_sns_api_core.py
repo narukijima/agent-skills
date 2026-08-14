@@ -386,7 +386,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("private%2Fkey%20value", value["message"])
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.3.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.3.1")
 
 
 if __name__ == "__main__": unittest.main()

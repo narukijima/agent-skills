@@ -12,6 +12,15 @@ class FacebookTests(unittest.TestCase):
         provider = facebook.FacebookProvider()
         self.assertNotIn("publish.profile", provider.capabilities); self.assertIn("page.content", provider.capabilities)
 
+    def test_identity_requests_only_binding_and_display_fields(self):
+        provider = facebook.FacebookProvider(); cred = credentials("facebook", "page-token")
+        response = type("R", (), {"status": 200, "rate_limit": {}})()
+        with patch.object(facebook, "_account", return_value="42"), \
+                patch.object(facebook, "graph_call", return_value=(response, {"id": "42", "name": "Page", "category": "Community"})) as call:
+            identity = provider.identity(cred)
+        self.assertEqual(call.call_args.kwargs["query"], {"fields": "id,name,category"})
+        self.assertEqual(identity["id"], "42"); self.assertEqual(identity["account_type"], "page")
+
     def test_page_text_photo_video_request_shapes(self):
         provider = facebook.FacebookProvider(); cred = credentials("facebook", "page-token")
         response = type("R", (), {"status": 200, "rate_limit": {}})()

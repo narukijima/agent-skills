@@ -39,7 +39,7 @@ class FacebookProvider(Provider):
     def identity(self, credentials):
         account = _account()
         _, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", account,
-                             query={"fields": "id,name,category,tasks"})
+                             query={"fields": "id,name,category"})
         if str(body.get("id", "")) != account: raise ApiFailure("Facebook Page identity mismatch in provider response", code="INVALID_PROVIDER_RESPONSE")
         return {**body, "id": account, "account_type": "page"}
 
