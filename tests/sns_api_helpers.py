@@ -35,18 +35,20 @@ def base_env(**extra):
 
 def prepare_args(path, *, platform="x", operation="publish.text", payload=None, content_id="content-1",
                  account_id="42", account_type=None, app_id="app-1", credential_fingerprint=FINGERPRINT,
-                 approval_id="approval-1", expires_in=900):
+                 approval_id="approval-1", standing_authorization_file=None, content_source=None, expires_in=900):
     return SimpleNamespace(
         platform=platform, operation=operation, payload=dict(payload or {"text": "hello"}),
         manifest=str(path), content_id=content_id, expected_account_id=account_id,
         account_type=account_type, app_id=app_id,
         expected_credential_fingerprint=credential_fingerprint,
-        approval_id=approval_id, expires_in=expires_in,
+        approval_id=approval_id if standing_authorization_file is None else None,
+        standing_authorization_file=standing_authorization_file, content_source=content_source,
+        expires_in=expires_in,
     )
 
 
-def make_manifest(path, **kwargs):
-    with patch.dict(os.environ, base_env(), clear=True):
+def make_manifest(path, environment=None, **kwargs):
+    with patch.dict(os.environ, environment or base_env(), clear=True):
         return core.prepare(prepare_args(path, **kwargs))
 
 

@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "1.2.1"
+  claudagt.version: "1.3.0"
   claudagt.status: "active"
   claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -12,7 +12,7 @@ metadata:
 
 ## Purpose
 
-Execute a small, allowlisted official-API surface for X, YouTube, Facebook Pages, Instagram Professional accounts, and Threads. Let the Project decide content, timing, account, and approval. Own only validation, authentication binding, budget enforcement, immutable media evidence, provider dispatch, canonical state, duplicate prevention, and uncertain-result recovery.
+Execute a small, allowlisted official-API surface for X, YouTube, Facebook Pages, Instagram Professional accounts, and Threads. Let the Project decide content, timing, account, and Domain Authorization. Own only validation, authentication binding, budget enforcement, immutable media evidence, provider dispatch, canonical state, duplicate prevention, and uncertain-result recovery.
 
 Treat one publish intent as exactly `1 platform × 1 account × 1 content intent`. Let the caller orchestrate cross-posting with independent manifests. Never expose `send-all`, `post-everywhere`, or a distributed cross-platform transaction.
 
@@ -23,6 +23,7 @@ TikTok is `planned`; do not claim runtime support.
 - Require explicit `$sns-api` invocation for paid/external reads and every external write.
 - Keep `allow_implicit_invocation: false` in `agents/openai.yaml`.
 - Do not treat the legacy aliases `x-api`, `x api`, or `twitter-api` as permission to bypass the `sns-api` workflow.
+- A bound scheduler or content pipeline may invoke `$sns-api` under standing authorization; do not add a repeated Human Approval when its signed Domain scope still matches.
 
 ## 使用するKnowledge
 
@@ -49,11 +50,15 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 
 ## Safety boundary
 
+- Do not inspect, set, or emulate Generic Runtime Permission. Shell, filesystem, network, sandbox, and provider execution-mode failures belong to the Runtime layer.
 - Require `SNS_API_READ_ENABLED=true` for external reads and `SNS_API_WRITE_ENABLED=true` for writes.
+- Treat these read/write gates as SNS application kill switches, not as Runtime network permission or Domain Authorization.
 - Require Project/Agent invocation and daily call budgets before any credential refresh or provider request.
 - Accept secrets only from environment variables or a gateway-owned private token store. Never accept them as CLI arguments or place them in a prompt, manifest, ledger, stdout, stderr, fixture, or audit detail.
 - Require a short-lived HMAC-SHA256 manifest signed with gateway-owned `SNS_API_MANIFEST_SIGNING_KEY`.
-- Bind platform, operation, normalized payload, assets, stable expected account ID/type, app ID, credential fingerprint, approval ID, expiry, and provider call plan.
+- Treat `approval-id` as a compatibility name for an opaque Domain Authorization reference, never as evidence that a Human approved shell execution.
+- Bind platform, operation, normalized payload, assets, stable expected account ID/type, app ID, credential fingerprint, Domain Authorization, expiry, and provider call plan.
+- For standing authorization, require its gateway HMAC and also bind allowed content source, Project/Agent caller, schedule, validity period, and per-intent/daily provider-call limits. Require every field to match; do not add per-intent Human Approval while it remains in scope.
 - Let `prepare` accept provider JSON. Let `send` accept only `--manifest`; never add send-time platform, account, text, caption, media, or ledger overrides.
 - Verify authenticated identity, account type, app label, and credential fingerprint before writing an attempt.
 - Store canonical single-host state only under `state/sns-api/ledger.sqlite3` and `state/sns-api/usage.sqlite3`, resolved from the nearest `.git` marker. Do not accept arbitrary state paths.
@@ -159,14 +164,13 @@ python3 skills/sns-api/scripts/sns_api.py send \
   --manifest .tmp/approved-threads.json
 ```
 
-If a submitted upload/container outlives its manifest, issue a new Project approval bound to the current canonical Provider state. This command accepts no content override and cannot create a new intent.
+If a submitted upload/container outlives its manifest, prepare a new short-lived manifest bound to the current canonical Provider state under the same Domain Authorization reference. This command accepts no content override and cannot create a new intent.
 
 ```bash
 SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
-python3 skills/sns-api/scripts/sns_api.py authorize-resume \
+python3 skills/sns-api/scripts/sns_api.py prepare-resume \
   --manifest .tmp/expired-submitted.json \
-  --resume-manifest .tmp/approved-resume.json \
-  --approval-id approval-resume-2026-08-14-002
+  --resume-manifest .tmp/approved-resume.json
 ```
 
 ### Status and reconcile

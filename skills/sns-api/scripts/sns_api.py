@@ -50,12 +50,27 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--account-type")
     prepare.add_argument("--app-id", required=True)
     prepare.add_argument("--expected-credential-fingerprint", required=True)
-    prepare.add_argument("--approval-id", required=True)
+    authorization = prepare.add_mutually_exclusive_group(required=True)
+    authorization.add_argument(
+        "--approval-id",
+        help="opaque reference to an already-authorized exact external intent; never a shell permission receipt",
+    )
+    authorization.add_argument(
+        "--standing-authorization-file",
+        help="Project-owned standing Domain Authorization JSON for a narrowly scoped content pipeline",
+    )
+    prepare.add_argument("--content-source", help="stable Project content-source identifier required by standing authorization")
     prepare.add_argument("--expires-in", type=int, default=900, choices=range(60, 3601), metavar="60-3600")
-    resume = commands.add_parser("authorize-resume", help="issue a fresh approval bound to an existing submitted provider state")
+    resume = commands.add_parser(
+        "prepare-resume", aliases=["authorize-resume"],
+        help="prepare a short-lived state-bound manifest for the same authorized submitted intent",
+    )
     resume.add_argument("--manifest", required=True, help="current signed manifest, which may be expired")
     resume.add_argument("--resume-manifest", required=True, help="new signed resume-only manifest path")
-    resume.add_argument("--approval-id", required=True, help="new Project approval identifier")
+    resume.add_argument(
+        "--approval-id",
+        help="same opaque Domain Authorization reference; defaults to the original manifest reference",
+    )
     resume.add_argument("--expires-in", type=int, default=900, choices=range(60, 3601), metavar="60-3600")
     send = commands.add_parser("send", help="send or safely resume only the exact signed manifest intent")
     send.add_argument("--manifest", required=True)
@@ -82,7 +97,7 @@ def dispatch(args: Any) -> Dict[str, Any]:
     if args.command == "migrate-legacy-x": return core.migrate_legacy_x()
     if args.command == "read": return core.read(args.platform, args.operation, core.json_object(args.params, "--params"))
     if args.command == "prepare": args.payload = _payload(args); return core.prepare(args)
-    if args.command == "authorize-resume":
+    if args.command in {"prepare-resume", "authorize-resume"}:
         return core.authorize_resume(Path(args.manifest), Path(args.resume_manifest), args.approval_id, args.expires_in)
     if args.command == "send": return core.send(Path(args.manifest))
     if args.command == "status": return core.status(args.platform, args.operation, args.resource_id)

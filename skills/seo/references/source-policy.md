@@ -104,4 +104,4 @@ When evidence conflicts, do not average confidence. Show the conflict, scope and
 
 ## Change authority
 
-Read-only diagnostics may proceed within the user's scope. Do not treat access to code or dashboards as authorization to deploy, submit sitemaps, request removals, change WAF, alter robots, delete URLs or send external requests with side effects. Follow the Project's normal approval boundary.
+Read-only diagnostics may proceed within the requested scope. Access to code or dashboards does not add deploy, sitemap submission, removal, WAF, robots, URL deletion, or other external-side-effect operations to that scope. If an operation is outside the requested scope, do not perform it; do not add a generic Human Approval loop or decide Runtime execution permission inside this Skill.

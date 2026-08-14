@@ -14,6 +14,8 @@ metadata:
 
 対象Projectを先に理解し、最新の一次情報から再利用可能なUIを探索し、既存design systemへ最小差分で統合し、AI固有の非同期状態と品質を検証する。これはコンポーネント一覧ではなく、AI-native interfaceを実装するための実行プロトコルである。
 
+ここで扱うapproval UIとserver-side authorizationは設計・実装対象productのDomain Safetyである。このSkillを実行するAgentやprovider Runtimeのshell、filesystem、network、sandbox、execution modeは設定・判定しない。
+
 ## 使用するKnowledge
 
 ### Required

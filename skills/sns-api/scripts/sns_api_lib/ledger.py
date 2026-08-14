@@ -333,14 +333,12 @@ def reserve_attempt(manifest: Dict[str, Any]) -> int:
                     raise ApiFailure("submitted provider state is corrupt", code="UNSAFE_PROVIDER_STATE") from exc
                 if (manifest.get("resume_of_manifest_hash") != row["manifest_hash"]
                         or manifest.get("resume_state_hash") != _sha256_json(provider_state)):
-                    raise ApiFailure("submitted provider state changed after resume approval", code="RESUME_STATE_CHANGED")
-                if manifest.get("approval_id") == row["approval_id"]:
-                    raise ApiFailure("resume requires a new signed approval_id", code="NEW_APPROVAL_REQUIRED")
+                    raise ApiFailure("submitted provider state changed after resume manifest preparation", code="RESUME_STATE_CHANGED")
                 connection.execute(
                     "UPDATE intents SET manifest_hash=?,approval_id=?,updated_at=? WHERE id=?",
                     (manifest["manifest_hash"], manifest["approval_id"], now, row["id"]),
                 )
-                _event(connection, int(row["id"]), "resume-reauthorized", "submitted", detail={
+                _event(connection, int(row["id"]), "resume-manifest-refreshed", "submitted", detail={
                     "resume_of_manifest_hash": manifest["resume_of_manifest_hash"],
                     "resume_state_hash": manifest["resume_state_hash"], "approval_id": manifest["approval_id"],
                 })
@@ -351,7 +349,18 @@ def reserve_attempt(manifest: Dict[str, Any]) -> int:
             if row["status"] == "unknown":
                 raise ApiFailure("unknown publish result refuses blind retry; run reconcile", code="BLIND_RETRY_REFUSED")
             if row["status"] in {"failed", "confirmed_absent"} and row["approval_id"] == manifest["approval_id"]:
-                raise ApiFailure("retry requires a new signed approval_id", code="NEW_APPROVAL_REQUIRED")
+                original_binding = (
+                    row["account_type"], row["app_id"], row["credential_fingerprint"], row["operation"],
+                )
+                retry_binding = (
+                    manifest["account_type"], manifest["app_id"],
+                    manifest["expected_credential_fingerprint"], manifest["operation"],
+                )
+                if original_binding != retry_binding:
+                    raise ApiFailure(
+                        "same Domain Authorization reference cannot change retry bindings",
+                        code="AUTHORIZATION_SCOPE_MISMATCH",
+                    )
             if row["attempts"] >= 2:
                 raise ApiFailure("publish attempt limit reached", code="ATTEMPT_LIMIT")
             attempts = row["attempts"] + 1

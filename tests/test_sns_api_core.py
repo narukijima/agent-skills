@@ -6,13 +6,14 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request
 
-from tests.sns_api_helpers import base_env, core, credentials, make_manifest, signed
-from sns_api_lib import http
+from tests.sns_api_helpers import FINGERPRINT, base_env, core, credentials, make_manifest, prepare_args, signed
+from sns_api_lib import authorization, http
 from sns_api_lib.ledger import get_intent, reserve_attempt
 
 
@@ -33,6 +34,88 @@ class SnsApiCoreTests(unittest.TestCase):
                 patch.object(provider, "identity", return_value={"id": identity, "account_type": "user"}), \
                 patch.object(provider, "publish", side_effect=publish):
             return core.send(manifest_path)
+
+    def _standing_authorization(self, **overrides):
+        now = datetime.now(timezone.utc)
+        value = {
+            "schema_version": 1,
+            "authorization_type": "standing",
+            "authorization_id": "standing-editorial-1",
+            "platform": "x",
+            "operations": ["publish.text"],
+            "expected_account_id": "42",
+            "account_type": "user",
+            "app_id": "app-1",
+            "expected_credential_fingerprint": FINGERPRINT,
+            "allowed_content_sources": ["pipeline:editorial-approved"],
+            "max_provider_calls_per_intent": 3,
+            "daily_write_call_limit": 100,
+            "caller_scope": {"project_id": "project-1", "agent_id": "agent-1", "schedule_id": "schedule:daily"},
+            "not_before": (now - timedelta(minutes=1)).isoformat(),
+            "expires_at": (now + timedelta(days=1)).isoformat(),
+        }
+        value.update(overrides)
+        with patch.dict(os.environ, base_env(), clear=True):
+            value = authorization.sign_standing_authorization(value)
+        path = Path(self.temp.name) / ("standing-" + str(time.time_ns()) + ".json")
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    def test_standing_authorization_proceeds_without_per_intent_human_approval(self):
+        authorization = self._standing_authorization()
+        path = Path(self.temp.name) / "standing.json"
+        env = base_env(SNS_API_SCHEDULE_ID="schedule:daily")
+        make_manifest(
+            path, environment=env, approval_id=None, standing_authorization_file=str(authorization),
+            content_source="pipeline:editorial-approved",
+        )
+        value = signed(path)
+        self.assertEqual(value["approval_id"], "standing-editorial-1")
+        self.assertEqual(value["domain_authorization"]["type"], "standing")
+        self.assertEqual(self._send(path, env=env)["status"], "published")
+
+    def test_standing_authorization_rejects_scope_and_caller_mismatches(self):
+        env = base_env(SNS_API_SCHEDULE_ID="schedule:daily")
+        for label, authorization, kwargs in (
+            ("account", self._standing_authorization(expected_account_id="99"), {}),
+            ("app", self._standing_authorization(app_id="other-app"), {}),
+            ("credential", self._standing_authorization(expected_credential_fingerprint="0" * 64), {}),
+            ("operation", self._standing_authorization(operations=["publish.image"]), {}),
+            ("budget", self._standing_authorization(max_provider_calls_per_intent=2), {}),
+            ("daily-budget", self._standing_authorization(daily_write_call_limit=50), {}),
+            ("content-source", self._standing_authorization(), {"content_source": "pipeline:unreviewed"}),
+        ):
+            with self.subTest(label=label), patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(core.ApiFailure) as raised:
+                    core.prepare(prepare_args(
+                        Path(self.temp.name) / (label + ".json"), approval_id=None,
+                        standing_authorization_file=str(authorization),
+                        content_source=kwargs.get("content_source", "pipeline:editorial-approved"),
+                    ))
+                self.assertEqual(raised.exception.code, "AUTHORIZATION_SCOPE_MISMATCH")
+
+        authorization = self._standing_authorization()
+        path = Path(self.temp.name) / "caller.json"
+        make_manifest(
+            path, environment=env, approval_id=None, standing_authorization_file=str(authorization),
+            content_source="pipeline:editorial-approved",
+        )
+        with self.assertRaises(core.ApiFailure) as raised:
+            self._send(path, env=base_env(SNS_API_SCHEDULE_ID="schedule:other"))
+        self.assertEqual(raised.exception.code, "AUTHORIZATION_SCOPE_MISMATCH")
+
+    def test_standing_authorization_tamper_is_rejected(self):
+        path = self._standing_authorization()
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["allowed_content_sources"] = ["pipeline:unreviewed"]
+        path.write_text(json.dumps(value), encoding="utf-8")
+        with patch.dict(os.environ, base_env(SNS_API_SCHEDULE_ID="schedule:daily"), clear=True):
+            with self.assertRaises(core.ApiFailure) as raised:
+                core.prepare(prepare_args(
+                    Path(self.temp.name) / "tampered.json", approval_id=None,
+                    standing_authorization_file=str(path), content_source="pipeline:unreviewed",
+                ))
+        self.assertEqual(raised.exception.code, "AUTHORIZATION_TAMPERED")
 
     def test_expected_account_mismatch_has_no_ledger_attempt(self):
         path = Path(self.temp.name) / "m.json"; make_manifest(path)
@@ -182,14 +265,22 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertEqual(get_intent("x", "42", "content-1")["attempts"], 0)
         result = self._send(path); self.assertEqual(result["status"], "published")
 
-    def test_failed_retry_requires_new_signed_approval(self):
+    def test_definite_failure_retry_reuses_same_domain_authorization(self):
         first = Path(self.temp.name) / "first.json"; make_manifest(first)
         failure = core.ApiFailure("bad", status=400)
         with self.assertRaises(core.ApiFailure): self._send(first, publish=lambda *_: (_ for _ in ()).throw(failure))
-        with self.assertRaises(core.ApiFailure) as reused: self._send(first)
-        self.assertEqual(reused.exception.code, "NEW_APPROVAL_REQUIRED")
-        second = Path(self.temp.name) / "second.json"; make_manifest(second, approval_id="approval-2")
-        self.assertEqual(self._send(second)["status"], "published")
+        self.assertEqual(self._send(first)["status"], "published")
+
+    def test_definite_failure_retry_cannot_change_binding_under_same_authorization_reference(self):
+        first = Path(self.temp.name) / "first.json"; make_manifest(first)
+        failure = core.ApiFailure("bad", status=400)
+        with self.assertRaises(core.ApiFailure):
+            self._send(first, publish=lambda *_: (_ for _ in ()).throw(failure))
+        changed = Path(self.temp.name) / "changed.json"
+        make_manifest(changed, credential_fingerprint="0" * 64)
+        with self.assertRaises(core.ApiFailure) as raised:
+            reserve_attempt(signed(changed))
+        self.assertEqual(raised.exception.code, "AUTHORIZATION_SCOPE_MISMATCH")
 
     def test_concurrent_send_dispatches_one_external_write(self):
         path = Path(self.temp.name) / "m.json"; make_manifest(path); calls = []; lock = threading.Lock(); outcomes = []
@@ -295,7 +386,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("private%2Fkey%20value", value["message"])
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.2.1")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.3.0")
 
 
 if __name__ == "__main__": unittest.main()

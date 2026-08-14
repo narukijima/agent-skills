@@ -24,8 +24,11 @@ class SnsApiEvalTests(unittest.TestCase):
                     "x-approved-url-quote", "x-image-upload", "x-video-upload",
                     "credential-leakage-refusal", "legacy-x-state-migration", "youtube-authenticated-resume",
                     "meta-prepublish-crash-recovery", "facebook-unknown-recovery", "submitted-expired-resume-approval",
+                    "standing-authorization-no-repeat-approval", "authorization-account-mismatch",
+                    "authorization-content-hash-mismatch", "authorization-credential-mismatch",
+                    "authorization-duplicate-unknown", "runtime-permission-not-owned",
                     "instagram-media-fail-fast", "tiktok-planned"}
-        self.assertTrue(required.issubset(ids)); self.assertEqual(len(ids), 24)
+        self.assertTrue(required.issubset(ids)); self.assertEqual(len(ids), 30)
 
     def test_explicit_invocation_has_negative_cases(self):
         negatives = [case for case in self.payload["cases"] if not case["expected_activation"]]
