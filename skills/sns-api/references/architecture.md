@@ -10,7 +10,7 @@
 
 ## Boundaries
 
-The Skill implementation is a Common Safety Core plus static, thin Provider adapters. The Core owns workspace resolution, manifests, Domain Authorization/account/app/credential binding, budgets, ledger transactions, duplicate control, audit events, secret redaction, HTTP safety, media evidence, response envelopes, and dispatch. A Provider owns hosts, pinned version policy, credentials, authenticated identity, capability validation, API request shape, pagination, upload/publish protocol, native status, response normalization, reconciliation, and rate/quota metadata. Neither layer owns shell, filesystem, network, sandbox, or provider Runtime permission.
+The runtime is a Common Safety Core plus static, thin Provider adapters. The Core owns workspace resolution, manifests, approval/account/app/credential binding, budgets, ledger transactions, duplicate control, audit events, secret redaction, HTTP safety, media evidence, response envelopes, and dispatch. A Provider owns hosts, pinned version policy, credentials, authenticated identity, capability validation, API request shape, pagination, upload/publish protocol, native status, response normalization, reconciliation, and rate/quota metadata.
 
 `scripts/sns_api.py` is only the CLI. `scripts/sns_api_lib/core.py` orchestrates the lifecycle. `providers/base.py` is a shallow contract, not an inheritance framework. `providers/__init__.py` is a fixed registry; it never dynamically imports caller-selected code. X keeps auth/text/reconcile in `providers/x.py` and its upload/checkpoint protocol in the provider-owned `providers/x_media.py`; this is a static responsibility split, not a plugin system.
 
@@ -18,8 +18,8 @@ The Skill implementation is a Common Safety Core plus static, thin Provider adap
 
 1. `capabilities` reads the fixed registry without credentials or network.
 2. `read` validates a named capability, reserves invocation/daily budget, resolves one credential snapshot, and calls the Provider.
-3. `prepare` normalizes one provider payload, validates exact-intent or standing Domain Authorization, captures asset evidence and call plan, and creates a short-lived signed manifest.
-4. `send` verifies manifest/HMAC/expiry/assets, Domain Authorization scope, application kill switch, exact call budget, app ID, credential fingerprint, authenticated identity, and account type.
+3. `prepare` normalizes one provider payload, captures asset evidence and call plan, and creates a short-lived signed manifest.
+4. `send` verifies manifest/HMAC/expiry/assets, write gate, exact call budget, app ID, credential fingerprint, authenticated identity, and account type.
 5. The ledger transaction records `unknown` before the first irreversible request.
 6. Provider checkpoints persist non-secret stage/container IDs or an opaque private-session handle before later phases. Capability-sensitive session URLs stay outside SQLite.
 7. A definite response becomes `published`, `submitted`, `failed`, or `rate_limited`. An uncertain response remains `unknown`.
@@ -27,7 +27,7 @@ The Skill implementation is a Common Safety Core plus static, thin Provider adap
 
 YouTube, Instagram, Threads, and X media may return `submitted`. YouTube resumes the same private session URL from the Provider-acknowledged byte offset. Instagram/Threads persist `creating_children`, `creating_parent`/`creating_container`, `processing`, `ready`, `final_publish_started`, and `published`; checkpointed carousel children are reused. A pre-publish uncertainty can be converted from `unknown` to resumable `submitted` only by reconciliation after a grace window. A timeout during the final publish call remains `unknown` and requires official recent-content/status reconciliation.
 
-If the short-lived manifest expires during `submitted`, `prepare-resume` creates a fresh HMAC manifest under the same opaque Domain Authorization reference. It binds the prior manifest hash and the current Provider-state hash, carries no content override, and cannot create a new intent. Any state change between prepare and send fails closed.
+If the original approval expires during `submitted`, `authorize-resume` creates a fresh short-lived HMAC manifest with a new approval ID. It binds the prior manifest hash and the current Provider-state hash, carries no content override, and cannot create a new intent. Any state change between authorization and send fails closed.
 
 ## State and outcomes
 
@@ -53,7 +53,7 @@ Common states:
 | `unknown` | An irreversible request may have reached the Provider; blind retry forbidden. |
 | `submitted` | Provider accepted a stable upload/container/object, but full publication/processing is not complete. |
 | `published` | Provider-specific evidence says the content is published/complete. |
-| `failed` | A definite failure; one exact-intent retry may reuse the same still-valid Domain Authorization. |
+| `failed` | A definite failure; retry requires a new signed approval. |
 | `rate_limited` | 429 or equivalent; preserve rate metadata and do not sleep automatically. |
 | `confirmed_absent` | Provider-specific reconciliation proved absence. |
 | `unresolved` | Available official evidence cannot prove success or absence. |

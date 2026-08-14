@@ -19,8 +19,6 @@ metadata:
 
 <このSkillが所有する共通能力。利用側のProject固有の方針は書かない。>
 
-このSkillはDomain固有の入力、操作、安全性だけを扱う。shell、filesystem、network、sandbox、provider execution mode等のGeneric Runtime Permissionを設定・判定しない。Runtimeが実行不能ならRuntime層のerrorとして返す。
-
 ## 使用するKnowledge
 
 ### Required

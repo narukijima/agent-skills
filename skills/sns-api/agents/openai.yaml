@@ -1,6 +1,6 @@
 interface:
   display_name: "SNS API"
   short_description: "5 SNS公式APIを回復可能な署名manifestで安全に実行"
-  default_prompt: "Use $sns-api explicitly to inspect capabilities or execute one Domain-authorized, budgeted, account-bound official SNS API intent through prepare, manifest-only send, status, reconcile, and state-bound resume."
+  default_prompt: "Use $sns-api explicitly to inspect capabilities or execute one budgeted, account-bound official SNS API intent through prepare, manifest-only send, status, stage-aware reconcile, and state-bound resume authorization."
 policy:
   allow_implicit_invocation: false

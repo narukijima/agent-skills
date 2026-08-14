@@ -13,12 +13,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .auth import manifest_signing_key
-from .authorization import build_domain_authorization, validate_domain_authorization
 from .core import ApiFailure, parse_time, workspace_metadata
 from .media import prepare_assets
 
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = {2, 3}
+SCHEMA_VERSION = 2
 
 
 def canonical_bytes(value: Dict[str, Any], excluded: set[str] | None = None) -> bytes:
@@ -82,6 +80,7 @@ def create_manifest(provider: Any, args: Any) -> Dict[str, Any]:
         "account_type": args.account_type or provider.account_type,
         "app_id": args.app_id,
         "expected_credential_fingerprint": args.expected_credential_fingerprint,
+        "approval_id": args.approval_id,
         "created_at": created.isoformat().replace("+00:00", "Z"),
         "expires_at": (created + timedelta(seconds=args.expires_in)).isoformat().replace("+00:00", "Z"),
         "provider_payload": normalized,
@@ -91,9 +90,6 @@ def create_manifest(provider: Any, args: Any) -> Dict[str, Any]:
         "provider_call_plan": call_plan,
     }
     manifest["intent_hash"] = sha256_json({"provider_payload": normalized, "assets": assets})
-    authorization = build_domain_authorization(args, manifest)
-    manifest["approval_id"] = authorization["authorization_id"]
-    manifest["domain_authorization"] = authorization
     for key in ("content_id", "expected_account_id", "account_type", "app_id", "approval_id"):
         if not isinstance(manifest[key], str) or not manifest[key].strip():
             raise ApiFailure("manifest identity and approval fields must not be empty", code="INVALID_MANIFEST")
@@ -113,26 +109,21 @@ def create_manifest(provider: Any, args: Any) -> Dict[str, Any]:
     }
 
 
-def create_resume_manifest(original_path: Path, output_path: Path, approval_id: str | None, expires_in: int,
+def create_resume_manifest(original_path: Path, output_path: Path, approval_id: str, expires_in: int,
                            row: Dict[str, Any]) -> Dict[str, Any]:
     original = load_manifest(original_path, allow_expired=True)
-    validate_domain_authorization(original)
     if row.get("status") != "submitted" or row.get("manifest_hash") != original.get("manifest_hash"):
         raise ApiFailure("resume authorization requires the current submitted manifest", code="INVALID_RESUME_STATE")
     if row.get("payload_hash") != original.get("payload_hash") or row.get("intent_hash") != original.get("intent_hash"):
         raise ApiFailure("resume authorization payload does not match canonical ledger", code="RESUME_BINDING_MISMATCH")
-    authorization_id = str(approval_id or original.get("approval_id", "")).strip()
-    if not authorization_id:
-        raise ApiFailure("resume manifest requires a Domain Authorization reference", code="INVALID_AUTHORIZATION")
-    domain = original.get("domain_authorization")
-    if isinstance(domain, dict) and authorization_id != domain.get("authorization_id"):
-        raise ApiFailure("resume cannot replace the original Domain Authorization reference", code="AUTHORIZATION_SCOPE_MISMATCH")
+    if not isinstance(approval_id, str) or not approval_id.strip() or approval_id == row.get("approval_id"):
+        raise ApiFailure("resume authorization requires a new approval_id", code="NEW_APPROVAL_REQUIRED")
     if not 60 <= int(expires_in) <= 3600:
         raise ApiFailure("resume authorization expiry must be 60-3600 seconds", code="INVALID_MANIFEST")
     created = datetime.now(timezone.utc)
     value = {key: item for key, item in original.items() if key not in {"manifest_hash", "hmac_signature"}}
     value.update(
-        approval_id=authorization_id, created_at=created.isoformat().replace("+00:00", "Z"),
+        approval_id=approval_id.strip(), created_at=created.isoformat().replace("+00:00", "Z"),
         expires_at=(created + timedelta(seconds=int(expires_in))).isoformat().replace("+00:00", "Z"),
         authorization_type="resume", resume_of_manifest_hash=str(row["manifest_hash"]),
         resume_state_hash=sha256_json(row.get("provider_state") or {}),
@@ -158,14 +149,12 @@ def load_manifest(path: Path, *, allow_expired: bool = False) -> Dict[str, Any]:
     missing = sorted(required - set(value))
     if missing:
         raise ApiFailure("publish manifest is missing: " + ", ".join(missing), code="INVALID_MANIFEST")
-    if value["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS:
+    if value["schema_version"] != SCHEMA_VERSION:
         raise ApiFailure("unsupported manifest schema_version", code="INVALID_MANIFEST")
-    if value["schema_version"] == SCHEMA_VERSION and "domain_authorization" not in value:
-        raise ApiFailure("publish manifest is missing: domain_authorization", code="INVALID_MANIFEST")
     if not secrets.compare_digest(str(value["manifest_hash"]), manifest_hash(value)):
         raise ApiFailure("manifest integrity check failed", code="MANIFEST_TAMPERED")
     if not secrets.compare_digest(str(value["hmac_signature"]), signature(value)):
-        raise ApiFailure("manifest Domain Authorization signature check failed", code="MANIFEST_TAMPERED")
+        raise ApiFailure("manifest approval signature check failed", code="MANIFEST_TAMPERED")
     if (value["payload_hash"] != sha256_json(value["provider_payload"])
             or value["asset_hash"] != sha256_json(value["assets"])
             or value["intent_hash"] != sha256_json({"provider_payload": value["provider_payload"], "assets": value["assets"]})):

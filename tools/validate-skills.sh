@@ -5,8 +5,6 @@ repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 status=0
 skill_count=0
 
-python3 "$repo_root/tools/check-runtime-permission-boundary.py"
-
 while IFS= read -r skill_file; do
   skill_count=$((skill_count + 1))
   skill_dir="$(dirname -- "$skill_file")"
@@ -39,7 +37,7 @@ top_level_keys = {
     for line in lines
     if (item := re.match(r"^([a-z][a-z0-9-]*):(?:\s|$)", line))
 }
-allowed_keys = {"name", "description", "license", "compatibility", "metadata"}
+allowed_keys = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
 unknown_keys = sorted(top_level_keys - allowed_keys)
 if unknown_keys:
     raise SystemExit("unsupported top-level frontmatter keys: " + ", ".join(unknown_keys))
