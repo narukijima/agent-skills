@@ -9,7 +9,8 @@ updated_at: 2026-08-15
 共有Skill配布元は明示import、provenance記録、全体validator、unit test、behavior eval schemaを持つ。
 ClaudAGT AgentのIndependent Projectとして継続開発するProject契約を導入した。
 最新モデル能力に伴う包括的再監査で、`sns-api` の `resolve_workspace_root` における環境変数 `AGENT_DIRECTORY_ROOT` 対応および親探索境界（`stop_at`）保護を導入し、上位Gitリポジトリへの探索漏れによる誤検出を解消した。
-全体validator、全167件のunit test、および3定義50ケースのbehavior evalが完全合格する状態を確立した。
+import元のignored fileがprovenance外で混入する経路を、記録済みcommitのGit treeだけを展開する方式へ単純化して閉じた。
+全体validator、全168件のunit test、および3定義50ケースのbehavior eval定義検証が完全合格する状態を確立した。
 
 ## 現在の目標
 
@@ -27,8 +28,9 @@ Skillの発動契約、決定的処理、test、利用側責務境界を一致�
 - 対象: `PROJECT.md#PC-01`
 - 確認日: 2026-08-15
 - 方法: `git diff --check`、`bash tools/validate-skills.sh`、`python3 -m unittest discover -s tests -v`、
-  `python3 tools/score-behavior-eval.py --cases evals/<skill>/cases.json`（3定義50ケース）。
-- 結果: validator、全167件のunit test、behavior eval 3定義50 caseすべてが0 failure / 0 errorで完全合格した。
+  `python3 tools/score-behavior-eval.py --cases evals/<skill>/cases.json`（3定義50ケース、model実行・judgmentなし）。
+- 結果: validatorと全168件のunit testが0 failure / 0 errorで合格し、behavior eval 3定義50 caseは
+  `behavior_run: false`の定義検証として合格した。実model behaviorの成功を意味しない。
 
 ## 未完了・ブロッカー
 

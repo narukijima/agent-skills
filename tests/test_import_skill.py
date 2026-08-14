@@ -14,6 +14,7 @@ def temporary_source_repository(directory: str, skill_name: str, description: st
     source = Path(directory) / "source"
     (source / "tools").mkdir(parents=True)
     shutil.copy2(IMPORTER, source / "tools/import-skill.sh")
+    shutil.copy2(ROOT / ".gitignore", source / ".gitignore")
     shutil.copytree(ROOT / "skills" / skill_name, source / "skills" / skill_name)
     skill_file = source / "skills" / skill_name / "SKILL.md"
     skill_file.chmod(skill_file.stat().st_mode | stat.S_IWUSR)
@@ -111,6 +112,33 @@ class ImportSkillTests(unittest.TestCase):
             self.assertNotEqual(dirty.returncode, 0)
             self.assertIn("uncommitted changes", dirty.stderr)
             self.assertFalse(target.exists())
+
+    def test_import_excludes_ignored_files_not_present_in_source_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "agent-directory"
+            source, importer = temporary_source_repository(directory, "ai-native-design", "fixture description")
+            ignored = source / "skills/ai-native-design/.env"
+            ignored.write_text("fixture-only\n", encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(source), "status", "--porcelain", "--", "skills/ai-native-design"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
+
+            completed = subprocess.run(
+                ["/bin/bash", str(importer), "ai-native-design", "--target", str(target)],
+                cwd=source,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse((target / "skills/ai-native-design/.env").exists())
 
     def test_import_rejects_description_longer_than_agent_directory_contract(self):
         with tempfile.TemporaryDirectory() as directory:
