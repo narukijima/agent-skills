@@ -227,8 +227,8 @@ def read(platform: str, operation: str, params: Dict[str, Any]) -> Dict[str, Any
     )
 
 
-def status(platform: str, operation: str, resource_id: str) -> Dict[str, Any]:
-    return read(platform, "publish.status", {"resource_id": resource_id, "publish_operation": operation})
+def status(platform: str, resource_id: str) -> Dict[str, Any]:
+    return read(platform, "publish.status", {"resource_id": resource_id})
 
 
 def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[str, Any]:
@@ -236,6 +236,7 @@ def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[
     from .budget import reserve_calls
     from .ledger import ensure_legacy_x_migrated, get_intent, record_result
     item = provider(platform)
+    item.require_capability("reconcile")
     if global_control("READ_ENABLED", legacy=item.legacy_read_gate) != "true":
         raise ApiFailure("reconcile requires SNS_API_READ_ENABLED=true", code="READ_DISABLED")
     if platform == "x":
@@ -336,6 +337,42 @@ def redact(value: Any) -> Any:
                 text = text.replace(representation, "[REDACTED]")
         return text[:8000]
     return value
+
+
+def write_private_json(path: Path, value: Dict[str, Any]) -> None:
+    import secrets as secrets_module
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp." + str(os.getpid()) + "." + secrets_module.token_hex(8))
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
+            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def sign_standing(scope_path: Path, output_path: Path) -> Dict[str, Any]:
+    from .authorization import sign_standing_file
+
+    signed = sign_standing_file(scope_path, output_path)
+    return envelope(str(signed["platform"]), "authorization.sign", status_value="signed", data={
+        "standing_authorization": str(output_path), "authorization_id": signed["authorization_id"],
+        "platform": signed["platform"], "operations": signed["operations"],
+        "expected_account_id": signed["expected_account_id"], "not_before": signed["not_before"],
+        "expires_at": signed["expires_at"], **workspace_metadata(),
+    })
 
 
 def json_object(value: str, label: str) -> Dict[str, Any]:

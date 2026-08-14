@@ -1,5 +1,5 @@
 ---
-updated_at: 2026-08-14
+updated_at: 2026-08-15
 ---
 
 # Current State
@@ -8,7 +8,10 @@ updated_at: 2026-08-14
 
 共有Skill配布元は明示import、provenance記録、全体validator、unit test、behavior eval schemaを持つ。
 ClaudAGT AgentのIndependent Projectとして継続開発するProject契約を導入した。
-`sns-api` v1.3.1ではFacebook Page identity取得から不要な`tasks` field要求を除去した。
+モデル更新に伴う全体再監査を実施し、`sns-api` v2.0.0でmanifest v2互換とstatusの未使用`--operation`を廃止、
+`sign-standing-authorization` CLIとreconcile capability宣言を追加、Instagram/Threads共通処理を
+`meta_common`へ統合した。validatorはreference整合とscripts compile検査、importerは`_template`と
+dirty source拒否を追加した。
 
 ## 現在の目標
 
@@ -24,9 +27,10 @@ Skillの発動契約、決定的処理、test、利用側責務境界を一致�
 ## 検証結果
 
 - 対象: `PROJECT.md#PC-01`
-- 確認日: 2026-08-14
-- 方法: `git diff --check`、`bash tools/validate-skills.sh`、`python3 -m unittest discover -s tests -q`。
-- 結果: validatorと163件のunit testが合格した。behavior eval定義8件もschema検証に合格した。
+- 確認日: 2026-08-15
+- 方法: `git diff --check`、`bash tools/validate-skills.sh`、`python3 -m unittest discover -s tests -q`、
+  `python3 tools/score-behavior-eval.py --cases evals/<skill>/cases.json`（3定義）。
+- 結果: validatorと167件のunit testが合格した。behavior eval 3定義50 caseもschema検証に合格した。
 
 ## 未完了・ブロッカー
 

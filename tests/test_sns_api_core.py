@@ -1,6 +1,7 @@
 import io
 import os
 import json
+import stat
 import tempfile
 import threading
 import time
@@ -35,7 +36,7 @@ class SnsApiCoreTests(unittest.TestCase):
                 patch.object(provider, "publish", side_effect=publish):
             return core.send(manifest_path)
 
-    def _standing_authorization(self, **overrides):
+    def _standing_scope(self, **overrides):
         now = datetime.now(timezone.utc)
         value = {
             "schema_version": 1,
@@ -55,11 +56,56 @@ class SnsApiCoreTests(unittest.TestCase):
             "expires_at": (now + timedelta(days=1)).isoformat(),
         }
         value.update(overrides)
+        return value
+
+    def _standing_authorization(self, **overrides):
+        value = self._standing_scope(**overrides)
         with patch.dict(os.environ, base_env(), clear=True):
             value = authorization.sign_standing_authorization(value)
         path = Path(self.temp.name) / ("standing-" + str(time.time_ns()) + ".json")
         path.write_text(json.dumps(value), encoding="utf-8")
         return path
+
+    def test_sign_standing_authorization_cli_signs_scope_end_to_end(self):
+        import sns_api
+        scope_path = Path(self.temp.name) / "scope.json"
+        scope_path.write_text(json.dumps(self._standing_scope()), encoding="utf-8")
+        output_path = Path(self.temp.name) / "standing-signed.json"
+        out = io.StringIO()
+        with patch.dict(os.environ, base_env(), clear=True), patch("sys.stdout", out):
+            code = sns_api.main([
+                "sign-standing-authorization", "--scope-file", str(scope_path), "--output", str(output_path),
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["status"], "signed")
+        self.assertEqual(stat.S_IMODE(output_path.stat().st_mode), 0o600)
+        env = base_env(SNS_API_SCHEDULE_ID="schedule:daily")
+        manifest_path = Path(self.temp.name) / "standing-cli.json"
+        make_manifest(
+            manifest_path, environment=env, approval_id=None, standing_authorization_file=str(output_path),
+            content_source="pipeline:editorial-approved",
+        )
+        self.assertEqual(signed(manifest_path)["approval_id"], "standing-editorial-1")
+
+    def test_sign_standing_authorization_cli_rejects_incomplete_scope(self):
+        import sns_api
+        scope = self._standing_scope()
+        scope.pop("operations")
+        scope_path = Path(self.temp.name) / "bad-scope.json"
+        scope_path.write_text(json.dumps(scope), encoding="utf-8")
+        output_path = Path(self.temp.name) / "bad-signed.json"
+        error = io.StringIO()
+        with patch.dict(os.environ, base_env(), clear=True), patch("sys.stderr", error):
+            code = sns_api.main([
+                "sign-standing-authorization", "--scope-file", str(scope_path), "--output", str(output_path),
+            ])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(error.getvalue())["errors"][0]["code"], "INVALID_AUTHORIZATION")
+        self.assertFalse(output_path.exists())
+
+    def test_skill_requires_explicit_invocation(self):
+        text = (Path(__file__).parents[1] / "skills/sns-api/agents/openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("allow_implicit_invocation: false", text)
 
     def test_standing_authorization_proceeds_without_per_intent_human_approval(self):
         authorization = self._standing_authorization()
@@ -386,7 +432,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("private%2Fkey%20value", value["message"])
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/1.3.1")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/2.0.0")
 
 
 if __name__ == "__main__": unittest.main()

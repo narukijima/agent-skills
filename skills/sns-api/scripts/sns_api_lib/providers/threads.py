@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from ..auth import bearer_credentials, provider_env
-from ..core import ApiFailure, parse_time, utc_now
+from ..core import ApiFailure, utc_now
 from .base import Provider
-from .meta_common import THREADS_HOST, graph_call, graph_id, normalized, prepublish_call, prepublish_resume_ready, require_remote
+from .meta_common import (
+    THREADS_HOST, container_reconcile, container_resume_state, graph_call, graph_id, graph_limit,
+    normalized, prepublish_call, recent_container_match, require_remote,
+)
 
 VERSION = "v1.0"
 
 
 class ThreadsProvider(Provider):
     name = "threads"; account_type = "threads-user"; api_version = VERSION
-    capabilities = ("identity.read", "own.posts", "publish.text", "publish.image", "publish.video", "publish.carousel", "publish.status")
+    capabilities = ("identity.read", "own.posts", "publish.text", "publish.image", "publish.video", "publish.carousel", "publish.status", "reconcile")
     read_operations = ("identity.read", "own.posts", "publish.status")
     publish_operations = ("publish.text", "publish.image", "publish.video", "publish.carousel")
     supports_manifest_resume = True
@@ -107,72 +108,23 @@ class ThreadsProvider(Provider):
                 "rate_limit": result.rate_limit, "provider": {"container_id": container, "api_version": VERSION}}
 
     def reconcile(self, credentials, row):
-        state = row.get("provider_state") or {}; resource = state.get("container_id") or row.get("provider_id")
-        if row.get("status") == "unknown" and (not state or state.get("final_publish_started") is False) and prepublish_resume_ready(row):
-            return {"status": "resume_safe", "provider": {"stage": state.get("stage"), "public_publish_started": False}}
-        if not resource: return {"status": "unresolved"}
-        result = self.read(credentials, "publish.status", {"resource_id": resource}); data = result.get("data") or {}
-        code = data.get("status") if isinstance(data, dict) else None
-        known_final = row.get("provider_id") or state.get("provider_id")
-        if code == "PUBLISHED" and known_final and str(known_final) != str(resource):
-            return {"status": "confirmed_success", "provider_id": str(known_final), "provider_status": code}
-        if code in {"ERROR", "EXPIRED"}: return {"status": "confirmed_absent", "provider": {"container_status": code}}
-        if state.get("final_publish_started") is True:
-            match = self._recent_publish_match(credentials, row, state)
-            if match:
-                return {"status": "confirmed_success", "provider_id": match, "provider_status": "PUBLISHED",
-                        "provider": {"matched_owned_post": True, "container_status": code}}
-        return {"status": "unresolved", "provider": {"container_status": code}}
+        return container_reconcile(self, credentials, row, status_keys=("status",),
+                                   match_meta_key="matched_owned_post", recent_match=self._recent_publish_match)
 
     def _recent_publish_match(self, credentials, row, state):
-        result = self.read(credentials, "own.posts", {"limit": 100})
-        if result.get("status") == "partial" or result.get("errors"):
-            return None
-        expected = str((row.get("provider_payload") or {}).get("text", ""))
-        attempted = parse_time(str(state.get("final_publish_started_at") or row.get("attempted_at")), "Threads final publish time")
-        expected_types = {
-            "publish.text": {"TEXT_POST", "TEXT"}, "publish.image": {"IMAGE"},
-            "publish.video": {"VIDEO"}, "publish.carousel": {"CAROUSEL"},
-        }.get(row.get("operation"), set())
-        candidates = []
-        for item in result.get("data") or []:
-            if not isinstance(item, dict) or not item.get("timestamp") or str(item.get("text", "")) != expected:
-                continue
-            created = parse_time(str(item["timestamp"]), "Threads post timestamp")
-            native_type = str(item.get("media_type") or item.get("media_product_type") or "").upper()
-            if attempted - timedelta(seconds=30) <= created <= attempted + timedelta(minutes=5) and (not expected_types or native_type in expected_types):
-                if item.get("id"): candidates.append(str(item["id"]))
-        return candidates[0] if len(candidates) == 1 else None
+        return recent_container_match(self, credentials, row, state, read_operation="own.posts",
+                                      text_field="text", type_keys=("media_type", "media_product_type"),
+                                      expected_types_by_operation={
+                                          "publish.text": {"TEXT_POST", "TEXT"}, "publish.image": {"IMAGE"},
+                                          "publish.video": {"VIDEO"}, "publish.carousel": {"CAROUSEL"},
+                                      }, label="Threads")
 
 
 def _account(): return graph_id(provider_env("threads", "ACCOUNT_ID", required=True), "Threads account ID")
 
 
-def _limit(value):
-    try: number = int(value)
-    except (TypeError, ValueError) as exc: raise ApiFailure("limit must be integer", code="INVALID_PARAMETER") from exc
-    if not 1 <= number <= 100: raise ApiFailure("Threads limit must be 1-100", code="INVALID_PARAMETER")
-    return str(number)
+def _limit(value): return graph_limit(value, "Threads")
 
 
 def _resume_state(value, operation, asset_count):
-    state = dict(value)
-    stage = state.get("stage")
-    if stage is None and state:
-        if state.get("provider_status") == "ready":
-            stage = "legacy_final_publish_unknown"; state["final_publish_started"] = True
-        elif state.get("container_id"):
-            stage = "container_created"; state.setdefault("final_publish_started", False)
-        elif state.get("child_container_ids"):
-            stage = "creating_children"; state.setdefault("final_publish_started", False)
-    allowed = {None, "creating_children", "creating_parent", "creating_container", "container_created",
-               "processing", "ready", "final_publish_started", "published", "legacy_final_publish_unknown"}
-    if stage not in allowed or state.get("final_publish_started") not in {None, False, True}:
-        raise ApiFailure("Threads provider checkpoint is invalid", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
-    children = state.get("child_container_ids", [])
-    if not isinstance(children, list) or len(children) > asset_count or any(not str(item).isdigit() for item in children):
-        raise ApiFailure("Threads carousel checkpoint is invalid", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
-    if operation != "publish.carousel" and children:
-        raise ApiFailure("Threads non-carousel checkpoint has children", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
-    state["stage"] = stage
-    return state
+    return container_resume_state(value, operation, asset_count, "Threads")

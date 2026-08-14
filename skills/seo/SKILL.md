@@ -3,7 +3,7 @@ name: seo
 description: SEO、検索順位・流入低下、crawl/indexing、robots、sitemap、canonical、Search Console、Core Web Vitals、structured data、internal linking、pSEO、AIO/AEO/GEO、AI searchの調査・実装・検証に使う。広告、SNS、SEO目的のないcopywritingや一般UI改善には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.2.0"
+  claudagt.version: "0.3.0"
   claudagt.status: "active"
   claudagt.aliases: "technical seo,search optimization,search console,aio,aeo,geo,pseo,ai search"
 ---
@@ -37,20 +37,7 @@ metadata:
 
 関係するreferenceだけを読み、無関係な分野を一括ロードしない。providerの仕様、bot名、rich-result対応、計測画面は変わるため、reference内のURLから実行時の公式documentationを確認する。
 
-## Source priority
-
-判断には次の順序でsourceを使う。
-
-1. 対象Projectのcode、設定、deploy履歴、HTTP / rendered output、server / CDN / WAF log
-2. 対象propertyのSearch Console、analytics、CrUX / RUM、sitemap / index data
-3. 検索engine・AI service・browser提供者の現在の公式documentation
-4. Schema.org、robots protocol、web標準等の仕様原文
-5. 再現可能なbrowser、HTTP、crawler、validatorによる実測
-6. 査読研究またはmethodologyとdataを公開した研究
-7. 高品質な第三者調査
-8. community knowledge
-
-下位sourceだけで重大変更を決めない。検索結果の相関、tool score、業界通説は仮説生成に使えてもranking factorの証明にはならない。
+Source優先順位と証拠の記録方法は`references/source-policy.md`の`Source hierarchy`と`Evidence ledger`が正本である。下位sourceだけで重大変更を決めない。
 
 ## 実行protocol
 
@@ -118,12 +105,8 @@ Search Engineの再crawl / 再処理が必要なら、`verified implementation` 
 
 ## Evidence and decision rules
 
-### Claim level
-
-- `confirmed`: 対象Projectの再現、対象service実data、または直接適用できる公式仕様で確認した。
-- `likely`: 複数の独立証拠が一致するが、root causeを直接観測できない。
-- `hypothesis`: 説明候補。追加測定が必要。
-- `unsupported`: 根拠不足、古い主張、または相関を因果として扱っている。
+主張の確度分類（`confirmed` / `likely` / `hypothesis` / `unsupported`）は
+`references/source-policy.md#claim-classification`が正本である。
 
 ### Severity
 

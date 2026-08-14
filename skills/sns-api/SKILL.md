@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "1.3.1"
+  claudagt.version: "2.0.0"
   claudagt.status: "active"
   claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -88,7 +88,7 @@ python3 skills/sns-api/scripts/sns_api.py capabilities --platform instagram
 
 ### Upgrade legacy X safety state
 
-Retire the legacy runtime, then run this local, credential-free migration before the first X operation. X runtime paths also enforce the same migration guard automatically.
+Retire the legacy runtime, then run this local, credential-free migration before the first X operation. X runtime paths also enforce the same migration guard automatically. This migration path exists only for the retired `x-api` runtime and is planned for removal in the next major version.
 
 ```bash
 python3 skills/sns-api/scripts/sns_api.py migrate-legacy-x
@@ -105,6 +105,17 @@ SNS_API_DAILY_READ_CALL_LIMIT=100 \
 python3 skills/sns-api/scripts/sns_api.py read \
   --platform x --operation user.posts \
   --params '{"user_id":"123456789","max_results":5}'
+```
+
+### Sign a standing authorization
+
+For a bound scheduler or content pipeline, sign the Project-defined scope once with the gateway-owned key. Do not reimplement the canonical-JSON HMAC.
+
+```bash
+SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
+python3 skills/sns-api/scripts/sns_api.py sign-standing-authorization \
+  --scope-file .tmp/standing-scope.json \
+  --output .tmp/standing-signed.json
 ```
 
 ### Prepare
@@ -182,7 +193,7 @@ SNS_API_READ_ENABLED=true SNS_API_READ_MAX_CALLS=1 \
 SNS_API_PROJECT_ID=project-1 SNS_API_AGENT_ID=agent-1 \
 SNS_API_DAILY_READ_CALL_LIMIT=100 \
 python3 skills/sns-api/scripts/sns_api.py status \
-  --platform youtube --operation publish.video --resource-id VIDEO_ID
+  --platform youtube --resource-id VIDEO_ID
 
 SNS_API_READ_ENABLED=true SNS_API_READ_MAX_CALLS=2 \
 SNS_API_PROJECT_ID=project-1 SNS_API_AGENT_ID=agent-1 \

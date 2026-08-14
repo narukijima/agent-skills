@@ -8,12 +8,12 @@ from datetime import datetime, timedelta, timezone
 from ..auth import bearer_credentials
 from ..core import ApiFailure, parse_time, utc_now
 from .base import Provider
-from .meta_common import META_HOST, META_VERSION, graph_call, graph_id, normalized, require_remote
+from .meta_common import META_HOST, META_VERSION, graph_call, graph_id, graph_limit, normalized, require_remote
 
 
 class FacebookProvider(Provider):
     name = "facebook"; account_type = "page"; api_version = META_VERSION
-    capabilities = ("identity.read", "page.content", "publish.text", "publish.image", "publish.video", "publish.status", "manual.resolve")
+    capabilities = ("identity.read", "page.content", "publish.text", "publish.image", "publish.video", "publish.status", "reconcile", "manual.resolve")
     read_operations = ("identity.read", "page.content", "publish.status")
     publish_operations = ("publish.text", "publish.image", "publish.video")
     supports_manual_resolve = True
@@ -125,11 +125,7 @@ def _account():
     return graph_id(provider_env("facebook", "PAGE_ID", required=True), "Facebook Page ID")
 
 
-def _limit(value):
-    try: number = int(value)
-    except (TypeError, ValueError) as exc: raise ApiFailure("limit must be integer", code="INVALID_PARAMETER") from exc
-    if not 1 <= number <= 100: raise ApiFailure("Facebook limit must be 1-100", code="INVALID_PARAMETER")
-    return str(number)
+def _limit(value): return graph_limit(value, "Facebook")
 
 
 def _expected_message(row):

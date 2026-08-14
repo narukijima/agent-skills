@@ -11,7 +11,7 @@ Use gateway-owned configuration:
 - `SNS_API_MANIFEST_SIGNING_KEY` (minimum 32 bytes)
 - `SNS_API_TEST_MODE` (loopback-only transport tests while writes are disabled)
 
-Write invocation budget must equal the signed Provider call-plan maximum. Reads require at least the planned calls. Reserve budget before credential refresh or external requests.
+Write invocation budget must equal the signed Provider call-plan maximum. Reads require at least the planned calls. Reserve budget before credential refresh or external requests. Budgets are fail-closed pre-flight reservations of the signed call plan against the daily Project/Agent limit; the runtime reserves the whole plan up front and does not meter individual HTTP requests afterwards.
 
 ## Provider namespaces
 

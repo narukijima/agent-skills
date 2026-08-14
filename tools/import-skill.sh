@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$target_root" || "$skill_name" == */* || "$skill_name" == .* ]]; then
+if [[ -z "$target_root" || "$skill_name" == */* || "$skill_name" == .* || "$skill_name" == _* ]]; then
   usage
   exit 2
 fi
@@ -43,6 +43,10 @@ git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
 }
 [[ ! -e "$destination" ]] || { printf 'ERROR: destination exists; refusing to overwrite: %s\n' "$destination" >&2; exit 1; }
 
+if [[ -n "$(git -C "$repo_root" status --porcelain -- "skills/$skill_name")" ]]; then
+  printf 'ERROR: source skill has uncommitted changes; provenance would not describe the copied bytes\n' >&2
+  exit 1
+fi
 source_commit="$(git -C "$repo_root" rev-parse HEAD)"
 source_repository="$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)"
 if [[ -z "$source_repository" ]]; then

@@ -48,7 +48,7 @@ class ManifestTests(unittest.TestCase):
         path = Path(self.temp.name) / "m.json"; make_manifest(path); value = json.loads(path.read_text()); value["platform"] = "threads"; path.write_text(json.dumps(value))
         with patch.dict(os.environ, base_env(), clear=True), self.assertRaises(core.ApiFailure): manifest.load_manifest(path)
 
-    def test_legacy_v2_manifest_remains_loadable_for_inflight_compatibility(self):
+    def test_retired_v2_manifest_without_domain_authorization_is_rejected(self):
         path = Path(self.temp.name) / "legacy-v2.json"; make_manifest(path)
         value = json.loads(path.read_text(encoding="utf-8"))
         value["schema_version"] = 2
@@ -57,10 +57,9 @@ class ManifestTests(unittest.TestCase):
         with patch.dict(os.environ, base_env(), clear=True):
             value["hmac_signature"] = manifest.signature(value)
         path.write_text(json.dumps(value), encoding="utf-8")
-        with patch.dict(os.environ, base_env(), clear=True):
-            loaded = manifest.load_manifest(path)
-        self.assertEqual(loaded["schema_version"], 2)
-        self.assertNotIn("domain_authorization", loaded)
+        with patch.dict(os.environ, base_env(), clear=True), self.assertRaises(core.ApiFailure) as rejected:
+            manifest.load_manifest(path)
+        self.assertEqual(rejected.exception.code, "INVALID_MANIFEST")
 
     def test_secret_value_in_payload_is_rejected_before_write(self):
         path = Path(self.temp.name) / "m.json"; env = base_env(SNS_PRIVATE_ACCESS_TOKEN="secret-value-12345")

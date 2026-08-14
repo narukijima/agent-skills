@@ -3,7 +3,7 @@ name: ai-native-design
 description: AI固有の状態や操作を含むWeb UIの調査・設計・実装・review・改善に使う。対象はchat、reasoning summary、tool call、approval、streaming、sources、artifact、multi-agent、generative UI、AI dashboard。LP、ブランドサイト、通常Web UI、backendだけの変更には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.2.1"
+  claudagt.version: "0.3.0"
   claudagt.status: "active"
   claudagt.aliases: "ai native design,ai ui"
 ---
@@ -31,17 +31,7 @@ metadata:
 
 外部仕様は変わる。保存済みの知識や固定リストを正本にせず、実行時に上記資料から公式docs、公式repository、公式registryを開いて確認する。
 
-## Source priority
-
-主張と実装判断には次の順でsourceを使う。
-
-1. 対象Project自身のコード、manifest、設定、design system、規約
-2. 各libraryの公式documentation
-3. 各libraryの公式GitHub repository
-4. 公式registryとCLIが返す現在のmetadata / source
-5. 21st.devなどのcommunity source
-
-ブログ、SEO記事、古いsnippetは正本にしない。community候補の説明と実コードが食い違う場合は、実コード、依存関係、license原文を確認し、不明なら採用しない。
+Source優先順位は`references/source-strategy.md#authority-order`が正本である。ブログ、SEO記事、古いsnippetは正本にしない。community候補の説明と実コードが食い違う場合は、実コード、依存関係、license原文を確認し、不明なら採用しない。
 
 ## 実行手順
 

@@ -21,7 +21,7 @@ HOSTS = youtube_resumable.HOSTS
 
 class YouTubeProvider(Provider):
     name = "youtube"; account_type = "channel"; api_version = "v3"
-    capabilities = ("identity.read", "video.lookup", "own.videos", "publish.video", "publish.status", "media.upload.resumable")
+    capabilities = ("identity.read", "video.lookup", "own.videos", "publish.video", "publish.status", "media.upload.resumable", "reconcile")
     read_operations = ("identity.read", "video.lookup", "own.videos", "publish.status")
     publish_operations = ("publish.video",)
     supports_manifest_resume = True

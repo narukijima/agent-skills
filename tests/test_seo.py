@@ -90,7 +90,7 @@ class SeoSkillContractTests(unittest.TestCase):
             if (match := re.match(r"^([a-z][a-z0-9-]*):", line))
         }
         self.assertEqual(top_level, {"name", "description", "license", "metadata"})
-        self.assertIn('claudagt.version: "0.2.0"', frontmatter)
+        self.assertIn('claudagt.version: "0.3.0"', frontmatter)
         catalog = (ROOT / "skills/SKILLS.md").read_text(encoding="utf-8")
         metadata = (SKILL / "agents/openai.yaml").read_text(encoding="utf-8")
         self.assertIn("[`seo`](seo/SKILL.md)", catalog)
@@ -98,11 +98,14 @@ class SeoSkillContractTests(unittest.TestCase):
         self.assertIn("allow_implicit_invocation: true", metadata)
 
     def test_publisher_import_preserves_self_contained_skill_and_provenance(self):
+        from tests.test_import_skill import temporary_source_repository
+
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "agent-directory"
+            source, importer = temporary_source_repository(directory, "seo", "fixture description")
             completed = subprocess.run(
-                ["/bin/bash", str(ROOT / "tools/import-skill.sh"), "seo", "--target", str(target)],
-                cwd=ROOT,
+                ["/bin/bash", str(importer), "seo", "--target", str(target)],
+                cwd=source,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -119,7 +122,7 @@ class SeoSkillContractTests(unittest.TestCase):
             projected = (imported / "SKILL.md").read_text(encoding="utf-8")
             upstream = (imported / "agents/upstream.yaml").read_text(encoding="utf-8")
             self.assertIn("status: active", projected)
-            self.assertIn('source_version: "0.2.0"', upstream)
+            self.assertIn('source_version: "0.3.0"', upstream)
             self.assertIn('import_mode: "vendored-copy"', upstream)
 
 

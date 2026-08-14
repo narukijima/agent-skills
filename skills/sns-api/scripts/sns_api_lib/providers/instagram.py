@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from ..auth import bearer_credentials, provider_env
-from ..core import ApiFailure, parse_time, utc_now
+from ..core import ApiFailure, utc_now
 from .base import Provider
 from .meta_common import (
-    INSTAGRAM_HOST, META_HOST, META_VERSION, graph_call, graph_id, normalized, prepublish_call,
-    prepublish_resume_ready, require_remote,
+    INSTAGRAM_HOST, META_HOST, META_VERSION, container_reconcile, container_resume_state, graph_call,
+    graph_id, graph_limit, normalized, prepublish_call, recent_container_match, require_remote,
 )
 
 IMAGE_MIMES = {"image/jpeg"}
@@ -20,7 +18,7 @@ MAX_VIDEO_BYTES = 1024 * 1024 * 1024
 
 class InstagramProvider(Provider):
     name = "instagram"; account_type = "professional"; api_version = META_VERSION
-    capabilities = ("identity.read", "media.read", "publish.image", "publish.video", "publish.reel", "publish.carousel", "publish.status")
+    capabilities = ("identity.read", "media.read", "publish.image", "publish.video", "publish.reel", "publish.carousel", "publish.status", "reconcile")
     read_operations = ("identity.read", "media.read", "publish.status")
     publish_operations = ("publish.image", "publish.video", "publish.reel", "publish.carousel")
     supports_manifest_resume = True
@@ -125,75 +123,26 @@ class InstagramProvider(Provider):
                 "rate_limit": result.rate_limit, "provider": {"container_id": container, "api_version": META_VERSION}}
 
     def reconcile(self, credentials, row):
-        state = row.get("provider_state") or {}; resource = state.get("container_id") or row.get("provider_id")
-        if row.get("status") == "unknown" and (not state or state.get("final_publish_started") is False) and prepublish_resume_ready(row):
-            return {"status": "resume_safe", "provider": {"stage": state.get("stage"), "public_publish_started": False}}
-        if not resource: return {"status": "unresolved"}
-        result = self.read(credentials, "publish.status", {"resource_id": resource}); data = result.get("data") or {}
-        code = data.get("status_code") or data.get("status") if isinstance(data, dict) else None
-        known_final = row.get("provider_id") or state.get("provider_id")
-        if code == "PUBLISHED" and known_final and str(known_final) != str(resource):
-            return {"status": "confirmed_success", "provider_id": str(known_final), "provider_status": code}
-        if code in {"ERROR", "EXPIRED"}: return {"status": "confirmed_absent", "provider": {"container_status": code}}
-        if state.get("final_publish_started") is True:
-            match = self._recent_publish_match(credentials, row, state)
-            if match:
-                return {"status": "confirmed_success", "provider_id": match, "provider_status": "PUBLISHED",
-                        "provider": {"matched_owned_media": True, "container_status": code}}
-        return {"status": "unresolved", "provider": {"container_status": code}}
+        return container_reconcile(self, credentials, row, status_keys=("status_code", "status"),
+                                   match_meta_key="matched_owned_media", recent_match=self._recent_publish_match)
 
     def _recent_publish_match(self, credentials, row, state):
-        result = self.read(credentials, "media.read", {"limit": 100})
-        if result.get("status") == "partial" or result.get("errors"):
-            return None
-        payload = row.get("provider_payload") or {}; expected_caption = str(payload.get("caption", ""))
-        attempted = parse_time(str(state.get("final_publish_started_at") or row.get("attempted_at")), "Instagram final publish time")
-        expected_types = {
-            "publish.image": {"IMAGE"}, "publish.video": {"VIDEO"}, "publish.reel": {"REELS", "VIDEO"},
-            "publish.carousel": {"CAROUSEL_ALBUM"},
-        }.get(row.get("operation"), set())
-        candidates = []
-        for item in result.get("data") or []:
-            if not isinstance(item, dict) or not item.get("timestamp") or str(item.get("caption", "")) != expected_caption:
-                continue
-            created = parse_time(str(item["timestamp"]), "Instagram media timestamp")
-            native_type = str(item.get("media_product_type") or item.get("media_type") or "").upper()
-            if attempted - timedelta(seconds=30) <= created <= attempted + timedelta(minutes=5) and (not expected_types or native_type in expected_types):
-                if item.get("id"): candidates.append(str(item["id"]))
-        return candidates[0] if len(candidates) == 1 else None
+        return recent_container_match(self, credentials, row, state, read_operation="media.read",
+                                      text_field="caption", type_keys=("media_product_type", "media_type"),
+                                      expected_types_by_operation={
+                                          "publish.image": {"IMAGE"}, "publish.video": {"VIDEO"},
+                                          "publish.reel": {"REELS", "VIDEO"}, "publish.carousel": {"CAROUSEL_ALBUM"},
+                                      }, label="Instagram")
 
 
 def _account(): return graph_id(provider_env("instagram", "ACCOUNT_ID", required=True), "Instagram account ID")
 
 
-def _limit(value):
-    try: number = int(value)
-    except (TypeError, ValueError) as exc: raise ApiFailure("limit must be integer", code="INVALID_PARAMETER") from exc
-    if not 1 <= number <= 100: raise ApiFailure("Instagram limit must be 1-100", code="INVALID_PARAMETER")
-    return str(number)
+def _limit(value): return graph_limit(value, "Instagram")
 
 
 def _resume_state(value, operation, asset_count):
-    state = dict(value)
-    stage = state.get("stage")
-    if stage is None and state:
-        if state.get("provider_status") == "ready":
-            stage = "legacy_final_publish_unknown"; state["final_publish_started"] = True
-        elif state.get("container_id"):
-            stage = "container_created"; state.setdefault("final_publish_started", False)
-        elif state.get("child_container_ids"):
-            stage = "creating_children"; state.setdefault("final_publish_started", False)
-    allowed = {None, "creating_children", "creating_parent", "creating_container", "container_created",
-               "processing", "ready", "final_publish_started", "published", "legacy_final_publish_unknown"}
-    if stage not in allowed or state.get("final_publish_started") not in {None, False, True}:
-        raise ApiFailure("Instagram provider checkpoint is invalid", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
-    children = state.get("child_container_ids", [])
-    if not isinstance(children, list) or len(children) > asset_count or any(not str(item).isdigit() for item in children):
-        raise ApiFailure("Instagram carousel checkpoint is invalid", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
-    if operation != "publish.carousel" and children:
-        raise ApiFailure("Instagram non-carousel checkpoint has children", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
-    state["stage"] = stage
-    return state
+    return container_resume_state(value, operation, asset_count, "Instagram")
 
 
 def _validate_media(operation, assets):

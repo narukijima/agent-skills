@@ -93,9 +93,22 @@ if not catalog_path.is_file():
     raise SystemExit("missing skills/SKILLS.md catalog")
 if "[`" + skill_dir.name + "`](" + skill_dir.name + "/SKILL.md)" not in catalog_path.read_text(encoding="utf-8"):
     raise SystemExit("skill is not registered in skills/SKILLS.md")
+references_dir = skill_dir / "references"
+if references_dir.is_dir():
+    for reference in sorted(references_dir.rglob("*.md")):
+        relative = reference.relative_to(skill_dir).as_posix()
+        if relative not in text:
+            raise SystemExit("orphan reference is not linked from SKILL.md: " + relative)
+for linked in re.finditer(r"`(references/[^`\n]+\.md)`", text):
+    if not (skill_dir / linked.group(1)).is_file():
+        raise SystemExit("SKILL.md references a missing file: " + linked.group(1))
 PY
   then
     printf 'FAIL: invalid skill contract: %s\n' "$skill_dir" >&2
+    status=1
+  fi
+  if [[ -d "$skill_dir/scripts" ]] && ! python3 -m compileall -q "$skill_dir/scripts" >/dev/null 2>&1; then
+    printf 'FAIL: skill scripts do not compile: %s\n' "$skill_dir" >&2
     status=1
   fi
 done < <(find "$repo_root/skills" -mindepth 2 -maxdepth 2 -type f -name SKILL.md -print | sort)

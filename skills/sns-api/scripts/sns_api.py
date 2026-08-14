@@ -72,11 +72,16 @@ def parser() -> argparse.ArgumentParser:
         help="same opaque Domain Authorization reference; defaults to the original manifest reference",
     )
     resume.add_argument("--expires-in", type=int, default=900, choices=range(60, 3601), metavar="60-3600")
+    sign = commands.add_parser(
+        "sign-standing-authorization",
+        help="sign and validate one Project-defined standing Domain Authorization scope with the gateway-owned key",
+    )
+    sign.add_argument("--scope-file", required=True, help="unsigned standing authorization scope JSON")
+    sign.add_argument("--output", required=True, help="signed standing authorization JSON path")
     send = commands.add_parser("send", help="send or safely resume only the exact signed manifest intent")
     send.add_argument("--manifest", required=True)
     status = commands.add_parser("status", help="read a provider-native asynchronous publish status")
     status.add_argument("--platform", required=True)
-    status.add_argument("--operation", required=True)
     status.add_argument("--resource-id", required=True)
     reconcile = commands.add_parser("reconcile", help="reconcile one unknown canonical-ledger outcome")
     reconcile.add_argument("--platform", required=True)
@@ -99,8 +104,9 @@ def dispatch(args: Any) -> Dict[str, Any]:
     if args.command == "prepare": args.payload = _payload(args); return core.prepare(args)
     if args.command in {"prepare-resume", "authorize-resume"}:
         return core.authorize_resume(Path(args.manifest), Path(args.resume_manifest), args.approval_id, args.expires_in)
+    if args.command == "sign-standing-authorization": return core.sign_standing(Path(args.scope_file), Path(args.output))
     if args.command == "send": return core.send(Path(args.manifest))
-    if args.command == "status": return core.status(args.platform, args.operation, args.resource_id)
+    if args.command == "status": return core.status(args.platform, args.resource_id)
     if args.command == "reconcile": return core.reconcile(args.platform, args.content_id, args.expected_account_id)
     if args.command == "resolve": return core.resolve(args.platform, args.content_id, args.expected_account_id, args.outcome, args.reason, args.provider_id)
     raise core.ApiFailure("unsupported command", code="UNSUPPORTED_COMMAND")

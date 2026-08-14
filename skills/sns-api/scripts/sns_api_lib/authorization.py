@@ -84,6 +84,10 @@ def _load_standing(path: Path) -> Dict[str, Any]:
         raise ApiFailure("standing authorization must be a readable JSON object", code="INVALID_AUTHORIZATION") from exc
     if not isinstance(value, dict):
         raise ApiFailure("standing authorization must be a JSON object", code="INVALID_AUTHORIZATION")
+    return _validate_standing(value)
+
+
+def _validate_standing(value: Dict[str, Any]) -> Dict[str, Any]:
     missing = sorted(STANDING_FIELDS - set(value))
     unexpected = sorted(set(value) - STANDING_FIELDS)
     if missing or unexpected:
@@ -127,6 +131,21 @@ def _load_standing(path: Path) -> Dict[str, Any]:
     if expires_at <= not_before:
         raise ApiFailure("standing authorization expiry must follow not_before", code="INVALID_AUTHORIZATION")
     return normalized
+
+
+def sign_standing_file(scope_path: Path, output_path: Path) -> Dict[str, Any]:
+    """Sign and validate a Project-defined standing scope without reimplementing the HMAC."""
+    from .core import write_private_json
+
+    try:
+        value = json.loads(scope_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ApiFailure("standing authorization scope must be a readable JSON object", code="INVALID_AUTHORIZATION") from exc
+    if not isinstance(value, dict):
+        raise ApiFailure("standing authorization scope must be a JSON object", code="INVALID_AUTHORIZATION")
+    signed = _validate_standing(sign_standing_authorization(value))
+    write_private_json(output_path, signed)
+    return signed
 
 
 def _current_caller() -> Dict[str, str]:
@@ -206,8 +225,6 @@ def build_domain_authorization(args: Any, manifest_fields: Dict[str, Any]) -> Di
 
 def validate_domain_authorization(manifest: Dict[str, Any]) -> None:
     authorization = manifest.get("domain_authorization")
-    if authorization is None and manifest.get("schema_version") == 2:
-        return
     if not isinstance(authorization, dict) or authorization.get("authorization_id") != manifest.get("approval_id"):
         raise ApiFailure("manifest Domain Authorization reference is invalid", code="INVALID_AUTHORIZATION")
     auth_type = authorization.get("type")

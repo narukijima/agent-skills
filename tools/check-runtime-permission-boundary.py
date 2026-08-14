@@ -31,12 +31,13 @@ def scan_text(path: Path, text: str) -> list[str]:
 
 
 def candidate_files(root: Path) -> list[Path]:
-    files = [root / "README.md", root / "AGENTS.md"]
-    for directory in ("skills", "evals", "tools", ".github"):
+    files = [root / "README.md", root / "AGENTS.md", root / "PROJECT.md", root / "STATE.md"]
+    for directory in ("skills", "evals", "tools", "tests", ".github"):
         base = root / directory
         if base.is_dir():
             files.extend(path for path in base.rglob("*") if path.is_file())
-    return sorted({path for path in files if path.is_file() and path.name != "LICENSE.txt"})
+    excluded = {"LICENSE.txt", "test_runtime_permission_boundary.py"}
+    return sorted({path for path in files if path.is_file() and path.name not in excluded})
 
 
 def scan_repository(root: Path) -> list[str]:

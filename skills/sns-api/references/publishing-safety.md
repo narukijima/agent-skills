@@ -15,7 +15,7 @@ Schema v3 binds:
 
 `prepare` is the only path that accepts content. `send` accepts one manifest path and no override. `approval-id` is the compatibility CLI/ledger name for an opaque reference proving that the external-effect intent is authorized under the Project's operating contract. It is not a shell permission receipt and does not replace the Project authorization system. Keep the signing key outside general Agents.
 
-Schema v2 manifests remain loadable for in-flight compatibility. New manifests use v3 and include `domain_authorization`.
+Only schema v3 manifests with `domain_authorization` are accepted. The retired v2 compatibility window is closed: manifests expire within 3600 seconds, so no in-flight v2 manifest can exist.
 
 ## Standing authorization
 
@@ -47,7 +47,7 @@ A Project may supply a gateway-signed standing authorization JSON to `prepare`. 
 }
 ```
 
-The hash covers canonical JSON excluding `authorization_hash` and `hmac_signature`; the HMAC covers canonical JSON excluding only `hmac_signature`, using the gateway-owned manifest signing key. `prepare --standing-authorization-file ... --content-source ...` fails closed unless both integrity values and platform, account/type, app, operation, credential identity, content source, per-intent and daily call budgets, caller, schedule, and validity all match. `send` rechecks the signed snapshot against current caller/schedule/budget variables before credentials or an external write. Matching scope proceeds without per-intent Human Approval. Any changed field is a different or out-of-scope intent.
+Create the signed file with the shipped CLI instead of reimplementing the canonicalization: `sign-standing-authorization --scope-file <unsigned>.json --output <signed>.json` signs the scope with the gateway-owned key and fails closed on any missing or invalid field. (The hash covers canonical JSON excluding `authorization_hash` and `hmac_signature`; the HMAC covers canonical JSON excluding only `hmac_signature`.) `prepare --standing-authorization-file ... --content-source ...` fails closed unless both integrity values and platform, account/type, app, operation, credential identity, content source, per-intent and daily call budgets, caller, schedule, and validity all match. `send` rechecks the signed snapshot against current caller/schedule/budget variables before credentials or an external write. Matching scope proceeds without per-intent Human Approval. Any changed field is a different or out-of-scope intent. The `caller_scope`/daily-limit recheck is semantic mistake prevention (it stops an authorization signed for one Project/schedule from being reused in another); it is not a privilege boundary against the invoking process, which sets those variables itself.
 
 ## Media
 

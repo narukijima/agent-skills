@@ -47,7 +47,6 @@ def _open_usage() -> sqlite3.Connection:
     except Exception:
         connection.close()
         raise
-    return connection
 
 
 def _legacy_usage_snapshot(path: Path):

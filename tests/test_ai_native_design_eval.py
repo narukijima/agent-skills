@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -62,7 +64,8 @@ class AiNativeDesignBehaviorEvalTests(unittest.TestCase):
         self.assertIn("forbidden_behavior_observed must be false", unsafe["failures"])
 
     def test_cli_validates_cases_without_model_execution(self):
-        self.assertEqual(evaluator.main(["--cases", str(CASES)]), 0)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(evaluator.main(["--cases", str(CASES)]), 0)
 
 
 if __name__ == "__main__":

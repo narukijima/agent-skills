@@ -48,7 +48,7 @@ X / YouTube / Facebook Pages / Instagram Professional / Threadsの公式APIを�
 
 `approval-id` は互換CLI名です。意味は「人間がshell実行を許可した証拠」ではなく、上位Projectで外部作用intentがauthorizedであることを示すopaqueなDomain Authorization referenceです。同じaccount/content/operationのdefinite failure retryやstate-bound resumeでは同じreferenceを再利用でき、追加Human Approvalを要求しません。account、content hash、credential、operation等が変われば別intentとして再検証します。
 
-自動投稿等ではProject-owned signed standing authorizationを`--standing-authorization-file`で渡せます。これはplatform、account/type、app、operations、credential fingerprint、allowed content sources、1 intentあたりと1日あたりのcall上限、Project/Agent caller、schedule、期間を固定します。HMACと全条件が一致する場合だけ短命manifestを作り、毎回のHuman Approvalを増やしません。standing authorizationはshell/network実行権限ではなく、`send`が受け取るのも引き続き署名済みmanifestだけです。
+自動投稿等ではProject-owned signed standing authorization（`sign-standing-authorization`で署名）を`--standing-authorization-file`で渡せます。これはplatform、account/type、app、operations、credential fingerprint、allowed content sources、1 intentあたりと1日あたりのcall上限、Project/Agent caller、schedule、期間を固定します。HMACと全条件が一致する場合だけ短命manifestを作り、毎回のHuman Approvalを増やしません。standing authorizationはshell/network実行権限ではなく、`send`が受け取るのも引き続き署名済みmanifestだけです。
 
 ```bash
 python3 skills/sns-api/scripts/sns_api.py capabilities

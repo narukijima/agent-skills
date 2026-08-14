@@ -75,3 +75,90 @@ def prepublish_resume_ready(row: Dict[str, Any], grace_seconds: int = 300) -> bo
     """Avoid racing a still-running request before converting unknown to resumable."""
     attempted = parse_time(str(row.get("attempted_at", "")), "attempted_at")
     return datetime.now(timezone.utc) >= attempted + timedelta(seconds=grace_seconds)
+
+
+def graph_limit(value: Any, label: str) -> str:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ApiFailure("limit must be integer", code="INVALID_PARAMETER") from exc
+    if not 1 <= number <= 100:
+        raise ApiFailure(label + " limit must be 1-100", code="INVALID_PARAMETER")
+    return str(number)
+
+
+def container_resume_state(value: Dict[str, Any], operation: str, asset_count: int, label: str) -> Dict[str, Any]:
+    """Validate one checkpointed container publish state, inferring legacy pre-stage checkpoints."""
+    state = dict(value)
+    stage = state.get("stage")
+    if stage is None and state:
+        if state.get("provider_status") == "ready":
+            stage = "legacy_final_publish_unknown"; state["final_publish_started"] = True
+        elif state.get("container_id"):
+            stage = "container_created"; state.setdefault("final_publish_started", False)
+        elif state.get("child_container_ids"):
+            stage = "creating_children"; state.setdefault("final_publish_started", False)
+    allowed = {None, "creating_children", "creating_parent", "creating_container", "container_created",
+               "processing", "ready", "final_publish_started", "published", "legacy_final_publish_unknown"}
+    if stage not in allowed or state.get("final_publish_started") not in {None, False, True}:
+        raise ApiFailure(label + " provider checkpoint is invalid", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
+    children = state.get("child_container_ids", [])
+    if not isinstance(children, list) or len(children) > asset_count or any(not str(item).isdigit() for item in children):
+        raise ApiFailure(label + " carousel checkpoint is invalid", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
+    if operation != "publish.carousel" and children:
+        raise ApiFailure(label + " non-carousel checkpoint has children", code="UNSAFE_PROVIDER_STATE", outcome="unknown")
+    state["stage"] = stage
+    return state
+
+
+def container_reconcile(provider: Any, credentials: Any, row: Dict[str, Any], *,
+                        status_keys: tuple[str, ...], match_meta_key: str,
+                        recent_match: Callable[[Any, Dict[str, Any], Dict[str, Any]], Optional[str]]) -> Dict[str, Any]:
+    """Shared container-provider reconcile: resume-safe detection, container status, owned-content match."""
+    state = row.get("provider_state") or {}
+    resource = state.get("container_id") or row.get("provider_id")
+    if row.get("status") == "unknown" and (not state or state.get("final_publish_started") is False) and prepublish_resume_ready(row):
+        return {"status": "resume_safe", "provider": {"stage": state.get("stage"), "public_publish_started": False}}
+    if not resource:
+        return {"status": "unresolved"}
+    result = provider.read(credentials, "publish.status", {"resource_id": resource})
+    data = result.get("data") or {}
+    code = None
+    if isinstance(data, dict):
+        for key in status_keys:
+            if data.get(key):
+                code = data[key]
+                break
+    known_final = row.get("provider_id") or state.get("provider_id")
+    if code == "PUBLISHED" and known_final and str(known_final) != str(resource):
+        return {"status": "confirmed_success", "provider_id": str(known_final), "provider_status": code}
+    if code in {"ERROR", "EXPIRED"}:
+        return {"status": "confirmed_absent", "provider": {"container_status": code}}
+    if state.get("final_publish_started") is True:
+        match = recent_match(credentials, row, state)
+        if match:
+            return {"status": "confirmed_success", "provider_id": match, "provider_status": "PUBLISHED",
+                    "provider": {match_meta_key: True, "container_status": code}}
+    return {"status": "unresolved", "provider": {"container_status": code}}
+
+
+def recent_container_match(provider: Any, credentials: Any, row: Dict[str, Any], state: Dict[str, Any], *,
+                           read_operation: str, text_field: str, type_keys: tuple[str, str],
+                           expected_types_by_operation: Dict[str, set[str]], label: str) -> Optional[str]:
+    """Match exactly one owned recent item by signed text and native type near the final publish time."""
+    result = provider.read(credentials, read_operation, {"limit": 100})
+    if result.get("status") == "partial" or result.get("errors"):
+        return None
+    expected = str((row.get("provider_payload") or {}).get(text_field, ""))
+    attempted = parse_time(str(state.get("final_publish_started_at") or row.get("attempted_at")), label + " final publish time")
+    expected_types = expected_types_by_operation.get(row.get("operation"), set())
+    candidates = []
+    for item in result.get("data") or []:
+        if not isinstance(item, dict) or not item.get("timestamp") or str(item.get(text_field, "")) != expected:
+            continue
+        created = parse_time(str(item["timestamp"]), label + " content timestamp")
+        native_type = str(item.get(type_keys[0]) or item.get(type_keys[1]) or "").upper()
+        if attempted - timedelta(seconds=30) <= created <= attempted + timedelta(minutes=5) and (not expected_types or native_type in expected_types):
+            if item.get("id"):
+                candidates.append(str(item["id"]))
+    return candidates[0] if len(candidates) == 1 else None

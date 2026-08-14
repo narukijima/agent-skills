@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -14,11 +13,10 @@ from typing import Any, Dict
 
 from .auth import manifest_signing_key
 from .authorization import build_domain_authorization, validate_domain_authorization
-from .core import ApiFailure, parse_time, workspace_metadata
+from .core import ApiFailure, parse_time, workspace_metadata, write_private_json
 from .media import prepare_assets
 
 SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = {2, 3}
 
 
 def canonical_bytes(value: Dict[str, Any], excluded: set[str] | None = None) -> bytes:
@@ -37,28 +35,6 @@ def manifest_hash(value: Dict[str, Any]) -> str:
 
 def signature(value: Dict[str, Any]) -> str:
     return hmac.new(manifest_signing_key(), canonical_bytes(value, {"hmac_signature"}), hashlib.sha256).hexdigest()
-
-
-def _write_private(path: Path, value: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp." + str(os.getpid()) + "." + secrets.token_hex(8))
-    try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            os.chmod(temporary, 0o600)
-            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def create_manifest(provider: Any, args: Any) -> Dict[str, Any]:
@@ -104,7 +80,7 @@ def create_manifest(provider: Any, args: Any) -> Dict[str, Any]:
     for secret in secret_values():
         if len(secret) >= 8 and secret.encode("utf-8") in encoded:
             raise ApiFailure("secret value detected in manifest content", code="SECRET_IN_MANIFEST")
-    _write_private(Path(args.manifest), manifest)
+    write_private_json(Path(args.manifest), manifest)
     return {
         "status": "prepared", "platform": provider.name, "operation": args.operation,
         "data": {"manifest": str(Path(args.manifest)), **manifest, **workspace}, "errors": [],
@@ -139,7 +115,7 @@ def create_resume_manifest(original_path: Path, output_path: Path, approval_id: 
     )
     value["manifest_hash"] = manifest_hash(value)
     value["hmac_signature"] = signature(value)
-    _write_private(output_path, value)
+    write_private_json(output_path, value)
     return value
 
 
@@ -153,15 +129,14 @@ def load_manifest(path: Path, *, allow_expired: bool = False) -> Dict[str, Any]:
     required = {
         "schema_version", "platform", "operation", "content_id", "expected_account_id", "account_type",
         "app_id", "expected_credential_fingerprint", "approval_id", "created_at", "expires_at",
-        "provider_payload", "payload_hash", "assets", "asset_hash", "intent_hash", "provider_call_plan", "manifest_hash", "hmac_signature",
+        "provider_payload", "payload_hash", "assets", "asset_hash", "intent_hash", "provider_call_plan",
+        "domain_authorization", "manifest_hash", "hmac_signature",
     }
     missing = sorted(required - set(value))
     if missing:
         raise ApiFailure("publish manifest is missing: " + ", ".join(missing), code="INVALID_MANIFEST")
-    if value["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS:
+    if value["schema_version"] != SCHEMA_VERSION:
         raise ApiFailure("unsupported manifest schema_version", code="INVALID_MANIFEST")
-    if value["schema_version"] == SCHEMA_VERSION and "domain_authorization" not in value:
-        raise ApiFailure("publish manifest is missing: domain_authorization", code="INVALID_MANIFEST")
     if not secrets.compare_digest(str(value["manifest_hash"]), manifest_hash(value)):
         raise ApiFailure("manifest integrity check failed", code="MANIFEST_TAMPERED")
     if not secrets.compare_digest(str(value["hmac_signature"]), signature(value)):
