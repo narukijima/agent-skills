@@ -22,7 +22,7 @@ skills/<skill-name>/
 
 このRepositoryの責務は `Reusable Capability + Domain-specific safety` です。Codex / Claude Codeのshell、filesystem、network、sandbox、provider execution modeを設定・判定せず、Generic Runtime PermissionやAgent ACLを所有しません。Runtimeが操作を実行できない場合はRuntime層のerrorとして扱います。
 
-Skill固有の安全境界は維持します。例えば`seo`の診断・変更scope、`ai-native-design`が設計対象productへ求めるserver-side authorization、`sns-api`のaccount/content/credential binding、署名manifest、budget、duplicate防止、unknown reconciliationはDomain Safetyです。これらをRuntimeの実行許可の代替にはしません。
+Skill固有の安全境界は維持します。例えば`seo`の診断・変更scope、`ai-native-design`が設計対象productへ求めるserver-side authorization、`sns-algorithm`のevidence class・surface・freshness分離、`sns-api`のaccount/content/credential binding、署名manifest、budget、duplicate防止、unknown reconciliationはDomain Safetyです。これらをRuntimeの実行許可の代替にはしません。
 
 ## 導入
 
@@ -41,6 +41,10 @@ bash tools/import-skill.sh sns-api --target /path/to/agent-directory
 ### seo
 
 対象Project、Search Console、HTTP/rendered output、crawler logを優先し、`Observe → Measure → Diagnose → Fix → Verify`で検索・AI可視性を扱います。
+
+### sns-algorithm
+
+X / YouTube / Facebook / Instagram / Threads / TikTokの推薦・ranking・search・distributionを、platformとsurfaceごとの公式一次情報から分析します。`Evidence → Algorithm Model → Analysis → Action`を固定し、確認済みcode/official claim、creator guidance、inference、hypothesis、unknown、staleを分離します。source registryはsource、surface、published/verified date、Xのcommit/code path、scope、limitationsを保持し、実データから単一原因を断定せず、alternative explanationと最小experimentへ落とします。credentials、API read/write、投稿は所有せず、必要なら`$sns-api`の別intentへ分離します。
 
 ### sns-api
 
@@ -118,7 +122,9 @@ bash tools/validate-skills.sh
 python3 -m unittest discover -s tests -v
 python3 tools/score-behavior-eval.py --cases evals/ai-native-design/cases.json
 python3 tools/score-behavior-eval.py --cases evals/seo/cases.json
+python3 tools/score-behavior-eval.py --cases evals/sns-algorithm/cases.json
 python3 tools/score-behavior-eval.py --cases evals/sns-api/cases.json
+python3 skills/sns-algorithm/scripts/validate_registry.py
 ```
 
 CIではcompile、全unit test、behavior eval schema、secret scanも実行します。score commandは定義検証では `behavior_run: false` を返します。実behavior評価は各promptを独立Agentで実行し、semantic judgmentと証拠を `--judgments` で採点します。

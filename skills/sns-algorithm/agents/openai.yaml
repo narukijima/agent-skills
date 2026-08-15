@@ -1,0 +1,7 @@
+interface:
+  display_name: "SNS Algorithm"
+  short_description: "公式一次情報からSNS推薦面を分離して分析・実験設計"
+  default_prompt: "Use $sns-algorithm to identify the platform and recommendation surface, separate official evidence from inference, diagnose observed performance with alternatives and unknowns, and propose the smallest useful experiment without executing any SNS API action."
+
+policy:
+  allow_implicit_invocation: true
