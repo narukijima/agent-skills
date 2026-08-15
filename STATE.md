@@ -1,5 +1,5 @@
 ---
-updated_at: 2026-08-15
+updated_at: 2026-08-16
 ---
 
 # Current State
@@ -12,6 +12,7 @@ ClaudAGT AgentのIndependent Projectとして継続開発するProject契約を�
 import元のignored fileがprovenance外で混入する経路を、記録済みcommitのGit treeだけを展開する方式へ単純化して閉じた。
 その時点で全体validator、全168件のunit test、および3定義50ケースのbehavior eval定義検証が完全合格する状態を確立した。
 `sns-algorithm` Skillを追加し、X / YouTube / Facebook / Instagram / Threads / TikTokをsurface単位で扱うEvidence → Algorithm Model → Analysis → Action契約、27件の公式sourceと38件の重要claimを持つsource registry、registry validator、14件のbehavior evalを自己完結した配布物として統合した。Xの数値claimは`xai-org/x-algorithm`のfull commit SHAとcode pathへ固定し、`sns-api`の実行責務とは分離した。
+Issue #61で判明したagent-directory互換性不整合を修正し、`sns-algorithm`のRequired Knowledgeを3件へ収め、`source-registry.json`をFreshness gate成立時のConditional参照へ移した。配布元validatorもRequired Knowledge最大3件を執行し、取り込み先で初めて失敗する再発経路を閉じた。
 
 ## 現在の目標
 
@@ -27,11 +28,11 @@ Skillの発動契約、決定的処理、test、利用側責務境界を一致�
 ## 検証結果
 
 - 対象: `PROJECT.md#PC-01`
-- 確認日: 2026-08-15
+- 確認日: 2026-08-16
 - 方法: `git diff --check`、`bash tools/validate-skills.sh`、`python3 -m unittest discover -s tests -v`、
   `python3 skills/sns-algorithm/scripts/validate_registry.py`、
-  `python3 tools/score-behavior-eval.py --cases evals/<skill>/cases.json`（4定義64ケース、model実行・judgmentなし）。
-- 結果: 4 Skillのvalidator、全179件のunit test、`sns-algorithm`の6 platform / 27 source / 38 claim registryが0 failure / 0 errorで合格し、behavior eval 4定義64 caseは`behavior_run: false`の定義検証として合格した。実model behaviorの成功を意味しない。
+  一時展開したagent-directoryへの`tools/import-skill.sh sns-algorithm`後に`bash tools/validate-agent-directory.sh`と`--full`。
+- 結果: 4 Skillのvalidator、全180件のunit test、`sns-algorithm`の6 platform / 27 source / 38 claim registryが0 failure / 0 errorで合格し、import後のagent-directory通常・full検証も0 warningで合格した。
 
 ## 未完了・ブロッカー
 

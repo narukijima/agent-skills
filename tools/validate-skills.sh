@@ -72,6 +72,18 @@ if len(text.encode("utf-8")) > 20 * 1024:
 for heading in ("## 使用するKnowledge", "### Required", "### Conditional"):
     if heading not in text:
         raise SystemExit("missing required heading: " + heading)
+knowledge_section = re.search(
+    r"^## 使用するKnowledge\s*$\n(.*?)(?=^## |\Z)", text, re.M | re.S
+)
+required_section = re.search(
+    r"^### Required\s*$\n(.*?)(?=^### |\Z)", knowledge_section.group(1), re.M | re.S
+)
+required_count = sum(
+    line.startswith("- ") and line.strip() != "- なし"
+    for line in required_section.group(1).splitlines()
+)
+if required_count > 3:
+    raise SystemExit("SKILL.md has more than 3 Required Knowledge references")
 openai_path = skill_dir / "agents" / "openai.yaml"
 if not openai_path.is_file():
     raise SystemExit("missing agents/openai.yaml")
