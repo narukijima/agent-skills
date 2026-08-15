@@ -53,11 +53,20 @@ class SnsAlgorithmContractTests(unittest.TestCase):
 
     def test_frontmatter_catalog_and_agent_metadata(self):
         frontmatter = re.match(r"^---\n(.*?)\n---\n", self.skill_text, re.S).group(1)
-        self.assertIn('claudagt.version: "0.1.0"', frontmatter)
+        self.assertIn('claudagt.version: "0.1.1"', frontmatter)
         self.assertIn("[`sns-algorithm`](sns-algorithm/SKILL.md)", (ROOT / "skills/SKILLS.md").read_text())
         metadata = (SKILL / "agents/openai.yaml").read_text()
         self.assertIn("$sns-algorithm", metadata)
         self.assertIn("allow_implicit_invocation: true", metadata)
+
+    def test_source_registry_is_conditional_within_required_budget(self):
+        knowledge = re.search(
+            r"^## 使用するKnowledge\s*$\n(.*?)(?=^## |\Z)", self.skill_text, re.M | re.S
+        ).group(1)
+        required, conditional = re.split(r"^### Conditional\s*$", knowledge, maxsplit=1, flags=re.M)
+        self.assertLessEqual(sum(line.startswith("- ") for line in required.splitlines()), 3)
+        self.assertNotIn("source-registry.json", required)
+        self.assertIn("source-registry.json", conditional)
 
     def test_registry_schema_and_all_platforms(self):
         self.assertEqual(registry_validator.validate_registry(self.registry, SKILL), [])
@@ -101,7 +110,7 @@ class SnsAlgorithmContractTests(unittest.TestCase):
             self.assertTrue((imported / "references/source-registry.json").is_file())
             self.assertTrue((imported / "scripts/validate_registry.py").is_file())
             upstream = (imported / "agents/upstream.yaml").read_text()
-            self.assertIn('source_version: "0.1.0"', upstream)
+            self.assertIn('source_version: "0.1.1"', upstream)
 
 
 if __name__ == "__main__":
