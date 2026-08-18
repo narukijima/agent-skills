@@ -6,6 +6,7 @@ status=0
 skill_count=0
 
 python3 "$repo_root/tools/check-runtime-permission-boundary.py"
+python3 "$repo_root/tools/public_repo_scan.py" --commit-range HEAD
 
 while IFS= read -r skill_file; do
   skill_count=$((skill_count + 1))

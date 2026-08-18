@@ -24,6 +24,12 @@ skills/<skill-name>/
 
 Skill固有の安全境界は維持します。例えば`seo`の診断・変更scope、`ai-native-design`が設計対象productへ求めるserver-side authorization、`sns-algorithm`のevidence class・surface・freshness分離、`sns-api`のaccount/content/credential binding、署名manifest、budget、duplicate防止、unknown reconciliationはDomain Safetyです。これらをRuntimeの実行許可の代替にはしません。
 
+### 公開製品とOwner Agent状態
+
+`agent-skills`は`agent-directory`と別の公開製品であり、このRepositoryにはSkillの安定契約、公開validator・test・eval、配布・provenance仕様、外部開発者に必要な変更履歴を置きます。一方、ClaudAGT内部の現在目標、優先順位、運用判断、次の一手、handoff、採用revisionはこの公開境界の所有物ではありません。
+
+Agent Directoryを利用する一般のAgent Workspaceでは、引き続きProjectごとの`PROJECT.md` / `STATE.md`が目的と現在状態を管理します。その利用者契約と、ClaudAGTが公開基盤製品自体を開発する際の内部管理は別の境界です。
+
 ## 導入
 
 ```bash

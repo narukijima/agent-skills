@@ -13,12 +13,37 @@ SPEC.loader.exec_module(public_repo_scan)
 
 
 class PublicRepoScanTests(unittest.TestCase):
+    def test_current_public_product_has_no_owner_agent_active_state_files(self):
+        present_files = [path for path in public_repo_scan.tracked_files() if path.is_file()]
+        self.assertEqual(public_repo_scan.scan_owner_agent_state_files(present_files), [])
+
+    def test_public_product_root_rejects_owner_agent_project_and_state_files(self):
+        findings = public_repo_scan.scan_owner_agent_state_files(
+            [Path("README.md"), Path("PROJECT.md"), Path("STATE.md")]
+        )
+        self.assertEqual(len(findings), 2)
+        self.assertTrue(any(finding.startswith("PROJECT.md:") for finding in findings))
+        self.assertTrue(any(finding.startswith("STATE.md:") for finding in findings))
+
+    def test_nested_consumer_project_state_is_not_the_public_product_root(self):
+        paths = [Path("fixtures/consumer/PROJECT.md"), Path("fixtures/consumer/STATE.md")]
+        self.assertEqual(public_repo_scan.scan_owner_agent_state_files(paths), [])
+
     def test_fixture_email_and_generic_ci_paths_are_allowed(self):
-        content = b"fixture" + b"@" + b"example.invalid /home/runner/work/repo"
+        content = b"fixture" + b"@" + b"example.invalid /home/" + b"runner/work/repo"
         self.assertEqual(public_repo_scan.scan_bytes(Path("fixture.txt"), content), [])
 
     def test_personal_identifiers_and_credentials_are_rejected_without_echoing_values(self):
-        content = b"owner" + b"@" + b"private.test " + b"/Users/" + b"operator/project " + b"ghp_" + (b"A" * 24)
+        content = (
+            b"owner"
+            + b"@"
+            + b"private.test "
+            + b"/"
+            + b"Users/operator/project "
+            + b"gh"
+            + b"p_"
+            + (b"A" * 24)
+        )
         findings = public_repo_scan.scan_bytes(Path("unsafe.txt"), content)
         self.assertEqual(len(findings), 3)
         rendered = " ".join(findings)

@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Iterable
 
 
 EMAIL = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -24,6 +25,7 @@ SECRET_PATTERNS = (
     re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     re.compile(rb"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{20,}\b", re.I),
 )
+OWNER_AGENT_STATE_FILES = frozenset({Path("PROJECT.md"), Path("STATE.md")})
 
 
 def git(*args: str) -> bytes:
@@ -53,11 +55,21 @@ def scan_bytes(path: Path, content: bytes) -> list[str]:
     return findings
 
 
+def scan_owner_agent_state_files(paths: Iterable[Path]) -> list[str]:
+    """Reject ClaudAGT's active Project state at this public product root."""
+    return [
+        f"{path}: owner-agent active state belongs in the ClaudAGT root"
+        for path in sorted(set(paths))
+        if path in OWNER_AGENT_STATE_FILES
+    ]
+
+
 def scan_worktree() -> list[str]:
     findings: list[str] = []
-    for path in tracked_files():
-        if path.is_file():
-            findings.extend(scan_bytes(path, path.read_bytes()))
+    present_files = [path for path in tracked_files() if path.is_file()]
+    findings.extend(scan_owner_agent_state_files(present_files))
+    for path in present_files:
+        findings.extend(scan_bytes(path, path.read_bytes()))
     return findings
 
 
