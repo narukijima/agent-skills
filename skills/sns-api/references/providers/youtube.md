@@ -2,7 +2,7 @@
 
 ## Contract
 
-- Hosts: `www.googleapis.com` and Provider-returned resumable sessions on the same allowlist.
+- Hosts: `www.googleapis.com` only — the documented v3 surface; Provider-returned resumable session URIs must stay on the same allowlist and anything else fails closed.
 - API: YouTube Data API v3.
 - Auth: pre-provisioned OAuth 2.0 user access token. Use `youtube.readonly` for reads where sufficient and `youtube.upload` for upload; request broader scopes only when an operation truly requires them.
 - Account binding: the singular channel returned by `channels.list(part=id,snippet,contentDetails,mine=true)`.
@@ -15,7 +15,9 @@ Treat the returned session URI as a capability secret. Store it only in canonica
 
 A returned video ID means `submitted` unless `processingDetails.processingStatus` proves success. Poll `videos.list(part=status,processingDetails,id=...)`; preserve `processing`, `succeeded`, `failed`, and `terminated` distinctly. If the short-lived manifest expires while upload/processing is submitted, use `prepare-resume` with the same Domain Authorization reference bound to the unchanged Provider state.
 
-Unverified API projects may have uploads restricted to private. Quota cost, daily quota, upload restrictions, and audit state drift; recheck the Cloud Console, official docs, and response at execution time.
+Google signals quota and throttling as HTTP 403 with official reason codes (`quotaExceeded`, `rateLimitExceeded`, `userRateLimitExceeded`, `uploadLimitExceeded`), not 429. The adapter classifies those reasons as `rate_limited` so the local reset gate stops further calls, matching the official retry-later semantics; daily-quota reasons gate for at least an hour. For 5xx during resumable upload, the official exponential-backoff recommendation is satisfied by deferral: the session is preserved in private state and resumed by a later invocation via the `bytes */TOTAL` probe — the Skill never sleep-retries in-process.
+
+Unverified API projects may have uploads restricted to private. Quota buckets changed officially (2025-12/2026-06): `videos.insert` and `search.list` now have their own daily buckets separate from the general units pool. Quota cost, daily quota, upload restrictions, and audit state drift; recheck the Cloud Console, official docs, and response at execution time.
 
 Official sources:
 

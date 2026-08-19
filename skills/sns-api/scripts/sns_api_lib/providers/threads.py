@@ -15,8 +15,8 @@ VERSION = "v1.0"
 
 class ThreadsProvider(Provider):
     name = "threads"; account_type = "threads-user"; api_version = VERSION
-    capabilities = ("identity.read", "own.posts", "publish.text", "publish.image", "publish.video", "publish.carousel", "publish.status", "reconcile")
-    read_operations = ("identity.read", "own.posts", "publish.status")
+    capabilities = ("identity.read", "own.posts", "publishing.limit", "publish.text", "publish.image", "publish.video", "publish.carousel", "publish.status", "reconcile")
+    read_operations = ("identity.read", "own.posts", "publishing.limit", "publish.status")
     publish_operations = ("publish.text", "publish.image", "publish.video", "publish.carousel")
     supports_manifest_resume = True
 
@@ -33,7 +33,13 @@ class ThreadsProvider(Provider):
         elif operation == "publish.image": require_remote(assets, count=1, media_prefix="image/")
         elif operation == "publish.video": require_remote(assets, count=1, media_prefix="video/")
         else: require_remote(assets, minimum=2, maximum=20)
-        return {"text": text, "alt_text": str(payload.get("alt_text", ""))}
+        alt_text = str(payload.get("alt_text", ""))
+        if alt_text:
+            if operation not in {"publish.image", "publish.video"}:
+                raise ApiFailure("Threads alt_text applies only to image or video publish", code="INVALID_CONTENT")
+            if len(alt_text) > 1000:
+                raise ApiFailure("Threads alt_text exceeds 1000 characters", code="INVALID_CONTENT")
+        return {"text": text, "alt_text": alt_text}
 
     def call_plan(self, operation, payload, assets):
         calls = len(assets) + 4 if operation == "publish.carousel" else 4
@@ -52,6 +58,9 @@ class ThreadsProvider(Provider):
         if operation == "own.posts":
             result, body = graph_call(THREADS_HOST, VERSION, credentials.token, "GET", _account() + "/threads",
                                       query={"fields": "id,media_product_type,media_type,media_url,permalink,username,text,timestamp,shortcode,children", "limit": _limit(params.get("limit", 25)), "after": params.get("after")})
+        elif operation == "publishing.limit":
+            result, body = graph_call(THREADS_HOST, VERSION, credentials.token, "GET", _account() + "/threads_publishing_limit",
+                                      query={"fields": "quota_usage,config"})
         elif operation == "publish.status":
             result, body = graph_call(THREADS_HOST, VERSION, credentials.token, "GET", graph_id(params.get("resource_id")),
                                       query={"fields": "id,status,error_message"})
@@ -92,7 +101,17 @@ class ThreadsProvider(Provider):
         status_result = self.read(credentials, "publish.status", {"resource_id": container})
         status_data = status_result.get("data") if isinstance(status_result.get("data"), dict) else {}
         code = status_data.get("status")
-        if code not in {"FINISHED", "PUBLISHED"}:
+        if code == "PUBLISHED":
+            # Official terminal state: never repeat threads_publish on a published container.
+            known = state.get("provider_id")
+            if known and str(known) != str(container):
+                state.update(stage="published", provider_status="PUBLISHED", final_publish_started=True)
+                checkpoint(dict(state))
+                return {"status": "published", "provider_id": str(known), "provider_status": "PUBLISHED",
+                        "provider": {"container_id": container, "already_published": True}}
+            raise ApiFailure("Threads container is already PUBLISHED; run reconcile to bind the published post id",
+                             code="PROVIDER_RESULT_UNKNOWN", outcome="unknown", payload=status_data)
+        if code != "FINISHED":
             if code in {"ERROR", "EXPIRED"}: raise ApiFailure("Threads container failed", code="PROVIDER_ASYNC_FAILED", outcome="failed", payload=status_data)
             state.update(stage="processing", provider_status=code or "IN_PROGRESS", final_publish_started=False)
             checkpoint(dict(state))

@@ -16,10 +16,26 @@ from urllib.parse import urlsplit
 from ..core import ApiFailure, redact, state_path, utc_now, workspace_info
 from ..http import HttpResult, MAX_RESPONSE_BYTES, validate_url
 
-HOSTS = {"www.googleapis.com", "upload.youtube.com"}
+HOSTS = {"www.googleapis.com"}
 CHUNK_BYTES = 8 * 1024 * 1024
 HANDLE = re.compile(r"^[0-9a-f]{64}$")
 RANGE = re.compile(r"^bytes=0-([0-9]+)$")
+# Official quota/throttle reason codes: https://developers.google.com/youtube/v3/docs/errors
+RATE_LIMIT_REASONS = {"quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "uploadLimitExceeded"}
+DAILY_QUOTA_REASONS = {"quotaExceeded", "uploadLimitExceeded"}
+
+
+def classify_quota(exc: ApiFailure) -> None:
+    """Reclassify official YouTube quota/throttle reasons (403-carried) as rate_limited."""
+    error = exc.payload.get("error") if isinstance(exc.payload, dict) else None
+    entries = error.get("errors") if isinstance(error, dict) else None
+    reasons = {str(item.get("reason")) for item in entries if isinstance(item, dict)} if isinstance(entries, list) else set()
+    if not reasons & RATE_LIMIT_REASONS:
+        return
+    exc.outcome = "rate_limited"
+    rate_limit = exc.meta.setdefault("rate_limit", {})
+    if reasons & DAILY_QUOTA_REASONS and "retry_after" not in rate_limit:
+        rate_limit["retry_after"] = "3600"
 
 
 def save_session(session_url: str, binding: Dict[str, Any]) -> tuple[str, str]:
@@ -138,9 +154,11 @@ def _exchange(session_url: str, token: str, total: int, path: Optional[Path], st
             else:
                 outcome = "rate_limited" if status == 429 else "failed" if 400 <= status < 500 else "submitted"
                 code = "PROVIDER_HTTP_ERROR"
-            raise ApiFailure("YouTube resumable endpoint returned an HTTP error", code=code, status=status,
-                             payload=redact(body), outcome=outcome,
-                             meta={"rate_limit": HttpResult(status, {}, headers).rate_limit})
+            failure = ApiFailure("YouTube resumable endpoint returned an HTTP error", code=code, status=status,
+                                 payload=redact(body), outcome=outcome,
+                                 meta={"rate_limit": HttpResult(status, {}, headers).rate_limit})
+            classify_quota(failure)
+            raise failure
         return HttpResult(status, body, headers)
     except ApiFailure:
         raise

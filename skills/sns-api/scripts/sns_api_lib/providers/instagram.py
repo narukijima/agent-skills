@@ -13,13 +13,15 @@ from .meta_common import (
 IMAGE_MIMES = {"image/jpeg"}
 VIDEO_MIMES = {"video/mp4", "video/quicktime"}
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_VIDEO_BYTES = 1024 * 1024 * 1024
+# Official Reels file-size maximum (single feed videos publish as REELS containers):
+# https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media/
+MAX_VIDEO_BYTES = 300 * 1024 * 1024
 
 
 class InstagramProvider(Provider):
     name = "instagram"; account_type = "professional"; api_version = META_VERSION
-    capabilities = ("identity.read", "media.read", "publish.image", "publish.video", "publish.reel", "publish.carousel", "publish.status", "reconcile")
-    read_operations = ("identity.read", "media.read", "publish.status")
+    capabilities = ("identity.read", "media.read", "publishing.limit", "publish.image", "publish.video", "publish.reel", "publish.carousel", "publish.status", "reconcile")
+    read_operations = ("identity.read", "media.read", "publishing.limit", "publish.status")
     publish_operations = ("publish.image", "publish.video", "publish.reel", "publish.carousel")
     supports_manifest_resume = True
 
@@ -66,6 +68,9 @@ class InstagramProvider(Provider):
         if operation == "media.read":
             result, body = graph_call(host, META_VERSION, credentials.token, "GET", account + "/media",
                                       query={"fields": "id,caption,media_type,media_product_type,permalink,timestamp,username", "limit": _limit(params.get("limit", 25)), "after": params.get("after")})
+        elif operation == "publishing.limit":
+            result, body = graph_call(host, META_VERSION, credentials.token, "GET", account + "/content_publishing_limit",
+                                      query={"fields": "quota_usage,config"})
         elif operation == "publish.status":
             result, body = graph_call(host, META_VERSION, credentials.token, "GET", graph_id(params.get("resource_id")),
                                       query={"fields": "id,status_code,status"})
@@ -98,8 +103,11 @@ class InstagramProvider(Provider):
                 asset = manifest["assets"][0]; form = {"caption": payload["caption"]}
                 if operation == "publish.image": form["image_url"] = asset["url"]
                 else:
-                    form.update({"media_type": "REELS" if operation == "publish.reel" else "VIDEO", "video_url": asset["url"]})
+                    # Officially, single feed videos publish as REELS containers; top-level
+                    # media_type=VIDEO is deprecated and rejected by the provider.
+                    form.update({"media_type": "REELS", "video_url": asset["url"]})
                     if operation == "publish.reel": form["share_to_feed"] = "true" if payload["share_to_feed"] else "false"
+                    else: form["share_to_feed"] = "true"
                 container, _ = prepublish_call(lambda: self._container(credentials, account, form), state, checkpoint, "creating_container")
             state.update(stage="container_created", container_id=container, provider_id=container,
                          provider_status="container_created", final_publish_started=False)
@@ -107,7 +115,17 @@ class InstagramProvider(Provider):
         status_result = self.read(credentials, "publish.status", {"resource_id": container})
         status_data = status_result.get("data") if isinstance(status_result.get("data"), dict) else {}
         provider_status = status_data.get("status_code") or status_data.get("status")
-        if provider_status not in {"FINISHED", "PUBLISHED"}:
+        if provider_status == "PUBLISHED":
+            # Official terminal state: never repeat media_publish on a published container.
+            known = state.get("provider_id")
+            if known and str(known) != str(container):
+                state.update(stage="published", provider_status="PUBLISHED", final_publish_started=True)
+                checkpoint(dict(state))
+                return {"status": "published", "provider_id": str(known), "provider_status": "PUBLISHED",
+                        "provider": {"container_id": container, "already_published": True}}
+            raise ApiFailure("Instagram container is already PUBLISHED; run reconcile to bind the published media id",
+                             code="PROVIDER_RESULT_UNKNOWN", outcome="unknown", payload=status_data)
+        if provider_status != "FINISHED":
             if provider_status in {"ERROR", "EXPIRED"}: raise ApiFailure("Instagram container failed", code="PROVIDER_ASYNC_FAILED", outcome="failed", payload=status_data)
             state.update(stage="processing", provider_status=provider_status or "IN_PROGRESS", final_publish_started=False)
             checkpoint(dict(state))
@@ -130,7 +148,7 @@ class InstagramProvider(Provider):
         return recent_container_match(self, credentials, row, state, read_operation="media.read",
                                       text_field="caption", type_keys=("media_product_type", "media_type"),
                                       expected_types_by_operation={
-                                          "publish.image": {"IMAGE"}, "publish.video": {"VIDEO"},
+                                          "publish.image": {"IMAGE"}, "publish.video": {"REELS", "VIDEO"},
                                           "publish.reel": {"REELS", "VIDEO"}, "publish.carousel": {"CAROUSEL_ALBUM"},
                                       }, label="Instagram")
 

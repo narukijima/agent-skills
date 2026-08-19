@@ -19,6 +19,14 @@ UPLOAD = "https://www.googleapis.com/upload/youtube/v3/videos"
 HOSTS = youtube_resumable.HOSTS
 
 
+def _request(*args, **kwargs):
+    try:
+        return request(*args, **kwargs)
+    except ApiFailure as exc:
+        youtube_resumable.classify_quota(exc)
+        raise
+
+
 class YouTubeProvider(Provider):
     name = "youtube"; account_type = "channel"; api_version = "v3"
     capabilities = ("identity.read", "video.lookup", "own.videos", "publish.video", "publish.status", "media.upload.resumable", "reconcile")
@@ -52,7 +60,7 @@ class YouTubeProvider(Provider):
         return {"max_calls": len(calls), "calls": calls}
 
     def identity(self, credentials):
-        result = request("GET", API + "/channels", allowed_hosts=HOSTS, token=credentials.token,
+        result = _request("GET", API + "/channels", allowed_hosts=HOSTS, token=credentials.token,
                          query={"part": "id,snippet,contentDetails", "mine": "true"})
         items = result.body.get("items") if isinstance(result.body, dict) else None
         if not isinstance(items, list) or len(items) != 1 or not items[0].get("id"):
@@ -66,16 +74,16 @@ class YouTubeProvider(Provider):
     def read(self, credentials, operation, params):
         if operation == "identity.read": data = self.identity(credentials); return {"data": data, "provider": {"api_version": "v3"}}
         if operation == "video.lookup":
-            result = request("GET", API + "/videos", allowed_hosts=HOSTS, token=credentials.token,
+            result = _request("GET", API + "/videos", allowed_hosts=HOSTS, token=credentials.token,
                              query={"part": "snippet,status,processingDetails", "id": str(params.get("ids", ""))})
         elif operation == "publish.status":
-            result = request("GET", API + "/videos", allowed_hosts=HOSTS, token=credentials.token,
+            result = _request("GET", API + "/videos", allowed_hosts=HOSTS, token=credentials.token,
                              query={"part": "status,processingDetails", "id": str(params.get("resource_id", ""))})
         elif operation == "own.videos":
             identity = self.identity(credentials)
             playlist = (((identity.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
             if not playlist: raise ApiFailure("YouTube identity missing uploads playlist", code="INVALID_PROVIDER_RESPONSE")
-            result = request("GET", API + "/playlistItems", allowed_hosts=HOSTS, token=credentials.token,
+            result = _request("GET", API + "/playlistItems", allowed_hosts=HOSTS, token=credentials.token,
                              query={"part": "snippet,contentDetails", "playlistId": playlist,
                                     "maxResults": _max(params.get("max_results", 25)), "pageToken": params.get("page_token")})
         else: raise ApiFailure("unsupported YouTube read", code="UNSUPPORTED_CAPABILITY")
@@ -116,7 +124,7 @@ class YouTubeProvider(Provider):
             state.update(stage="session_initiating", provider_status="session_initiating", final_upload_started=False)
             checkpoint(dict(state))
             try:
-                initiated = request("POST", UPLOAD, allowed_hosts=HOSTS, token=credentials.token,
+                initiated = _request("POST", UPLOAD, allowed_hosts=HOSTS, token=credentials.token,
                                     query={"uploadType": "resumable", "part": "snippet,status"}, json_body=metadata,
                                     headers={"X-Upload-Content-Length": str(asset["size"]), "X-Upload-Content-Type": asset["mime"]})
             except ApiFailure as exc:

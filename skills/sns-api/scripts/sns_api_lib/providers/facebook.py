@@ -50,8 +50,12 @@ class FacebookProvider(Provider):
             result, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", account + "/feed",
                                       query={"fields": "id,message,created_time,permalink_url,attachments", "limit": _limit(params.get("limit", 25)), "after": params.get("after")})
         elif operation == "publish.status":
-            result, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", graph_id(params.get("resource_id")),
-                                      query={"fields": "id,status,permalink_url,created_time"})
+            resource = graph_id(params.get("resource_id"))
+            # Official node fields differ: `status` exists only on Video nodes; composite
+            # {page}_{post} IDs are PagePost nodes whose field list has is_published instead.
+            fields = "id,is_published,permalink_url,created_time" if "_" in resource else "id,status,permalink_url,created_time"
+            result, body = graph_call(META_HOST, META_VERSION, credentials.token, "GET", resource,
+                                      query={"fields": fields})
         else: raise ApiFailure("unsupported Facebook read", code="UNSUPPORTED_CAPABILITY")
         return normalized(result, body)
 
@@ -106,6 +110,8 @@ class FacebookProvider(Provider):
         except ApiFailure: return {"status": "unresolved"}
         data = result.get("data") or {}
         if row.get("operation") in {"publish.text", "publish.image"} and isinstance(data, dict) and str(data.get("id", "")) == str(provider_id):
+            if data.get("is_published") is False:
+                return {"status": "unresolved", "provider": {"is_published": False}}
             return {"status": "confirmed_success", "provider_id": str(provider_id), "provider_status": "published"}
         native = data.get("status", {}) if isinstance(data, dict) else {}
         video_status = str(native.get("video_status", "")).lower() if isinstance(native, dict) else str(native).lower()

@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  agent-directory.version: "3.1.0"
+  agent-directory.version: "3.2.0"
   agent-directory.status: "active"
   agent-directory.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -64,7 +64,8 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 - Write the attempt as `unknown` before the first irreversible provider request.
 - Block blind retry of `unknown`, and block new sends to the same platform/account while an unknown remains.
 - Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID after an irreversible/public request as `unknown`; treat definite 4xx as `failed`. A Provider may return resumable `submitted` only when its checkpoint proves no public publish started or preserves a recoverable upload session.
-- On HTTP 429, record the provider-communicated `x-rate-limit-reset`/`retry-after` and refuse further sends/reads for that platform locally until it passes, per official provider guidance. Never sleep-and-retry inside the Skill and never loop around the gate; every provider call is billable under pay-per-use pricing.
+- On HTTP 429, record the provider-communicated `x-rate-limit-reset`/`retry-after` and refuse further sends/reads for that platform locally until it passes, per official provider guidance. Never sleep-and-retry inside the Skill and never loop around the gate; every provider call is billable or quota-limited.
+- Classify provider-native rate-limit signals by each provider's official contract, not by HTTP status alone: Meta error codes 4/17/32/613/80000-80014 (with `X-Business-Use-Case-Usage` `estimated_time_to_regain_access`) and YouTube 403 reasons `quotaExceeded`/`rateLimitExceeded`/`userRateLimitExceeded`/`uploadLimitExceeded` are `rate_limited`, never definite content failures.
 - Run ledger refusal checks and the rate-limit gate before any billable provider call, so a refused send costs zero external requests.
 - Cap attempts at 2 per Domain Authorization reference. A definite `failed`/`confirmed_absent` may be retried only under a new explicit Domain Authorization; the retry is recorded as an audited `retry-authorized` event. `unknown` still refuses blind retry unconditionally.
 - Reconcile through the provider's official status/read surface. Never infer `confirmed_absent` unless the provider-specific evidence proves absence.

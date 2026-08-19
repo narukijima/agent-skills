@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import quote
@@ -15,6 +16,51 @@ META_HOST = "graph.facebook.com"
 INSTAGRAM_HOST = "graph.instagram.com"
 THREADS_HOST = "graph.threads.net"
 GRAPH_ID = re.compile(r"[0-9]+(?:_[0-9]+)?")
+# Official Meta rate-limit error codes: platform throttling (4, 17, 32, 613) and
+# Business Use Case throttling (80000-80014).
+# https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
+RATE_LIMIT_CODES = {4, 17, 32, 613} | set(range(80000, 80015))
+
+
+def _error_code(error: Any) -> Optional[int]:
+    if not isinstance(error, dict):
+        return None
+    try:
+        return int(error.get("code"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _regain_seconds(rate_limit: Dict[str, Any]) -> Optional[int]:
+    """Largest estimated_time_to_regain_access (minutes) from X-Business-Use-Case-Usage."""
+    raw = rate_limit.get("business_usage")
+    if not raw:
+        return None
+    try:
+        usage = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    minutes = []
+    if isinstance(usage, dict):
+        for entries in usage.values():
+            for entry in entries if isinstance(entries, list) else []:
+                if isinstance(entry, dict):
+                    try:
+                        minutes.append(int(entry.get("estimated_time_to_regain_access", 0)))
+                    except (TypeError, ValueError):
+                        continue
+    return max(minutes) * 60 if minutes else None
+
+
+def _classify_rate_limit(exc: ApiFailure, error: Any) -> None:
+    """Reclassify an official Meta throttling error as rate_limited so the shared reset gate applies."""
+    if _error_code(error) not in RATE_LIMIT_CODES:
+        return
+    exc.outcome = "rate_limited"
+    rate_limit = exc.meta.setdefault("rate_limit", {})
+    regain = _regain_seconds(rate_limit)
+    if regain is not None and "retry_after" not in rate_limit:
+        rate_limit["retry_after"] = str(regain)
 
 
 def graph_id(value: Any, label: str = "resource_id") -> str:
@@ -26,12 +72,20 @@ def graph_id(value: Any, label: str = "resource_id") -> str:
 
 def graph_call(host: str, version: str, token: str, method: str, path: str,
                *, query: Optional[Dict[str, Any]] = None, form: Optional[Dict[str, Any]] = None):
-    result = request(method, f"https://{host}/{version}/{path.lstrip('/')}", allowed_hosts={host},
-                     token=token, query=query, form=form)
+    try:
+        result = request(method, f"https://{host}/{version}/{path.lstrip('/')}", allowed_hosts={host},
+                         token=token, query=query, form=form)
+    except ApiFailure as exc:
+        error = exc.payload.get("error") if isinstance(exc.payload, dict) else None
+        _classify_rate_limit(exc, error)
+        raise
     body = result.body if isinstance(result.body, dict) else {"data": result.body}
     if isinstance(body.get("error"), dict):
-        raise ApiFailure("Meta provider returned an application error", code="PROVIDER_APPLICATION_ERROR",
-                         status=result.status, payload=body.get("error"), outcome="failed")
+        exc = ApiFailure("Meta provider returned an application error", code="PROVIDER_APPLICATION_ERROR",
+                         status=result.status, payload=body.get("error"), outcome="failed",
+                         meta={"rate_limit": dict(result.rate_limit)})
+        _classify_rate_limit(exc, body.get("error"))
+        raise exc
     return result, body
 
 

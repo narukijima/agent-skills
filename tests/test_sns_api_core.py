@@ -499,8 +499,43 @@ class SnsApiCoreTests(unittest.TestCase):
             self.assertNotIn(key, value)
         self.assertNotIn("private%2Fkey%20value", value["message"])
 
+    def test_meta_official_throttle_codes_classify_as_rate_limited(self):
+        from sns_api_lib.providers import meta_common
+        for code, expected in ((4, "rate_limited"), (17, "rate_limited"), (32, "rate_limited"),
+                               (613, "rate_limited"), (80005, "rate_limited"), (100, "failed")):
+            with self.subTest(code=code):
+                failure = core.ApiFailure(
+                    "http error", code="PROVIDER_HTTP_ERROR", status=400,
+                    payload={"error": {"code": code, "message": "redacted"}}, outcome="failed",
+                    meta={"rate_limit": {"business_usage": json.dumps({"1": [
+                        {"type": "pages", "estimated_time_to_regain_access": 19},
+                    ]})}},
+                )
+                with patch.object(meta_common, "request", side_effect=failure):
+                    with self.assertRaises(core.ApiFailure) as raised:
+                        meta_common.graph_call("graph.facebook.com", "v26.0", "token", "POST", "1/feed")
+                self.assertEqual(raised.exception.outcome, expected)
+                if expected == "rate_limited":
+                    self.assertEqual(raised.exception.meta["rate_limit"]["retry_after"], str(19 * 60))
+
+    def test_youtube_official_quota_reasons_classify_as_rate_limited(self):
+        from sns_api_lib.providers import youtube_resumable
+        for reason, expected, retry_after in (
+            ("quotaExceeded", "rate_limited", "3600"), ("rateLimitExceeded", "rate_limited", None),
+            ("forbidden", "failed", None),
+        ):
+            with self.subTest(reason=reason):
+                failure = core.ApiFailure(
+                    "http error", code="PROVIDER_HTTP_ERROR", status=403,
+                    payload={"error": {"errors": [{"reason": reason}]}}, outcome="failed",
+                )
+                youtube_resumable.classify_quota(failure)
+                self.assertEqual(failure.outcome, expected)
+                if retry_after:
+                    self.assertEqual(failure.meta["rate_limit"]["retry_after"], retry_after)
+
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/3.1.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/3.2.0")
 
 
 if __name__ == "__main__": unittest.main()
