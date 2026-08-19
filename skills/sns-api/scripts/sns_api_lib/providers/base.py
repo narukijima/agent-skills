@@ -27,8 +27,6 @@ class Provider:
     publish_operations: tuple[str, ...] = ()
     supports_manual_resolve = False
     supports_manifest_resume = False
-    legacy_read_gate: Optional[str] = None
-    legacy_write_gate: Optional[str] = None
 
     def capability_document(self) -> Dict[str, Any]:
         value: Dict[str, Any] = {

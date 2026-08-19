@@ -324,7 +324,7 @@ def _refresh_token(client_id: str, client_secret: str, store_name: str, bootstra
 
 
 class XProvider(Provider):
-    name = "x"; account_type = "user"; legacy_read_gate = "X_API_READ_ENABLED"; legacy_write_gate = "X_POSTING_ENABLED"
+    name = "x"; account_type = "user"
     capabilities = (
         "identity.read", "user.lookup", "post.lookup", "user.posts", "post.search.recent", "usage.read",
         "publish.text", "publish.quote", "publish.image", "publish.video", "publish.gif",
@@ -394,25 +394,25 @@ class XProvider(Provider):
         return {"max_calls": len(calls), "calls": calls}
 
     def credentials(self, for_write, operation=""):
-        bearer = provider_env("x", "BEARER_TOKEN", legacy=["X_BEARER_TOKEN"])
+        bearer = provider_env("x", "BEARER_TOKEN")
         if not for_write and (operation == "usage.read" or (operation not in {"identity.read", "publish.status", "reconcile"} and bearer)):
-            token = bearer or provider_env("x", "BEARER_TOKEN", legacy=["X_BEARER_TOKEN"], required=True)
-            public = provider_env("x", "APP_PUBLIC_ID", legacy=["X_API_APP_ID"], required=True)
+            token = bearer or provider_env("x", "BEARER_TOKEN", required=True)
+            public = provider_env("x", "APP_PUBLIC_ID", required=True)
             return CredentialSnapshot("app", token, public, fingerprint("app", public))
-        mapping = [("API_KEY", "X_API_KEY"), ("API_SECRET", "X_API_SECRET"), ("ACCESS_TOKEN", "X_ACCESS_TOKEN"), ("ACCESS_TOKEN_SECRET", "X_ACCESS_TOKEN_SECRET")]
-        values = {name.lower(): provider_env("x", name, legacy=[old]) for name, old in mapping}
+        names = ("API_KEY", "API_SECRET", "ACCESS_TOKEN", "ACCESS_TOKEN_SECRET")
+        values = {name.lower(): provider_env("x", name) for name in names}
         if any(values[key] for key in ("api_key", "api_secret", "access_token_secret")):
             if not all(values.values()): raise ApiFailure("OAuth 1.0a variables must be complete", code="MISSING_CREDENTIAL")
             public = values["api_key"]
             return CredentialSnapshot("oauth1", values["access_token"], public, fingerprint("oauth1", public), values)
-        client = provider_env("x", "OAUTH2_CLIENT_ID", legacy=["X_OAUTH2_CLIENT_ID", "X_OAUTH2_STATIC_CLIENT_ID"])
-        store = provider_env("x", "OAUTH2_TOKEN_STORE", legacy=["X_OAUTH2_TOKEN_STORE"])
+        client = provider_env("x", "OAUTH2_CLIENT_ID")
+        store = provider_env("x", "OAUTH2_TOKEN_STORE")
         if store:
             if not client: raise ApiFailure("OAuth2 token store requires client ID", code="MISSING_CREDENTIAL")
-            token = _refresh_token(client, provider_env("x", "OAUTH2_CLIENT_SECRET", legacy=["X_OAUTH2_CLIENT_SECRET"]), store,
-                                   provider_env("x", "OAUTH2_REFRESH_TOKEN", legacy=["X_OAUTH2_REFRESH_TOKEN"]))
+            token = _refresh_token(client, provider_env("x", "OAUTH2_CLIENT_SECRET"), store,
+                                   provider_env("x", "OAUTH2_REFRESH_TOKEN"))
         else:
-            token = provider_env("x", "OAUTH2_ACCESS_TOKEN", legacy=["X_ACCESS_TOKEN"], required=True)
+            token = provider_env("x", "OAUTH2_ACCESS_TOKEN", required=True)
         if not client: raise ApiFailure("static OAuth2 token requires client ID", code="MISSING_CREDENTIAL")
         return CredentialSnapshot("oauth2", token, client, fingerprint("oauth2", client))
 
@@ -429,7 +429,7 @@ class XProvider(Provider):
         return {**data, "account_type": "user"}
 
     def read_call_budget(self, operation, params, credentials):
-        bearer = provider_env("x", "BEARER_TOKEN", legacy=["X_BEARER_TOKEN"])
+        bearer = provider_env("x", "BEARER_TOKEN")
         return 1 if operation == "usage.read" or (operation not in {"identity.read", "publish.status"} and bearer) else 2
 
     def read(self, credentials, operation, params):

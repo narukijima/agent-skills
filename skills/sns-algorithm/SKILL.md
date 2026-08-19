@@ -3,9 +3,9 @@ name: sns-algorithm
 description: SNSアルゴリズムの公式一次情報をsurface単位で検証し、投稿・アカウント・運用データの診断、比較、仮説、実験設計を行う。SNS文章作成やAPI実行だけの依頼には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.1.1"
-  claudagt.status: "active"
-  claudagt.aliases: "sns algorithm,social algorithm,ranking algorithm,recommendation algorithm,投稿分析,アルゴリズム分析"
+  agent-directory.version: "0.1.1"
+  agent-directory.status: "active"
+  agent-directory.aliases: "sns algorithm,social algorithm,ranking algorithm,recommendation algorithm,投稿分析,アルゴリズム分析"
 ---
 
 # sns-algorithm

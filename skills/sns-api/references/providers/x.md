@@ -17,8 +17,6 @@ X may accept media while processing is still `pending` or `in_progress`; return 
 
 X publish is immediate only when the response contains an unambiguous post ID. Reconciliation anchors on the durable Post-create timestamp, compares raw/HTML-unescaped/t.co-expanded text, verifies a URL quote's target ID through `referenced_tweets` or expanded URL evidence, and for media also requires exact uploaded media keys from `attachments.media_keys`. It may prove absence only when a complete returned timeline strictly brackets the attempt and the approved text has no URL. URL quotes remain unresolved unless matched or manually resolved with evidence. X and Facebook Pages are the only Providers that support audited manual resolve; X requires a numeric Post ID for a published resolution.
 
-Upgrades preserve canonical `x-api` v2 post and usage ledger state through the Common Core migration guard. Retire the old runtime first; an invalid or subsequently changed post snapshot blocks X write/recovery, and an unsafe usage snapshot blocks budgeted X calls, before credentials or Provider requests.
-
 Official sources:
 
 - [X API overview](https://docs.x.com/overview)

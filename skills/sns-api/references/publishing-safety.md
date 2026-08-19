@@ -59,8 +59,6 @@ For remote assets, require HTTPS without URL userinfo, record host and expected 
 
 ## Attempt lifecycle
 
-Before the first upgraded X attempt, legacy `sent` and `unknown` rows are imported as `published` and `unknown` respectively. This happens before credentials or provider dispatch, preserving both duplicate rejection and account-level unknown blocking. Migration is an audited canonical-state transition, not an external publish attempt.
-
 Identity and credential checks happen before the attempt. The irreversible lifecycle is:
 
 1. `BEGIN IMMEDIATE` duplicate/unknown/account check.
@@ -77,7 +75,7 @@ Do not retry timeout, disconnect, authenticated redirect, 5xx, malformed success
 
 YouTube upload, Instagram/Threads containers, and X media may be resumed by the exact signed manifest while it is valid. YouTube probes the same private session and obeys the Provider `Range`; Instagram/Threads reuse every checkpointed child/parent container. A pre-publish container request may have created an orphan object, but it cannot have published content: after a five-minute anti-race grace window, `reconcile` may convert that `unknown` to resumable `submitted`. The final `media_publish`/`threads_publish` checkpoint is a hard boundary; after it, official recent-content reconciliation is required and blind retry stays forbidden.
 
-Do not weaken manifest expiry. If processing outlives it, `prepare-resume` requires the current submitted ledger row, an expired-or-current signed manifest matching the row, the same Domain Authorization reference, and a hash of the exact Provider state. The resume manifest carries no content/media override and cannot create a new intent. State drift after prepare fails closed. The legacy `authorize-resume` command name remains an alias, but it does not imply a new Human Approval.
+Do not weaken manifest expiry. If processing outlives it, `prepare-resume` requires the current submitted ledger row, an expired-or-current signed manifest matching the row, the same Domain Authorization reference, and a hash of the exact Provider state. The resume manifest carries no content/media override and cannot create a new intent. State drift after prepare fails closed. The `authorize-resume` command name remains a compatibility alias, but it does not imply a new Human Approval.
 
 An X crash durably known to precede `POST /2/tweets` can reconcile as `confirmed_absent`; once the `post_create_started` checkpoint is written, timeline reconciliation or audited manual resolve is required. Facebook Page writes checkpoint their attempt timestamp; lost responses are compared against recent Page content where possible.
 

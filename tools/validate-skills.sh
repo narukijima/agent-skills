@@ -5,7 +5,6 @@ repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 status=0
 skill_count=0
 
-python3 "$repo_root/tools/check-runtime-permission-boundary.py"
 python3 "$repo_root/tools/public_repo_scan.py" --commit-range HEAD
 
 while IFS= read -r skill_file; do
@@ -59,15 +58,15 @@ if "LICENSE.txt" in license_value.group(1) and not (skill_dir / "LICENSE.txt").i
 if not metadata:
     raise SystemExit("metadata is required by this repository")
 metadata_text = metadata.group(1)
-version = re.search(r'^\s+claudagt\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', metadata_text, re.M)
-status_value = re.search(r'^\s+claudagt\.status:\s*"(active|deprecated|retired)"\s*$', metadata_text, re.M)
-aliases = re.search(r'^\s+claudagt\.aliases:\s*"([^"\n]+)"\s*$', metadata_text, re.M)
+version = re.search(r'^\s+agent-directory\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', metadata_text, re.M)
+status_value = re.search(r'^\s+agent-directory\.status:\s*"(active|deprecated|retired)"\s*$', metadata_text, re.M)
+aliases = re.search(r'^\s+agent-directory\.aliases:\s*"([^"\n]*)"\s*$', metadata_text, re.M)
 if not version:
-    raise SystemExit("metadata.claudagt.version must be a quoted semver string")
+    raise SystemExit("metadata.agent-directory.version must be a quoted semver string")
 if not status_value:
-    raise SystemExit("metadata.claudagt.status must be active, deprecated, or retired")
-if not aliases or not all(value.strip() for value in aliases.group(1).split(",")):
-    raise SystemExit("metadata.claudagt.aliases must be a non-empty comma-separated string")
+    raise SystemExit("metadata.agent-directory.status must be active, deprecated, or retired")
+if aliases is None:
+    raise SystemExit("metadata.agent-directory.aliases must be a quoted comma-separated string")
 if len(text.encode("utf-8")) > 20 * 1024:
     raise SystemExit("SKILL.md is larger than 20 KiB")
 for heading in ("## 使用するKnowledge", "### Required", "### Conditional"):
@@ -85,22 +84,6 @@ required_count = sum(
 )
 if required_count > 3:
     raise SystemExit("SKILL.md has more than 3 Required Knowledge references")
-openai_path = skill_dir / "agents" / "openai.yaml"
-if not openai_path.is_file():
-    raise SystemExit("missing agents/openai.yaml")
-openai_text = openai_path.read_text(encoding="utf-8")
-display = re.search(r'^\s+display_name:\s*"([^"\n]+)"\s*$', openai_text, re.M)
-short = re.search(r'^\s+short_description:\s*"([^"\n]+)"\s*$', openai_text, re.M)
-prompt = re.search(r'^\s+default_prompt:\s*"([^"\n]+)"\s*$', openai_text, re.M)
-implicit = re.search(r"^\s+allow_implicit_invocation:\s*(true|false)\s*$", openai_text, re.M)
-if not display:
-    raise SystemExit("agents/openai.yaml requires a quoted interface.display_name")
-if not short or not 25 <= len(short.group(1)) <= 64:
-    raise SystemExit("agents/openai.yaml short_description must be a quoted 25-64 character string")
-if not prompt or ("$" + skill_dir.name) not in prompt.group(1):
-    raise SystemExit("agents/openai.yaml default_prompt must reference $" + skill_dir.name)
-if not implicit:
-    raise SystemExit("agents/openai.yaml requires policy.allow_implicit_invocation: true or false")
 catalog_path = skill_dir.parent / "SKILLS.md"
 if not catalog_path.is_file():
     raise SystemExit("missing skills/SKILLS.md catalog")

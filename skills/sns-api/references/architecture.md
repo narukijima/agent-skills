@@ -37,12 +37,6 @@ Canonical files:
 - `state/sns-api/usage.sqlite3`: UTC-day call reservations keyed by platform, Project, Agent, and read/write kind.
 - `state/sns-api/private/youtube-upload-sessions/*.json`: owner-only 0600 capability state under 0700 directories; never manifest/SQLite/output content.
 
-### Legacy X upgrade guard
-
-Before X send/reconcile/resolve or X call-budget reservation, the Core checks only the canonical legacy files `state/x-api/x-posts.sqlite3` and `state/x-api/x-usage.sqlite3`. A valid v2 post ledger is copied transactionally into SNS ledger schema v3: `sent` becomes `published`, `unknown` remains `unknown`, and text/content hashes become duplicate tombstones. Each row receives a `legacy-x-migration` event and source-row mapping. Existing SNS state is merged only when account, content ID, payload hash, and intent hash agree; a mismatch fails closed.
-
-Usage rows are added once to any already-reserved SNS X calls so an upgrade cannot reset the daily Project/Agent budget. Both migrations store a canonical source snapshot digest. Repeated execution is idempotent. A malformed source or any source change after migration blocks X with structured `LEGACY_X_STATE_*` errors. Stop the old runtime before migration; SQLite cannot make two independent runtimes on different state files one distributed transaction.
-
 Ledger uniqueness includes `(platform, account_id, content_id)` and `(platform, account_id, intent_hash)`, where `intent_hash` binds normalized provider payload plus asset metadata. A write-ahead attempt is committed with `unknown` before dispatch. SQLite uses WAL, FULL synchronous mode, `BEGIN IMMEDIATE`, and bounded lock retry.
 
 Common states:
@@ -66,4 +60,4 @@ The nearest `.git` file/directory defines the workspace root. Missing markers fa
 
 ## Extending a provider
 
-Add a static module and registry entry. Declare only real capabilities. Implement normalization, call plan, credential snapshot/fingerprint, identity, read/publish, and reconciliation. Add official source links, request-shape tests, async/unknown tests, capability-doc consistency tests, and behavior eval cases. Do not add a generic endpoint escape hatch or a universal social-object schema.
+Add a static module and registry entry. Declare only real capabilities. Implement normalization, call plan, credential snapshot/fingerprint, identity, read/publish, and reconciliation. Add official source links and cover the new provider in the safety-core tests. Do not add a generic endpoint escape hatch or a universal social-object schema.

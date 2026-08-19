@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.request import Request
 
 from tests.sns_api_helpers import FINGERPRINT, base_env, core, credentials, make_manifest, prepare_args, signed
-from sns_api_lib import authorization, http
+from sns_api_lib import authorization, http, manifest
 from sns_api_lib.ledger import get_intent, reserve_attempt
 
 
@@ -103,9 +103,31 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertEqual(json.loads(error.getvalue())["errors"][0]["code"], "INVALID_AUTHORIZATION")
         self.assertFalse(output_path.exists())
 
-    def test_skill_requires_explicit_invocation(self):
-        text = (Path(__file__).parents[1] / "skills/sns-api/agents/openai.yaml").read_text(encoding="utf-8")
-        self.assertIn("allow_implicit_invocation: false", text)
+    def test_manifest_tamper_and_expiry_are_rejected(self):
+        path = Path(self.temp.name) / "approved.json"; make_manifest(path)
+        value = json.loads(path.read_text()); value["provider_payload"]["text"] = "changed"; path.write_text(json.dumps(value))
+        with patch.dict(os.environ, base_env(), clear=True), self.assertRaises(core.ApiFailure) as tampered: manifest.load_manifest(path)
+        self.assertEqual(tampered.exception.code, "MANIFEST_TAMPERED")
+        make_manifest(path); value = json.loads(path.read_text())
+        value["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        value["manifest_hash"] = manifest.manifest_hash(value)
+        with patch.dict(os.environ, base_env(), clear=True): value["hmac_signature"] = manifest.signature(value)
+        path.write_text(json.dumps(value))
+        with patch.dict(os.environ, base_env(), clear=True), self.assertRaises(core.ApiFailure) as expired: manifest.load_manifest(path)
+        self.assertEqual(expired.exception.code, "MANIFEST_EXPIRED")
+
+    def test_secret_value_in_payload_is_rejected_before_write(self):
+        path = Path(self.temp.name) / "m.json"; env = base_env(SNS_PRIVATE_ACCESS_TOKEN="secret-value-12345")
+        args = prepare_args(path, payload={"text": "secret-value-12345"})
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(core.ApiFailure) as raised: core.prepare(args)
+        self.assertEqual(raised.exception.code, "SECRET_IN_MANIFEST"); self.assertFalse(path.exists())
+
+    def test_send_parser_surface_has_manifest_only(self):
+        import sns_api
+        parser = sns_api.parser()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--platform", "x"])
+            with self.assertRaises(SystemExit): parser.parse_args(["send", "--manifest", "m.json", "--payload", "{}"])
 
     def test_standing_authorization_proceeds_without_per_intent_human_approval(self):
         authorization = self._standing_authorization()
@@ -207,17 +229,6 @@ class SnsApiCoreTests(unittest.TestCase):
         called.assert_not_called()
         self.assertFalse((Path(self.temp.name) / "state/sns-api/usage.sqlite3").exists())
         self.assertFalse((Path(self.temp.name) / "state/sns-api/ledger.sqlite3").exists())
-
-    def test_unsafe_legacy_x_state_blocks_before_budget_or_credentials(self):
-        path = Path(self.temp.name) / "m.json"; make_manifest(path)
-        legacy = Path(self.temp.name) / "state/x-api/x-posts.sqlite3"
-        legacy.parent.mkdir(parents=True); legacy.write_bytes(b"not-a-sqlite-ledger")
-        provider = core.provider("x")
-        with patch.dict(os.environ, base_env(), clear=True), patch.object(provider, "credentials") as called:
-            with self.assertRaises(core.ApiFailure) as raised: core.send(path)
-        self.assertEqual(raised.exception.code, "LEGACY_X_STATE_UNSAFE")
-        called.assert_not_called()
-        self.assertFalse((Path(self.temp.name) / "state/sns-api/usage.sqlite3").exists())
 
     def test_one_credential_snapshot_is_reused_for_identity_and_publish(self):
         path = Path(self.temp.name) / "m.json"; make_manifest(path); provider = core.provider("x")
@@ -432,7 +443,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("private%2Fkey%20value", value["message"])
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/2.0.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/3.0.0")
 
 
 if __name__ == "__main__": unittest.main()

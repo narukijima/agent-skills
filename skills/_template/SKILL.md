@@ -3,9 +3,9 @@ name: <skill-name>
 description: <200文字以内。何を行い、どの依頼で使うか、誤発動を避ける境界が分かる説明>
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.1.0"
-  claudagt.status: "active"
-  claudagt.aliases: "<comma-separated aliases>"
+  agent-directory.version: "0.1.0"
+  agent-directory.status: "active"
+  agent-directory.aliases: "<comma-separated aliases。別名がなければ空文字列>"
 ---
 
 # `<skill-name>` — <一行説明>

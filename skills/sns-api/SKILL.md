@@ -3,9 +3,9 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "2.0.0"
-  claudagt.status: "active"
-  claudagt.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
+  agent-directory.version: "3.0.0"
+  agent-directory.status: "active"
+  agent-directory.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
 
 # sns-api
@@ -21,8 +21,7 @@ TikTok is `planned`; do not claim runtime support.
 ## Activation
 
 - Require explicit `$sns-api` invocation for paid/external reads and every external write.
-- Keep `allow_implicit_invocation: false` in `agents/openai.yaml`.
-- Do not treat the legacy aliases `x-api`, `x api`, or `twitter-api` as permission to bypass the `sns-api` workflow.
+- Do not treat the aliases `x-api`, `x api`, or `twitter-api` as permission to bypass the `sns-api` workflow.
 - A bound scheduler or content pipeline may invoke `$sns-api` under standing authorization; do not add a repeated Human Approval when its signed Domain scope still matches.
 
 ## 使用するKnowledge
@@ -37,7 +36,7 @@ Read only what the requested operation needs:
 
 - Read `references/architecture.md` for Common Core lifecycle, state, or extension work.
 - Read `references/capability-matrix.md` before selecting an operation or handling unsupported capability.
-- Read `references/auth-and-secrets.md` for credentials, scopes, environment migration, or token rotation.
+- Read `references/auth-and-secrets.md` for credentials, scopes, or token rotation.
 - Read `references/publishing-safety.md` for `prepare`, `send`, `reconcile`, manual resolve, media, or async states.
 - Read `references/providers/x.md` only for X.
 - Read `references/providers/youtube.md` only for YouTube.
@@ -62,7 +61,6 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 - Let `prepare` accept provider JSON. Let `send` accept only `--manifest`; never add send-time platform, account, text, caption, media, or ledger overrides.
 - Verify authenticated identity, account type, app label, and credential fingerprint before writing an attempt.
 - Store canonical single-host state only under `state/sns-api/ledger.sqlite3` and `state/sns-api/usage.sqlite3`, resolved from the nearest `.git` marker. Do not accept arbitrary state paths.
-- Before any X write/recovery operation, detect canonical legacy `state/x-api/` post state; before every budgeted X call, detect legacy usage state. Migrate duplicate, unknown, result, and call-budget state once with audit records. Block the affected X operation if legacy state is invalid or changes after migration; never silently start with empty safety state.
 - Write the attempt as `unknown` before the first irreversible provider request.
 - Block blind retry of `unknown`, and block new sends to the same platform/account while an unknown remains.
 - Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID after an irreversible/public request as `unknown`; treat definite 4xx as `failed`; preserve 429/rate metadata without automatic sleep. A Provider may return resumable `submitted` only when its checkpoint proves no public publish started or preserves a recoverable upload session.
@@ -84,14 +82,6 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 ```bash
 python3 skills/sns-api/scripts/sns_api.py capabilities
 python3 skills/sns-api/scripts/sns_api.py capabilities --platform instagram
-```
-
-### Upgrade legacy X safety state
-
-Retire the legacy runtime, then run this local, credential-free migration before the first X operation. X runtime paths also enforce the same migration guard automatically. This migration path exists only for the retired `x-api` runtime and is planned for removal in the next major version.
-
-```bash
-python3 skills/sns-api/scripts/sns_api.py migrate-legacy-x
 ```
 
 ### Read

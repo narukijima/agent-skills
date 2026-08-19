@@ -1,7 +1,0 @@
-interface:
-  display_name: "<Skill display name>"
-  short_description: "<25-64文字の短い説明>"
-  default_prompt: "Use $<skill-name> to <short task description>."
-
-policy:
-  allow_implicit_invocation: true

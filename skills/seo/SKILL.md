@@ -3,9 +3,9 @@ name: seo
 description: SEO、検索順位・流入低下、crawl/indexing、robots、sitemap、canonical、Search Console、Core Web Vitals、structured data、internal linking、pSEO、AIO/AEO/GEO、AI searchの調査・実装・検証に使う。広告、SNS、SEO目的のないcopywritingや一般UI改善には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  claudagt.version: "0.3.0"
-  claudagt.status: "active"
-  claudagt.aliases: "technical seo,search optimization,search console,aio,aeo,geo,pseo,ai search"
+  agent-directory.version: "0.3.0"
+  agent-directory.status: "active"
+  agent-directory.aliases: "technical seo,search optimization,search console,aio,aeo,geo,pseo,ai search"
 ---
 
 # seo — 証拠から検索可視性を診断し、最小修正を再検証する

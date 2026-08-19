@@ -61,11 +61,10 @@ class ImportSkillTests(unittest.TestCase):
             self.assertTrue((imported / "references/source-strategy.md").is_file())
             upstream = (imported / "agents/upstream.yaml").read_text(encoding="utf-8")
             skill = (imported / "SKILL.md").read_text(encoding="utf-8")
-            self.assertIn("status: active", skill)
-            self.assertIn('aliases: ["ai native design", "ai ui"]', skill)
+            self.assertIn('agent-directory.status: "active"', skill)
+            self.assertIn('agent-directory.aliases: "ai native design,ai ui"', skill)
             self.assertIn('source_version: "0.3.0"', upstream)
             self.assertIn('import_mode: "vendored-copy"', upstream)
-            self.assertIn('frontmatter_projection: "agent-directory-v1"', upstream)
 
     def test_import_refuses_to_overwrite_existing_skill(self):
         with tempfile.TemporaryDirectory() as directory:

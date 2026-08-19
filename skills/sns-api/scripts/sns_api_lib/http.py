@@ -24,7 +24,7 @@ def skill_version() -> str:
         text = (Path(__file__).resolve().parents[2] / "SKILL.md").read_text(encoding="utf-8")
     except OSError:
         return "unknown"
-    match = re.search(r'^\s+claudagt\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', text, re.M)
+    match = re.search(r'^\s+agent-directory\.version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', text, re.M)
     return match.group(1) if match else "unknown"
 
 
