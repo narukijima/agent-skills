@@ -48,7 +48,7 @@ Common states:
 | `submitted` | Provider accepted a stable upload/container/object, but full publication/processing is not complete. |
 | `published` | Provider-specific evidence says the content is published/complete. |
 | `failed` | A definite failure; one exact-intent retry may reuse the same still-valid Domain Authorization. |
-| `rate_limited` | 429 or equivalent; preserve rate metadata and do not sleep automatically. |
+| `rate_limited` | 429 or equivalent; preserve rate metadata, persist the reset, and refuse new calls locally until it passes. |
 | `confirmed_absent` | Provider-specific reconciliation proved absence. |
 | `unresolved` | Available official evidence cannot prove success or absence. |
 

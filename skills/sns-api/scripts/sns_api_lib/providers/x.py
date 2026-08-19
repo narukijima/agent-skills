@@ -117,36 +117,14 @@ def quote_post_id(value: str) -> str:
     return canonical_quote_url(value).rsplit("/", 1)[-1]
 
 
-def quote_text(value: str, quote_url: str) -> tuple[str, str]:
-    canonical = canonical_quote_url(quote_url)
-    text = normalize_text(value)
-    spans = [(start, end) for start, end in _url_spans(text) if _quote_target(text[start:end])]
-    if len(spans) > 1:
-        raise ApiFailure("X quote publish accepts exactly one quote target", code="INVALID_QUOTE_TARGET")
-    if spans:
-        start, end = spans[0]
-        if canonical_quote_url(text[start:end]) != canonical:
-            raise ApiFailure("text quote target does not match quote_url", code="INVALID_QUOTE_TARGET")
-        text = text[:start] + canonical + text[end:]
-    else:
-        text = (text + "\n" if text else "") + canonical
-    return validate_text(text, declared_quote_url=canonical), canonical
-
-
-def validate_text(value: str, *, declared_quote_url: Optional[str] = None, allow_empty: bool = False) -> str:
+def validate_text(value: str, *, allow_empty: bool = False) -> str:
     text = normalize_text(value)
     errors = []
     if not text.strip() and not allow_empty: errors.append("TEXT_EMPTY")
     if weighted_length(text) > 280: errors.append("TEXT_TOO_LONG")
     if len(CASHTAG.findall(text)) > 1: errors.append("TOO_MANY_CASHTAGS")
-    quote_targets = [text[a:b] for a, b in _url_spans(text) if _quote_target(text[a:b])]
-    if quote_targets:
-        if declared_quote_url is None:
-            errors.append("UNDECLARED_QUOTE_TARGET")
-        elif len(quote_targets) != 1 or canonical_quote_url(quote_targets[0]) != declared_quote_url:
-            errors.append("QUOTE_TARGET_MISMATCH")
-    elif declared_quote_url is not None:
-        errors.append("QUOTE_TARGET_MISSING")
+    if any(_quote_target(text[a:b]) for a, b in _url_spans(text)):
+        errors.append("UNDECLARED_QUOTE_TARGET")
     if any(unicodedata.category(ch).startswith("C") and ch not in {"\n", "\t", "\u200d", "\ufe0f"} for ch in text): errors.append("CONTROL_CHARACTER")
     if errors:
         raise ApiFailure("X post validation failed: " + ", ".join(errors), code="INVALID_CONTENT", payload={"errors": errors})
@@ -348,11 +326,12 @@ class XProvider(Provider):
                 raise ApiFailure("X publish.quote does not accept media", code="INVALID_MEDIA")
             if not isinstance(quote_url, str) or not quote_url.strip():
                 raise ApiFailure("X publish.quote requires quote_url", code="INVALID_QUOTE_TARGET")
-            text, normalized_quote = quote_text(str(payload.get("text", "")), quote_url)
+            quote_tweet_id = quote_post_id(quote_url)
+            text = validate_text(str(payload.get("text", "")), allow_empty=True)
         else:
             if quote_url is not None:
                 raise ApiFailure("quote_url requires publish.quote", code="INVALID_QUOTE_TARGET")
-            normalized_quote = None
+            quote_tweet_id = None
             text = validate_text(str(payload.get("text", "")), allow_empty=operation in {"publish.image", "publish.video", "publish.gif"})
 
         if operation in {"publish.text", "publish.quote"}:
@@ -379,8 +358,8 @@ class XProvider(Provider):
         if made_with_ai and operation not in {"publish.image", "publish.video", "publish.gif"}:
             raise ApiFailure("X made_with_ai applies only to media publish", code="INVALID_CONTENT")
         normalized = {"text": text}
-        if normalized_quote is not None:
-            normalized["quote_url"] = normalized_quote
+        if quote_tweet_id is not None:
+            normalized["quote_tweet_id"] = quote_tweet_id
         if alt_texts:
             normalized["alt_texts"] = alt_texts
         if made_with_ai:
@@ -466,6 +445,8 @@ class XProvider(Provider):
         body: Dict[str, Any] = {}
         if payload["text"]:
             body["text"] = payload["text"]
+        if payload.get("quote_tweet_id"):
+            body["quote_tweet_id"] = payload["quote_tweet_id"]
         if state["media_ids"]:
             body["media"] = {"media_ids": state["media_ids"]}
         if payload.get("made_with_ai"):
@@ -511,12 +492,8 @@ class XProvider(Provider):
         anchor = state.get("post_create_started_at") or row["attempted_at"]
         attempted = parse_time(anchor, "post create attempted_at"); expected = row["provider_payload"]["text"]
         expected_media_keys = {str(item) for item in state.get("media_keys", [])}
-        expected_quote_url = row["provider_payload"].get("quote_url")
-        expected_quote_id = quote_post_id(expected_quote_url) if expected_quote_url else None
+        expected_quote_id = row["provider_payload"].get("quote_tweet_id") or None
         expected_text_hashes = {content_hash(expected)}
-        if expected_quote_url:
-            comment = expected[:-len(expected_quote_url)].rstrip() if expected.endswith(expected_quote_url) else expected
-            expected_text_hashes.add(content_hash(comment))
         for post in posts or []:
             if not isinstance(post, dict) or not post.get("created_at"): continue
             created = parse_time(str(post["created_at"]), "post created_at")

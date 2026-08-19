@@ -315,9 +315,20 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertEqual(row["status"], "published")
         self.assertEqual(row["provider_id"], "42_9001")
 
-    def test_429_refunds_attempt_and_same_approval_can_retry(self):
+    def test_429_refunds_attempt_and_gates_locally_until_official_reset(self):
         path = Path(self.temp.name) / "rate.json"; make_manifest(path)
         failure = core.ApiFailure("rate", status=429, outcome="rate_limited")
+        with self.assertRaises(core.ApiFailure): self._send(path, publish=lambda *_: (_ for _ in ()).throw(failure))
+        self.assertEqual(get_intent("x", "42", "content-1")["attempts"], 0)
+        provider = core.provider("x")
+        with patch.dict(os.environ, base_env(), clear=True), patch.object(provider, "credentials") as called:
+            with self.assertRaises(core.ApiFailure) as gated: core.send(path)
+        self.assertEqual(gated.exception.code, "RATE_LIMIT_ACTIVE"); called.assert_not_called()
+
+    def test_429_retry_proceeds_after_provider_reset_passes(self):
+        path = Path(self.temp.name) / "rate-reset.json"; make_manifest(path)
+        failure = core.ApiFailure("rate", status=429, outcome="rate_limited",
+                                  meta={"rate_limit": {"retry_after": "0"}})
         with self.assertRaises(core.ApiFailure): self._send(path, publish=lambda *_: (_ for _ in ()).throw(failure))
         self.assertEqual(get_intent("x", "42", "content-1")["attempts"], 0)
         result = self._send(path); self.assertEqual(result["status"], "published")
@@ -327,6 +338,52 @@ class SnsApiCoreTests(unittest.TestCase):
         failure = core.ApiFailure("bad", status=400)
         with self.assertRaises(core.ApiFailure): self._send(first, publish=lambda *_: (_ for _ in ()).throw(failure))
         self.assertEqual(self._send(first)["status"], "published")
+
+    def test_attempt_limit_is_per_domain_authorization_and_new_authorization_can_retry(self):
+        path = Path(self.temp.name) / "limited.json"; make_manifest(path)
+        failure = core.ApiFailure("forbidden", status=403)
+        for _ in range(2):
+            with self.assertRaises(core.ApiFailure):
+                self._send(path, publish=lambda *_: (_ for _ in ()).throw(failure))
+        provider = core.provider("x")
+        with patch.dict(os.environ, base_env(), clear=True), patch.object(provider, "credentials") as called:
+            with self.assertRaises(core.ApiFailure) as limited: core.send(path)
+        self.assertEqual(limited.exception.code, "ATTEMPT_LIMIT"); called.assert_not_called()
+        reauthorized = Path(self.temp.name) / "reauthorized.json"
+        make_manifest(reauthorized, approval_id="approval-2")
+        self.assertEqual(self._send(reauthorized)["status"], "published")
+        row = get_intent("x", "42", "content-1")
+        self.assertEqual(row["status"], "published"); self.assertEqual(row["attempts"], 3)
+
+    def test_duplicate_after_publish_is_refused_before_any_billable_call(self):
+        path = Path(self.temp.name) / "m.json"; make_manifest(path)
+        self._send(path)
+        provider = core.provider("x")
+        with patch.dict(os.environ, base_env(), clear=True), patch.object(provider, "credentials") as called:
+            with self.assertRaises(core.ApiFailure) as duplicate: core.send(path)
+        self.assertEqual(duplicate.exception.code, "DUPLICATE"); called.assert_not_called()
+
+    def test_x_quote_uses_official_quote_tweet_id_and_rejects_url_in_text(self):
+        path = Path(self.temp.name) / "quote.json"
+        make_manifest(path, operation="publish.quote", payload={
+            "text": "approved comment", "quote_url": "https://x.com/example/status/123456789",
+        })
+        value = signed(path)
+        self.assertEqual(value["provider_payload"], {"text": "approved comment", "quote_tweet_id": "123456789"})
+        provider = core.provider("x")
+        sent = {}
+        def publish(credentials, manifest, checkpoint):
+            body = {"text": manifest["provider_payload"]["text"],
+                    "quote_tweet_id": manifest["provider_payload"]["quote_tweet_id"]}
+            sent.update(body)
+            return {"status": "published", "provider_id": "9", "provider_status": "published"}
+        self._send(path, publish=publish)
+        self.assertEqual(sent["quote_tweet_id"], "123456789")
+        with patch.dict(os.environ, base_env(), clear=True), self.assertRaises(core.ApiFailure) as raised:
+            core.prepare(prepare_args(Path(self.temp.name) / "url-text.json", payload={
+                "text": "see https://x.com/example/status/123456789",
+            }))
+        self.assertEqual(raised.exception.payload["errors"], ["UNDECLARED_QUOTE_TARGET"])
 
     def test_definite_failure_retry_cannot_change_binding_under_same_authorization_reference(self):
         first = Path(self.temp.name) / "first.json"; make_manifest(first)
@@ -443,7 +500,7 @@ class SnsApiCoreTests(unittest.TestCase):
         self.assertNotIn("private%2Fkey%20value", value["message"])
 
     def test_user_agent_tracks_canonical_skill_version(self):
-        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/3.0.0")
+        self.assertEqual(http.USER_AGENT, "agent-skills-sns-api/3.1.0")
 
 
 if __name__ == "__main__": unittest.main()

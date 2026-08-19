@@ -155,11 +155,17 @@ def authorize_resume(original_path: Path, output_path: Path, approval_id: Option
     }, provider_meta={"resume_only": True, "provider_state_bound": True})
 
 
+def _record_provider_rate_limit(platform: str, kind: str, exc: "ApiFailure") -> None:
+    from .budget import record_rate_limit
+    if exc.status == 429 or exc.outcome == "rate_limited":
+        record_rate_limit(platform, kind, (exc.meta or {}).get("rate_limit") or {})
+
+
 def send(manifest_path: Path) -> Dict[str, Any]:
     from .authorization import validate_domain_authorization
     from .auth import global_control, provider_app_id
-    from .budget import reserve_calls
-    from .ledger import get_intent, record_result, reserve_attempt, update_provider_state
+    from .budget import rate_limit_gate, reserve_calls
+    from .ledger import get_intent, precheck_attempt, record_result, reserve_attempt, update_provider_state
     from .manifest import load_manifest
     from .media import verify_assets
 
@@ -172,12 +178,18 @@ def send(manifest_path: Path) -> Dict[str, Any]:
     if provider_app_id(item.name) != manifest["app_id"]:
         raise ApiFailure("configured app ID does not match manifest app_id", code="APP_MISMATCH")
     verify_assets(manifest.get("assets", []))
+    precheck_attempt({**manifest, "_allow_resume": item.supports_manifest_resume})
+    rate_limit_gate(item.name, "write")
     planned = int(manifest["provider_call_plan"]["max_calls"])
     budget = reserve_calls(item.name, "write", planned)
-    credentials = item.credentials(for_write=True)
-    if credentials.fingerprint != manifest["expected_credential_fingerprint"]:
-        raise ApiFailure("credential fingerprint does not match signed manifest", code="CREDENTIAL_MISMATCH")
-    actual = item.identity(credentials)
+    try:
+        credentials = item.credentials(for_write=True)
+        if credentials.fingerprint != manifest["expected_credential_fingerprint"]:
+            raise ApiFailure("credential fingerprint does not match signed manifest", code="CREDENTIAL_MISMATCH")
+        actual = item.identity(credentials)
+    except ApiFailure as exc:
+        _record_provider_rate_limit(item.name, "write", exc)
+        raise
     if str(actual.get("id", "")) != manifest["expected_account_id"]:
         raise ApiFailure("authenticated account does not match expected_account_id; no attempt recorded", code="ACCOUNT_MISMATCH")
     if manifest.get("account_type") and actual.get("account_type") != manifest["account_type"]:
@@ -192,6 +204,7 @@ def send(manifest_path: Path) -> Dict[str, Any]:
     try:
         result = item.publish(credentials, manifest, checkpoint)
     except ApiFailure as exc:
+        _record_provider_rate_limit(item.name, "write", exc)
         if exc.status == 429 or exc.outcome == "rate_limited":
             outcome = "rate_limited"
         elif exc.outcome == "submitted":
@@ -223,17 +236,22 @@ def send(manifest_path: Path) -> Dict[str, Any]:
 
 def read(platform: str, operation: str, params: Dict[str, Any]) -> Dict[str, Any]:
     from .auth import global_control
-    from .budget import reserve_calls
+    from .budget import rate_limit_gate, reserve_calls
     item = provider(platform)
     item.require_capability(operation)
     if not item.is_read_operation(operation):
         raise ApiFailure("operation is not a read capability", code="UNSUPPORTED_CAPABILITY")
     if global_control("READ_ENABLED") != "true":
         raise ApiFailure("external read requires SNS_API_READ_ENABLED=true", code="READ_DISABLED")
+    rate_limit_gate(platform, "read")
     calls = item.read_call_budget(operation, params, None)
     budget = reserve_calls(platform, "read", calls)
-    credentials = item.credentials(for_write=False, operation=operation)
-    result = item.read(credentials, operation, params)
+    try:
+        credentials = item.credentials(for_write=False, operation=operation)
+        result = item.read(credentials, operation, params)
+    except ApiFailure as exc:
+        _record_provider_rate_limit(platform, "read", exc)
+        raise
     return envelope(
         platform, operation, status_value=result.get("status", "success"), data=result.get("data"),
         errors=result.get("errors", []), auth_mode=credentials.auth_mode, budget=budget,
@@ -247,7 +265,7 @@ def status(platform: str, resource_id: str) -> Dict[str, Any]:
 
 def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[str, Any]:
     from .auth import global_control
-    from .budget import reserve_calls
+    from .budget import rate_limit_gate, reserve_calls
     from .ledger import get_intent, record_result
     item = provider(platform)
     item.require_capability("reconcile")
@@ -256,15 +274,20 @@ def reconcile(platform: str, content_id: str, expected_account_id: str) -> Dict[
     row = get_intent(platform, expected_account_id, content_id)
     if row["status"] not in {"unknown", "submitted"}:
         return envelope(platform, "reconcile", status_value=row["status"], data={"reconciled": False})
+    rate_limit_gate(platform, "read")
     calls = item.reconcile_call_budget(row)
     budget = reserve_calls(platform, "read", calls)
-    credentials = item.credentials(for_write=False, operation="reconcile")
-    if credentials.fingerprint != row["credential_fingerprint"]:
-        raise ApiFailure("credential fingerprint does not match ledger", code="CREDENTIAL_MISMATCH")
-    actual = item.identity(credentials)
-    if str(actual.get("id", "")) != expected_account_id:
-        raise ApiFailure("authenticated account does not match reconciliation account", code="ACCOUNT_MISMATCH")
-    result = item.reconcile(credentials, row)
+    try:
+        credentials = item.credentials(for_write=False, operation="reconcile")
+        if credentials.fingerprint != row["credential_fingerprint"]:
+            raise ApiFailure("credential fingerprint does not match ledger", code="CREDENTIAL_MISMATCH")
+        actual = item.identity(credentials)
+        if str(actual.get("id", "")) != expected_account_id:
+            raise ApiFailure("authenticated account does not match reconciliation account", code="ACCOUNT_MISMATCH")
+        result = item.reconcile(credentials, row)
+    except ApiFailure as exc:
+        _record_provider_rate_limit(platform, "read", exc)
+        raise
     outcome = result.get("status", "unresolved")
     if outcome == "confirmed_success":
         record_result(row["id"], "published", provider_id=result.get("provider_id"),

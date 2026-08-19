@@ -1,4 +1,4 @@
-"""Persistent Project/Agent scoped daily call budgets."""
+"""Persistent Project/Agent scoped daily call budgets and provider rate-limit windows."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from .auth import global_control
 from .core import ApiFailure, state_path, utc_now
 
 USAGE_COLUMNS = {"day", "platform", "project_id", "agent_id", "kind", "calls", "updated_at"}
+# Official default window when a 429 arrives without usable reset headers
+# (X rate-limit windows are 15 minutes: https://docs.x.com/x-api/fundamentals/rate-limits).
+DEFAULT_RATE_LIMIT_WINDOW = 900
 
 
 def _open_usage() -> sqlite3.Connection:
@@ -42,6 +45,67 @@ def _open_usage() -> sqlite3.Connection:
     except Exception:
         connection.close()
         raise
+
+
+def _rate_limit_key(platform: str, kind: str) -> str:
+    return "rate_limit_reset:" + platform + ":" + kind
+
+
+def record_rate_limit(platform: str, kind: str, rate_limit: dict) -> float:
+    """Persist the provider-communicated reset so later calls wait, per official 429 guidance."""
+    reset = None
+    try:
+        if rate_limit.get("reset"):
+            reset = float(rate_limit["reset"])
+        elif rate_limit.get("retry_after"):
+            reset = time.time() + float(rate_limit["retry_after"])
+    except (TypeError, ValueError):
+        reset = None
+    if reset is None:
+        reset = time.time() + DEFAULT_RATE_LIMIT_WINDOW
+    connection = _open_usage()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        key = _rate_limit_key(platform, kind)
+        row = connection.execute("SELECT value FROM usage_meta WHERE key=?", (key,)).fetchone()
+        try:
+            current = float(row[0]) if row else 0.0
+        except (TypeError, ValueError):
+            current = 0.0
+        stored = max(current, reset)
+        connection.execute(
+            "INSERT INTO usage_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, repr(stored)),
+        )
+        connection.commit()
+        return stored
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def rate_limit_gate(platform: str, kind: str) -> None:
+    """Refuse locally, without any provider call, while a recorded 429 window is still open."""
+    connection = _open_usage()
+    try:
+        row = connection.execute(
+            "SELECT value FROM usage_meta WHERE key=?", (_rate_limit_key(platform, kind),)
+        ).fetchone()
+    finally:
+        connection.close()
+    try:
+        reset = float(row[0]) if row else 0.0
+    except (TypeError, ValueError):
+        return
+    if reset > time.time():
+        reset_at = datetime.fromtimestamp(reset, timezone.utc).isoformat().replace("+00:00", "Z")
+        raise ApiFailure(
+            "provider rate limit window is active; wait until " + reset_at + " (official x-rate-limit-reset guidance)",
+            code="RATE_LIMIT_ACTIVE",
+            payload={"platform": platform, "kind": kind, "reset_at": reset_at},
+        )
 
 
 def reserve_calls(platform: str, kind: str, planned: int):

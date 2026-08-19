@@ -101,30 +101,82 @@ def _event(connection: sqlite3.Connection, intent_id: int, event: str, status: s
     )
 
 
+def _select_intent(connection: sqlite3.Connection, manifest: Dict[str, Any]):
+    row = connection.execute(
+        "SELECT * FROM intents WHERE platform=? AND account_id=? AND (content_id=? OR intent_hash=?)",
+        (manifest["platform"], manifest["expected_account_id"], manifest["content_id"], manifest["intent_hash"]),
+    ).fetchone()
+    unresolved = connection.execute(
+        "SELECT content_id FROM intents WHERE platform=? AND account_id=? AND status='unknown' LIMIT 1",
+        (manifest["platform"], manifest["expected_account_id"]),
+    ).fetchone()
+    return row, unresolved
+
+
+def _refuse_conflicts(row, unresolved, manifest: Dict[str, Any]) -> None:
+    if manifest.get("authorization_type") == "resume" and (row is None or row["status"] != "submitted"):
+        raise ApiFailure("resume-only manifest cannot create or retry a publish intent", code="INVALID_RESUME_STATE")
+    if unresolved and (row is None or unresolved["content_id"] != row["content_id"]):
+        raise ApiFailure("account has an unresolved unknown intent; reconcile before any new send", code="ACCOUNT_BLOCKED")
+    if row is None:
+        return
+    if row["content_id"] != manifest["content_id"]:
+        raise ApiFailure("duplicate payload already registered under another content_id", code="DUPLICATE")
+    if row["payload_hash"] != manifest["payload_hash"]:
+        raise ApiFailure("content_id is already bound to a different payload", code="DUPLICATE")
+    if row["intent_hash"] != manifest["intent_hash"]:
+        raise ApiFailure("content_id is already bound to different media", code="DUPLICATE")
+    if row["status"] == "submitted" and manifest.get("_allow_resume"):
+        return
+    if row["status"] in {"published", "submitted", "submitting"}:
+        raise ApiFailure("duplicate publish refused", code="DUPLICATE")
+    if row["status"] == "unknown":
+        raise ApiFailure("unknown publish result refuses blind retry; run reconcile", code="BLIND_RETRY_REFUSED")
+    if row["approval_id"] == manifest["approval_id"]:
+        original_binding = (
+            row["account_type"], row["app_id"], row["credential_fingerprint"], row["operation"],
+        )
+        retry_binding = (
+            manifest["account_type"], manifest["app_id"],
+            manifest["expected_credential_fingerprint"], manifest["operation"],
+        )
+        if original_binding != retry_binding:
+            raise ApiFailure(
+                "same Domain Authorization reference cannot change retry bindings",
+                code="AUTHORIZATION_SCOPE_MISMATCH",
+            )
+        if row["attempts"] >= 2:
+            raise ApiFailure(
+                "publish attempt limit reached for this Domain Authorization; a definite failure needs a new explicit authorization to retry",
+                code="ATTEMPT_LIMIT",
+            )
+
+
+def precheck_attempt(manifest: Dict[str, Any]) -> None:
+    """Read-only refusal check so a refused send never spends a billable provider call.
+
+    Advisory only: reserve_attempt remains the authoritative, transactional gate.
+    """
+    if not state_path("ledger.sqlite3").exists():
+        if manifest.get("authorization_type") == "resume":
+            raise ApiFailure("resume-only manifest cannot create or retry a publish intent", code="INVALID_RESUME_STATE")
+        return
+    connection = open_ledger()
+    try:
+        row, unresolved = _select_intent(connection, manifest)
+        _refuse_conflicts(row, unresolved, manifest)
+    finally:
+        connection.close()
+
+
 def reserve_attempt(manifest: Dict[str, Any]) -> int:
     connection = open_ledger()
     try:
         connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            "SELECT * FROM intents WHERE platform=? AND account_id=? AND (content_id=? OR intent_hash=?)",
-            (manifest["platform"], manifest["expected_account_id"], manifest["content_id"], manifest["intent_hash"]),
-        ).fetchone()
-        unresolved = connection.execute(
-            "SELECT content_id FROM intents WHERE platform=? AND account_id=? AND status='unknown' LIMIT 1",
-            (manifest["platform"], manifest["expected_account_id"]),
-        ).fetchone()
-        if manifest.get("authorization_type") == "resume" and (row is None or row["status"] != "submitted"):
-            raise ApiFailure("resume-only manifest cannot create or retry a publish intent", code="INVALID_RESUME_STATE")
-        if unresolved and (row is None or unresolved["content_id"] != row["content_id"]):
-            raise ApiFailure("account has an unresolved unknown intent; reconcile before any new send", code="ACCOUNT_BLOCKED")
+        row, unresolved = _select_intent(connection, manifest)
+        _refuse_conflicts(row, unresolved, manifest)
         now = utc_now()
         if row:
-            if row["content_id"] != manifest["content_id"]:
-                raise ApiFailure("duplicate payload already registered under another content_id", code="DUPLICATE")
-            if row["payload_hash"] != manifest["payload_hash"]:
-                raise ApiFailure("content_id is already bound to a different payload", code="DUPLICATE")
-            if row["intent_hash"] != manifest["intent_hash"]:
-                raise ApiFailure("content_id is already bound to different media", code="DUPLICATE")
             if row["status"] == "submitted" and manifest.get("_allow_resume") and row["manifest_hash"] == manifest["manifest_hash"] and row["provider_state"]:
                 _event(connection, int(row["id"]), "resume", "submitted")
                 connection.commit()
@@ -147,25 +199,13 @@ def reserve_attempt(manifest: Dict[str, Any]) -> int:
                 })
                 connection.commit()
                 return int(row["id"])
-            if row["status"] in {"published", "submitted", "submitting"}:
+            if row["status"] == "submitted":
                 raise ApiFailure("duplicate publish refused", code="DUPLICATE")
-            if row["status"] == "unknown":
-                raise ApiFailure("unknown publish result refuses blind retry; run reconcile", code="BLIND_RETRY_REFUSED")
-            if row["status"] in {"failed", "confirmed_absent"} and row["approval_id"] == manifest["approval_id"]:
-                original_binding = (
-                    row["account_type"], row["app_id"], row["credential_fingerprint"], row["operation"],
-                )
-                retry_binding = (
-                    manifest["account_type"], manifest["app_id"],
-                    manifest["expected_credential_fingerprint"], manifest["operation"],
-                )
-                if original_binding != retry_binding:
-                    raise ApiFailure(
-                        "same Domain Authorization reference cannot change retry bindings",
-                        code="AUTHORIZATION_SCOPE_MISMATCH",
-                    )
-            if row["attempts"] >= 2:
-                raise ApiFailure("publish attempt limit reached", code="ATTEMPT_LIMIT")
+            if row["approval_id"] != manifest["approval_id"]:
+                _event(connection, int(row["id"]), "retry-authorized", row["status"], detail={
+                    "previous_approval_id": row["approval_id"], "approval_id": manifest["approval_id"],
+                    "previous_attempts": row["attempts"],
+                })
             attempts = row["attempts"] + 1
             connection.execute(
                 "UPDATE intents SET account_type=?,app_id=?,credential_fingerprint=?,operation=?,manifest_hash=?,approval_id=?,status='unknown',attempts=?,attempted_at=?,updated_at=?,provider_state=NULL WHERE id=?",

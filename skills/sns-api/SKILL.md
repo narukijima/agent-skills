@@ -3,7 +3,7 @@ name: sns-api
 description: Use only when explicitly requested to read or safely publish via official X (including URL quotes and local media), YouTube, Facebook Pages, Instagram Professional, or Threads APIs.
 license: MIT. See LICENSE.txt
 metadata:
-  agent-directory.version: "3.0.0"
+  agent-directory.version: "3.1.0"
   agent-directory.status: "active"
   agent-directory.aliases: "sns api,social api,social media api,x-api,x api,twitter-api"
 ---
@@ -63,12 +63,15 @@ API versions, scopes, quotas, prices, rate limits, and restrictions drift. Reche
 - Store canonical single-host state only under `state/sns-api/ledger.sqlite3` and `state/sns-api/usage.sqlite3`, resolved from the nearest `.git` marker. Do not accept arbitrary state paths.
 - Write the attempt as `unknown` before the first irreversible provider request.
 - Block blind retry of `unknown`, and block new sends to the same platform/account while an unknown remains.
-- Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID after an irreversible/public request as `unknown`; treat definite 4xx as `failed`; preserve 429/rate metadata without automatic sleep. A Provider may return resumable `submitted` only when its checkpoint proves no public publish started or preserves a recoverable upload session.
+- Treat timeout, disconnect, authenticated redirect, 5xx, or missing provider ID after an irreversible/public request as `unknown`; treat definite 4xx as `failed`. A Provider may return resumable `submitted` only when its checkpoint proves no public publish started or preserves a recoverable upload session.
+- On HTTP 429, record the provider-communicated `x-rate-limit-reset`/`retry-after` and refuse further sends/reads for that platform locally until it passes, per official provider guidance. Never sleep-and-retry inside the Skill and never loop around the gate; every provider call is billable under pay-per-use pricing.
+- Run ledger refusal checks and the rate-limit gate before any billable provider call, so a refused send costs zero external requests.
+- Cap attempts at 2 per Domain Authorization reference. A definite `failed`/`confirmed_absent` may be retried only under a new explicit Domain Authorization; the retry is recorded as an audited `retry-authorized` event. `unknown` still refuses blind retry unconditionally.
 - Reconcile through the provider's official status/read surface. Never infer `confirmed_absent` unless the provider-specific evidence proves absence.
 - Enable audited manual resolve only for X and Facebook Pages, with gateway privilege, out-of-band evidence, reason, and provider ID when resolving as published.
 - Verify local asset canonical path, MIME, size, and SHA-256 immediately before send. Refuse mutation.
 - For X, upload only manifest-bound local images/video/GIF through the fixed `/2/media/*` surface, checkpoint non-secret media IDs/keys, and reverify bytes before `POST /2/tweets`. Never accept caller-supplied media IDs.
-- For X quotes, require `publish.quote` with an approved `quote_url`; canonicalize that URL into the signed Post text. Do not expose reply automation or the dedicated `quote_tweet_id` field.
+- For X quotes, require `publish.quote` with an approved `quote_url`; canonicalize it and send the official `quote_tweet_id` field. Never embed an X status URL in Post text (unofficial, reconciliation-ambiguous, and billed by X at the higher URL-Post rate). Do not expose reply automation.
 - Keep YouTube resumable session URLs only in canonical 0700/0600 private state; store only an opaque handle/hash in SQLite. Authenticate every session PUT, probe with empty PUT plus `Content-Range: bytes */TOTAL`, and resume from the server `Range`.
 - For Instagram and Threads, persist explicit pre-publish and final-publish stages. A pre-publish container uncertainty may become resumable only after reconciliation; uncertainty after `media_publish`/`threads_publish` starts remains `unknown`.
 - Treat remote media as mutable after prepare. Record URL, scheme, host, expected MIME and optional expected metadata; do not claim byte-level assurance when the provider fetches it.
@@ -126,7 +129,7 @@ python3 skills/sns-api/scripts/sns_api.py prepare \
   --approval-id approval-2026-08-13-001
 ```
 
-For an X URL quote, use `publish.quote`; `prepare` appends the canonical Post URL to the signed text. For X media, provide local assets. Images may include matching `alt_texts`; videos and GIFs use chunked upload and may return `submitted` while X processing continues.
+For an X quote, use `publish.quote`; `prepare` canonicalizes `quote_url` and binds the official `quote_tweet_id` into the signed payload. For X media, provide local assets. Images may include matching `alt_texts`; videos and GIFs use chunked upload and may return `submitted` while X processing continues.
 
 ```bash
 SNS_API_MANIFEST_SIGNING_KEY='<gateway-owned-secret>' \
