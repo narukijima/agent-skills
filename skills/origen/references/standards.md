@@ -34,3 +34,7 @@ C2PA 2.4はasset provenanceをcryptographic binding、signed claim、ingredient/
 - Signature algorithm、certificate、trust list、revocation、timestamp authority: external provider policy
 
 Origen JSONは限定型のdeterministic serializationを使うが、RFC 8785準拠を標榜しない。将来、相互運用が必要になった時点で標準canonicalizationまたはC2PAへ移行し、独自仕様を拡張し続けない。
+
+## Guarantee boundary
+
+Origenは「すべてのAI watermarkを除去する」「AI signalが存在しない」とは主張しない。STANDARDは検証可能なStructural Provenanceだけをclean判定し、Content-Levelを`unknown`として保持する。STRICT ORIGINはC2PAの代替規格ではなく、署名済みHuman source mapping外のcontentをFinalへ入れないlocal publication policyである。

@@ -1,9 +1,9 @@
 ---
 name: origen
-description: AI・外部toolを使うcontent制作でHuman Rootを署名固定し、untrusted assetを検査・Clean Build・検証してpublish-readyにする。投稿やAI生成偽装には使わない。
+description: Human Rootを署名固定し、Structural/Content provenanceを分離してSTANDARDまたはSTRICT ORIGINでpublish-readyを判定する。投稿やAI生成偽装には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  agent-directory.version: "0.1.0"
+  agent-directory.version: "0.2.0"
   agent-directory.status: "active"
   agent-directory.aliases: "Origen,オリジェン,content-origin,content-provenance"
 ---
@@ -31,12 +31,16 @@ External / AI output -> untrusted -> Origen -> publish-ready asset -> Project Pu
 - **Root**: content hash、asset identity、creator/origin identity、外部署名、timestampをsidecar evidenceへ固定する。
 - **Final / Pre-Publish**: untrusted inputを形式別に検査し、trusted toolchainで再構築してから最終hash・派生証拠・`publish_ready`を確定する。
 
+Origenが保証するのは技術的に確立できるprovenance propertyだけである。Structural Cleanはcontainer/metadataの検査結果であり、pixel、waveform、frame、token等のContent-Level信号が存在しないことを意味しない。
+
 このSkillはprovenance domainの入力、変換、安全ゲートだけを扱う。shell、filesystem、network、sandbox、provider execution mode等のGeneric Runtime Permissionを設定・判定しない。Publisher、投稿先、account、公開時刻、文体、KPIは利用側Projectが所有する。
 
 ## 不変条件
 
 - AI・外部serviceのoutputを直接Publisherへ渡さない。Publisherは `prepublish` が成功したassetだけを受け取る。
-- `unknown`、unsupported、署名未検証、hash不一致、lineage不一致は常に `publish_ready = false` として止める。
+- Structural Provenanceの `unknown`、unsupported、署名未検証、hash不一致、lineage不一致は常に `publish_ready = false` として止める。
+- Content-Level Provenanceの `unknown` はSTANDARDだけで許容し、結果へ明記する。STRICT ORIGINではdenyする。
+- `Structural Clean ≠ Content-Level Clean`、`Unknown ≠ Clean`、`Re-encoded ≠ Content signal absent` を維持する。
 - metadata削除だけで成功にしない。内容・containerを検査し、内蔵または明示されたtrusted adapterでClean Buildする。
 - `source_kind` と変換内容を証拠へ残す。AI由来をHuman由来と偽装しない。
 - 秘密鍵をrepository、manifest、command line、Agent-readable fileへ保存しない。署名・検証はKMS、hardware-backed key、外部署名service等へ接続するprovider commandへ委ねる。
@@ -48,6 +52,7 @@ External / AI output -> untrusted -> Origen -> publish-ready asset -> Project Pu
 
 - `references/evidence-schema.md` — evidence、署名、lineage、publish-readyの契約
 - `references/adapters.md` — file type別の内蔵対応とfail-closed条件
+- `references/strict-origin.md` — STRICT ORIGIN source mappingとfile type別の追跡契約
 
 ### Conditional
 
@@ -81,13 +86,34 @@ python3 skills/origen/scripts/origen.py root SOURCE \
 ```bash
 python3 skills/origen/scripts/origen.py finalize UNTRUSTED \
   --output FINAL --evidence FINAL.origen.json \
+  --guarantee-level standard \
   --source-kind ai-output --transformation 'edited from signed root' \
   --root-evidence ROOT.origen.json \
   --sign-command '/trusted/origen-sign-provider' \
   --verify-command '/trusted/origen-verify-provider'
 ```
 
-4. Publisherへ渡す直前に `prepublish` を再実行する。
+### STRICT ORIGINで確定する
+
+1. primary Human Rootと、必要なら別途署名したHuman追加sourceを用意する。
+2. `references/strict-origin.md` のsource mapで、text spanまたはmedia primary sourceと決定的変換を宣言する。
+3. AI生成contentではなくHuman sourceから再構成できることを`finalize`に検証させる。
+
+```bash
+python3 skills/origen/scripts/origen.py finalize PROPOSED_FINAL \
+  --output FINAL --evidence FINAL.origen.json \
+  --guarantee-level strict_origin --source-map SOURCE_MAP.json \
+  --source-kind human-edit --transformation 'select and reorder Human spans' \
+  --root-evidence ROOT.origen.json \
+  --sign-command '/trusted/origen-sign-provider' \
+  --verify-command '/trusted/origen-verify-provider'
+```
+
+STRICT `prepublish` でも同じsource mapとroot evidenceを再提示し、署名済みsummaryとsource bytesを再検証する。
+
+### Publisher直前に再検証する
+
+どちらのmodeもPublisherへ渡す直前に`prepublish`を再実行する。STRICTでは`--source-map`も指定する。
 
 ```bash
 python3 skills/origen/scripts/origen.py prepublish FINAL \
@@ -100,7 +126,7 @@ python3 skills/origen/scripts/origen.py prepublish FINAL \
 
 - `inspect ASSET`: read-only inspection。成功しても公開許可ではない。
 - `root ASSET`: Human Root evidenceを作成する。外部署名必須。
-- `finalize ASSET`: Clean Build後の新規assetとsigned final evidenceを作成する。
+- `finalize ASSET`: `--guarantee-level standard|strict_origin` に従い、Clean Build後の新規assetとsigned final evidenceを作成する。
 - `verify ASSET`: hash、署名、必要なroot/parent linkを検証する。
 - `prepublish ASSET`: `verify` に加え、final evidenceと `publish_ready = true` を必須にするPublisher直前ゲート。
 
@@ -125,7 +151,7 @@ importerが作る `skills/origen/agents/upstream.yaml` のsource repository、co
 
 ## 出力契約
 
-- 成功: stdoutへJSON。`finalize` は新規final assetとsigned sidecarを作り、`publish_ready: true` を返す。
+- 成功: stdoutへJSON。`publish_ready`、`guarantee_level`、`structural_provenance`、`content_provenance`、`root_verified`を返す。
 - 不明: stderrへ `status: rejected` とmachine-readable error code、非0終了。assetをPublisherへ渡さない。
 - 失敗: inputを変更せず非0終了。途中生成物をfinal outputとして残さない。
 
@@ -135,5 +161,7 @@ importerが作る `skills/origen/agents/upstream.yaml` のsource repository、co
 - `inspect` 成功、metadata消失、file open成功だけを `publish_ready` と解釈しない。
 - unsupported形式、unknown binary、壊れたcontainer、未検証signature/lineageを推測で通さない。
 - AI由来、外部tool由来、変換eventをHuman-only provenanceとして表現しない。
+- STANDARDの`content_provenance = unknown`を`verified_clean`へ読み替えない。
+- STRICT ORIGINでsource map外のliteral、AI-generated wording/pixel/waveform/frame、未署名sourceを混ぜない。
 - 秘密鍵、credential、実provider responseを保存・出力・コミットしない。
 - OrigenにSNS API、Project固有のapproval、schedule、公開操作を追加しない。

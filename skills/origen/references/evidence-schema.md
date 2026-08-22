@@ -1,12 +1,23 @@
 # Evidence schema
 
-Origen 0.1はasset本体へ独自metadataを埋め込まず、JSON sidecarをEvidence Planeの正本にする。これはC2PA manifestではない。
+Origen 0.2はasset本体へ独自metadataを埋め込まず、`origen-evidence/2` JSON sidecarをEvidence Planeの正本にする。これはC2PA manifestではない。
+
+## Provenanceの2層
+
+- `structural_provenance`: `clean | detected | unknown`
+  container、metadata、manifest、document property、hidden/active field等、形式adapterが構造として検査できる範囲。
+- `content_provenance`: `verified_clean | detected | unknown`
+  pixel、waveform、frame、token等のcontent dataそのもののorigin状態。
+
+`structural_provenance = clean` は `content_provenance = verified_clean` を意味しない。re-encode、UTF-8保存、metadata除去だけでContent-Level信号の不存在を主張しない。
+
+STRICTの`verified_clean`は「署名済みHuman source mapping外の未知/AI-generated contentをFinalへ追加していない」ことを示す。Human Root自身にsteganographyやwatermarkが絶対にないという万能なforensic保証ではない。
 
 ## 共通構造
 
 ```json
 {
-  "schema_version": "origen-evidence/1",
+  "schema_version": "origen-evidence/2",
   "evidence_type": "human-root | final-asset",
   "created_at": "RFC3339 UTC",
   "asset": {
@@ -25,45 +36,48 @@ Origen 0.1はasset本体へ独自metadataを埋め込まず、JSON sidecarをEvi
 }
 ```
 
-`proof` を除くJSON objectをUTF-8、key sort、余分な空白なしでserializeしたbytesが署名payloadである。値はJSONのstring、integer、boolean、null、array、objectだけに制限する。
+`proof`を除くobjectをUTF-8、sorted key、余分な空白なしでserializeしたbytesが署名payloadである。
+
+## Guarantee decision
+
+Final evidenceは次を必須にする。
+
+```json
+{
+  "guarantee": {
+    "level": "standard | strict_origin",
+    "structural_provenance": "clean",
+    "content_provenance": "unknown | verified_clean",
+    "root_verified": true
+  },
+  "publish_ready": true
+}
+```
+
+- STANDARD: Structural Clean必須。Content-Levelは常に`unknown`として保持する。Human Rootがない場合、`root_verified=false`を許容する。
+- STRICT ORIGIN: Structural Clean、`content_provenance=verified_clean`、`root_verified=true`、signed `source_mapping`をすべて必須にする。
+- adapterがContent-Level signalを`detected`と報告した場合、どちらのmodeでも公開拒否する。
 
 ## Human Root
 
-`evidence_type = human-root` は次を追加する。
+`human-root`はcreator/origin identity、asset hash、inspection、timestampを署名する。root captureは公開承認ではないため`publish_ready=false`である。
 
-- `origin.creator_id`: 人間または組織を指す安定した非秘密identifier
-- `origin.origin_id`: source record、capture、commission等を指す安定したidentifier
-- `event.action = human-root-captured`
-- `publish_ready = false`: root captureは公開承認ではない
+## Final Assetとlineage
 
-署名は「このidentity assertionとasset hashをsignerが固定した」ことを示す。本人性や権利を自動証明するものではないため、Project側のidentity/rights policyは別に維持する。
+Final evidenceは次を追加する。
 
-## Final Asset
+- `input_asset`: finalizeへ入ったbytesのhash
+- `event.source_kind` / `event.transformations`
+- `event.adapter`: 実行adapterと保証
+- `inspection`: final再検査結果
+- `lineage.root_*` / `lineage.parent_*`: Human Rootとpredecessorへのlink
+- `toolchain`: binary/script hash、version、dependency provenance、reproducible install記述
+- STRICTのみ`source_mapping`: pathを除いたsigned Human sourceとoperationのportable summary
 
-`evidence_type = final-asset` は次を追加する。
-
-- `input_asset`: untrusted inputのhash、size、media type
-- `event.source_kind`: `ai-output` / `external-tool` / `human-edit` / `captured-original`
-- `event.transformations`: 空でない処理説明のlist
-- `event.adapter`: 実際にClean Buildしたtoolとversion
-- `inspection`: final assetの再検査結果
-- `lineage.root_*`: signed Human Rootがある場合のasset idとevidence digest
-- `lineage.parent_*`: 直前のsigned predecessorを主張する場合のasset idとevidence digest
-- `publish_ready = true`: finalize時点で全gateが成功した場合だけ設定
-
-Evidence digestは署名を含むsidecar JSONをcanonical serializeしてSHA-256した値である。pathやfilesystem locationをlineageへ埋め込まないので、assetとevidenceを移動してもlinkは維持される。
-
-parent linkはsignerによる派生関係のassertionであり、content similarityを自動証明するものではない。実際にfinalizeへ入ったuntrusted bytesは別の `input_asset` へ固定するため、AI編集後のinputとその上流parentを混同しない。
+Evidence digestは署名を含むsidecar JSONのcanonical SHA-256であり、filesystem pathをlineageへ埋め込まない。
 
 ## Verification
 
-`verify` / `prepublish` は最低限次を再計算する。
+`verify` / `prepublish`はasset hash、proof、root/parent evidence、guarantee decisionを再検証する。STRICTではsource mapを再読込し、全source evidence、source asset bytes、mapping summaryを再検証する。
 
-1. schemaと必須field
-2. asset bytesのSHA-256、size、media type
-3. `proof` を除いたpayloadの外部署名
-4. root/parent evidence digestとasset id
-5. linked evidence自体の署名
-6. `prepublish` では `evidence_type = final-asset` と `publish_ready = true`
-
-root/parent referenceが記録されているのに対応evidenceが渡されない場合、chainは `unknown` なのでfail-closedにする。
+`origen-evidence/1`はread/`verify`互換を維持するが、Structural/Content保証を分離していないため、v2 `prepublish`では`EVIDENCE_UPGRADE_REQUIRED`として拒否する。

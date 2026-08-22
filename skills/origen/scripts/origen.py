@@ -15,8 +15,10 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -26,9 +28,14 @@ import unicodedata
 import zlib
 
 
-VERSION = "0.1.0"
-SCHEMA_VERSION = "origen-evidence/1"
+VERSION = "0.2.0"
+SCHEMA_VERSION = "origen-evidence/2"
+LEGACY_SCHEMA_VERSION = "origen-evidence/1"
+SOURCE_MAP_VERSION = "origen-source-map/1"
 SOURCE_KINDS = ("ai-output", "external-tool", "human-edit", "captured-original")
+GUARANTEE_LEVELS = ("standard", "strict_origin")
+KEY_PROTECTION_MODES = {"kms", "hsm", "hardware-backed", "external-service"}
+ALLOWED_FINAL_PROVENANCE_MARKERS = {"C2PA/JUMBF", "caBX"}
 REQUIRED_ADAPTER_GUARANTEES = {
     "decoded-content",
     "clean-container-rebuild",
@@ -36,8 +43,15 @@ REQUIRED_ADAPTER_GUARANTEES = {
     "provenance-inspected",
     "output-validated",
 }
+STRICT_ADAPTER_GUARANTEES = {
+    "human-origin-inputs-only",
+    "deterministic-transformation",
+    "content-origin-mapped",
+}
+ALLOWED_SEPARATORS = {"", " ", "\n", "\n\n", "\t"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 class OrigenError(Exception):
@@ -105,6 +119,7 @@ EXTENSION_TYPES = {
     ".yml": "application/yaml",
     ".html": "text/html",
     ".htm": "text/html",
+    ".svg": "image/svg+xml",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -131,6 +146,59 @@ def family_for(media_type: str) -> str:
     if media_type == "application/pdf":
         return "pdf"
     return "unknown"
+
+
+def inspect_text_characters(text: str) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    if text.startswith("\ufeff"):
+        findings.append({"code": "TEXT_BOM", "message": "leading UTF-8 BOM will be removed by Clean Build"})
+    seen: set[str] = set()
+    for index, character in enumerate(text):
+        category = unicodedata.category(character)
+        codepoint = f"U+{ord(character):04X}"
+        if category == "Cc" and character not in {"\t", "\n", "\r"} and "TEXT_CONTROL_CHARACTER" not in seen:
+            findings.append({
+                "code": "TEXT_CONTROL_CHARACTER",
+                "message": f"unexpected control character {codepoint} at code-point index {index}",
+            })
+            seen.add("TEXT_CONTROL_CHARACTER")
+        if category == "Cf" and not (index == 0 and character == "\ufeff") and "TEXT_INVISIBLE_CHARACTER" not in seen:
+            findings.append({
+                "code": "TEXT_INVISIBLE_CHARACTER",
+                "message": f"invisible or formatting character {codepoint} at code-point index {index}",
+            })
+            seen.add("TEXT_INVISIBLE_CHARACTER")
+    return findings
+
+
+def normalize_text(text: str, *, reject_hidden: bool = True) -> tuple[str, list[dict[str, str]]]:
+    findings = inspect_text_characters(text)
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if reject_hidden:
+        blocking = [item for item in findings if item["code"] != "TEXT_BOM"]
+        if blocking:
+            raise OrigenError(blocking[0]["code"], blocking[0]["message"])
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return unicodedata.normalize("NFC", text), findings
+
+
+def inspect_active_text(media_type: str, text: str) -> list[dict[str, str]]:
+    if media_type not in {"text/html", "image/svg+xml"}:
+        return []
+    lowered = text.lower()
+    patterns = {
+        "ACTIVE_SCRIPT": ("<script", "javascript:"),
+        "ACTIVE_EMBED": ("<iframe", "<object", "<embed", "<foreignobject"),
+        "ACTIVE_REFRESH": ("http-equiv=\"refresh\"", "http-equiv='refresh'"),
+    }
+    findings = []
+    for code, needles in patterns.items():
+        if any(needle in lowered for needle in needles):
+            findings.append({"code": code, "message": "active HTML/SVG content requires sanitization"})
+    if re.search(r"\son[a-z][a-z0-9_-]*\s*=", lowered):
+        findings.append({"code": "ACTIVE_EVENT_HANDLER", "message": "active HTML/SVG event handler requires sanitization"})
+    return findings
 
 
 def magic_type(prefix: bytes) -> str | None:
@@ -175,7 +243,7 @@ def detect_media_type(path: Path, *, name_hint: str | None = None) -> tuple[str,
         else:
             decoded_as_text = True
             detected = declared if declared in {
-                "text/plain", "text/markdown", "application/json", "application/yaml", "text/html"
+                "text/plain", "text/markdown", "application/json", "application/yaml", "text/html", "image/svg+xml"
             } else "text/plain"
 
     media_type = detected or declared or "application/octet-stream"
@@ -240,12 +308,14 @@ def inspect_png(path: Path) -> dict[str, object]:
             lowered = chunk_data.lower()
             if b"c2pa" in lowered or b"content credential" in lowered or b"xmp" in lowered:
                 provenance.append(kind.decode("ascii"))
+    structural = "detected" if metadata_names or provenance else "clean"
     return {
         "container_valid": True,
         "chunks": names,
         "metadata": sorted(set(metadata_names)),
         "provenance_markers": sorted(set(provenance)),
         "provenance_status": "present" if provenance else "clean",
+        "structural_provenance": structural,
     }
 
 
@@ -264,11 +334,13 @@ def inspect_jpeg(path: Path) -> dict[str, object]:
         markers.append("EXIF")
     if b"photoshop 3.0" in lowered:
         markers.append("IPTC")
+    structural = "detected" if markers or provenance else "unknown"
     return {
         "container_valid": True,
         "metadata": sorted(set(markers)),
         "provenance_markers": sorted(set(provenance)),
         "provenance_status": "present" if provenance else "unknown",
+        "structural_provenance": structural,
     }
 
 
@@ -287,6 +359,7 @@ def inspect_pdf(path: Path) -> dict[str, object]:
         "metadata": markers,
         "provenance_markers": markers,
         "provenance_status": "present" if markers else "unknown",
+        "structural_provenance": "detected" if markers else "unknown",
     }
 
 
@@ -327,18 +400,23 @@ def inspect_asset(path: Path, *, name_hint: str | None = None) -> dict[str, obje
         details = inspect_jpeg(path)
     elif media_type == "application/pdf":
         details = inspect_pdf(path)
-    elif media_type in {"text/plain", "text/markdown", "application/json"}:
+    elif media_type in {"text/plain", "text/markdown", "application/json", "text/html", "image/svg+xml"}:
         try:
             text = path.read_text(encoding="utf-8", errors="strict")
         except UnicodeDecodeError as error:
             raise OrigenError("INVALID_UTF8", "text asset is not strict UTF-8") from error
+        text_findings = inspect_text_characters(text) + inspect_active_text(media_type, text)
+        findings.extend(text_findings)
         if media_type == "application/json":
-            load_strict_json(text)
+            normalized, _ = normalize_text(text, reject_hidden=False)
+            load_strict_json(normalized)
+        structural = "detected" if text_findings else "clean"
         details = {
             "container_valid": True,
             "metadata": [],
             "provenance_markers": [],
             "provenance_status": "clean",
+            "structural_provenance": structural,
         }
     else:
         details = {
@@ -346,9 +424,11 @@ def inspect_asset(path: Path, *, name_hint: str | None = None) -> dict[str, obje
             "metadata": [],
             "provenance_markers": [],
             "provenance_status": "unknown",
+            "structural_provenance": "unknown",
         }
     if any(item["code"] == "MEDIA_TYPE_MISMATCH" for item in findings):
         details["provenance_status"] = "unknown"
+        details["structural_provenance"] = "unknown"
     return {
         "status": "inspected",
         "asset": {
@@ -360,6 +440,7 @@ def inspect_asset(path: Path, *, name_hint: str | None = None) -> dict[str, obje
         },
         "findings": findings,
         **details,
+        "content_provenance": "unknown",
         "publish_ready": False,
     }
 
@@ -472,7 +553,7 @@ def rebuild_text(source: Path, destination: Path, media_type: str) -> dict[str, 
         text = source.read_text(encoding="utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise OrigenError("INVALID_UTF8", "text asset is not strict UTF-8") from error
-    text = unicodedata.normalize("NFC", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text, sanitization_findings = normalize_text(text)
     if media_type == "application/json":
         value = load_strict_json(text)
         output = canonical_bytes(value) + b"\n"
@@ -486,16 +567,73 @@ def rebuild_text(source: Path, destination: Path, media_type: str) -> dict[str, 
         "version": VERSION,
         "media_type": media_type,
         "guarantees": sorted(REQUIRED_ADAPTER_GUARANTEES),
+        "sanitization": [item["code"] for item in sanitization_findings],
     }
 
 
-def run_json_command(command: str, request: dict[str, object], *, operation: str) -> dict[str, object]:
+def resolve_command(command: str, operation: str) -> list[str]:
     try:
         argv = shlex.split(command)
     except ValueError as error:
         raise OrigenError("INVALID_PROVIDER_COMMAND", f"{operation} command cannot be parsed") from error
     if not argv:
         raise OrigenError("INVALID_PROVIDER_COMMAND", f"{operation} command is empty")
+    return argv
+
+
+def command_toolchain(command: str, response: dict[str, object]) -> dict[str, object]:
+    argv = resolve_command(command, "adapter")
+    executable_name = shutil.which(argv[0]) if not Path(argv[0]).is_absolute() else argv[0]
+    if not executable_name:
+        raise OrigenError("PROVIDER_NOT_FOUND", "adapter executable was not found", executable=argv[0])
+    executable = Path(executable_name).resolve()
+    require_regular_file(executable, "adapter executable")
+    executable_digest, _ = hash_file(executable)
+    command_files = []
+    for argument in argv[1:]:
+        candidate = Path(argument)
+        if candidate.exists():
+            candidate = candidate.resolve()
+            require_regular_file(candidate, "adapter command file")
+            digest, _ = hash_file(candidate)
+            command_files.append({"path": str(candidate), "sha256": digest})
+    dependency_provenance = response.get("dependency_provenance")
+    reproducible_install = response.get("reproducible_install")
+    if not isinstance(dependency_provenance, str) or not dependency_provenance:
+        raise OrigenError("INVALID_ADAPTER_RESPONSE", "trusted adapter must report dependency_provenance")
+    if not isinstance(reproducible_install, str) or not reproducible_install:
+        raise OrigenError("INVALID_ADAPTER_RESPONSE", "trusted adapter must report reproducible_install")
+    return {
+        "tool": response["tool"],
+        "version": response["version"],
+        "executable_path": str(executable),
+        "executable_sha256": executable_digest,
+        "command_files": command_files,
+        "dependency_provenance": dependency_provenance,
+        "reproducible_install": reproducible_install,
+    }
+
+
+def builtin_toolchain(adapter: dict[str, object]) -> dict[str, object]:
+    runtime = Path(sys.executable).resolve()
+    runtime_digest, _ = hash_file(runtime)
+    script = Path(__file__).resolve()
+    script_digest, _ = hash_file(script)
+    return {
+        "tool": adapter["tool"],
+        "version": adapter["version"],
+        "executable_path": str(runtime),
+        "runtime_version": platform.python_version(),
+        "executable_sha256": runtime_digest,
+        "origen_script_sha256": script_digest,
+        "hash_implementation": "Python hashlib SHA-256",
+        "dependency_provenance": "Python standard library only",
+        "reproducible_install": f"Python {sys.version_info.major}.{sys.version_info.minor} plus the signed Origen script revision",
+    }
+
+
+def run_json_command(command: str, request: dict[str, object], *, operation: str) -> dict[str, object]:
+    argv = resolve_command(command, operation)
     try:
         completed = subprocess.run(
             argv,
@@ -524,23 +662,40 @@ def run_json_command(command: str, request: dict[str, object], *, operation: str
     return response
 
 
-def sign_evidence(statement: dict[str, object], command: str) -> dict[str, str]:
+def sign_evidence(statement: dict[str, object], command: str) -> dict[str, object]:
     payload = canonical_bytes(statement)
     response = run_json_command(
         command,
         {
             "operation": "sign",
+            "request_scope": "sign-canonical-evidence-only",
             "payload": base64.b64encode(payload).decode("ascii"),
             "payload_sha256": sha256_bytes(payload),
         },
         operation="sign",
     )
-    proof: dict[str, str] = {}
+    proof: dict[str, object] = {}
     for key in ("provider", "key_id", "algorithm", "signature"):
         value = response.get(key)
         if not isinstance(value, str) or not value:
             raise OrigenError("INVALID_PROVIDER_RESPONSE", f"sign provider response is missing {key}")
         proof[key] = value
+    for key in ("provider_version", "key_protection", "dependency_provenance", "reproducible_install"):
+        value = response.get(key)
+        if not isinstance(value, str) or not value:
+            raise OrigenError("INVALID_PROVIDER_RESPONSE", f"sign provider response is missing {key}")
+        proof[key] = value
+    if proof["key_protection"] not in KEY_PROTECTION_MODES:
+        raise OrigenError("UNSAFE_SIGNING_PROVIDER", "signing provider did not attest an isolated key protection mode")
+    if response.get("request_scope") != "sign-canonical-evidence-only":
+        raise OrigenError("INVALID_PROVIDER_RESPONSE", "sign provider did not confirm the restricted request scope")
+    proof["request_scope"] = response["request_scope"]
+    proof["toolchain"] = command_toolchain(command, {
+        "tool": response["provider"],
+        "version": response["provider_version"],
+        "dependency_provenance": response["dependency_provenance"],
+        "reproducible_install": response["reproducible_install"],
+    })
     return proof
 
 
@@ -565,7 +720,10 @@ def verify_signature(evidence: dict[str, object], command: str) -> None:
     )
     if response.get("verified") is not True:
         raise OrigenError("SIGNATURE_INVALID", "evidence signature was not verified")
-    for key in ("provider", "key_id", "algorithm"):
+    identity_keys = ["provider", "key_id", "algorithm"]
+    if evidence.get("schema_version") == SCHEMA_VERSION:
+        identity_keys.extend(("provider_version", "key_protection"))
+    for key in identity_keys:
         if response.get(key) != proof.get(key):
             raise OrigenError("SIGNATURE_IDENTITY_MISMATCH", f"verify provider returned a different {key}")
 
@@ -619,7 +777,8 @@ def validate_asset_record(value: object, context: str) -> dict[str, object]:
 
 
 def validate_evidence_shape(value: dict[str, object]) -> None:
-    if value.get("schema_version") != SCHEMA_VERSION:
+    schema_version = value.get("schema_version")
+    if schema_version not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
         raise OrigenError("UNSUPPORTED_EVIDENCE_SCHEMA", "unsupported Origen evidence schema")
     evidence_type = value.get("evidence_type")
     if evidence_type not in {"human-root", "final-asset"}:
@@ -631,6 +790,13 @@ def validate_evidence_shape(value: dict[str, object]) -> None:
         raise OrigenError("INVALID_EVIDENCE", "proof must be an object")
     for key in ("provider", "key_id", "algorithm", "signature"):
         require_string(proof, key, "proof")
+    if schema_version == SCHEMA_VERSION:
+        for key in ("provider_version", "key_protection", "dependency_provenance", "reproducible_install"):
+            require_string(proof, key, "proof")
+        if proof.get("key_protection") not in KEY_PROTECTION_MODES:
+            raise OrigenError("INVALID_EVIDENCE", "v2 proof uses an untrusted key protection mode")
+        if proof.get("request_scope") != "sign-canonical-evidence-only" or not isinstance(proof.get("toolchain"), dict):
+            raise OrigenError("INVALID_EVIDENCE", "v2 proof is missing restricted scope or signing toolchain")
     if not isinstance(value.get("publish_ready"), bool):
         raise OrigenError("INVALID_EVIDENCE", "publish_ready must be boolean")
     if evidence_type == "human-root":
@@ -666,9 +832,7 @@ def validate_evidence_shape(value: dict[str, object]) -> None:
         if adapter.get("embedded_provenance") not in {"none", "validated-final"}:
             raise OrigenError("INVALID_EVIDENCE", "final embedded provenance policy is invalid")
         inspection = value.get("inspection")
-        if not isinstance(inspection, dict) or inspection.get("provenance_status") not in {
-            "clean", "verified-by-adapter", "validated-final"
-        }:
+        if not isinstance(inspection, dict) or inspection.get("provenance_status") not in {"clean", "verified-by-adapter", "validated-final"}:
             raise OrigenError("INVALID_EVIDENCE", "final provenance inspection was not conclusively verified")
         lineage = value.get("lineage")
         if not isinstance(lineage, dict):
@@ -683,6 +847,32 @@ def validate_evidence_shape(value: dict[str, object]) -> None:
                     raise OrigenError("INVALID_EVIDENCE", f"{label} asset id is invalid")
                 if not isinstance(linked_digest, str) or not SHA256_RE.fullmatch(linked_digest):
                     raise OrigenError("INVALID_EVIDENCE", f"{label} evidence digest is invalid")
+        if schema_version == SCHEMA_VERSION:
+            guarantee = value.get("guarantee")
+            if not isinstance(guarantee, dict):
+                raise OrigenError("INVALID_EVIDENCE", "v2 final evidence requires a guarantee decision")
+            level = guarantee.get("level")
+            structural = guarantee.get("structural_provenance")
+            content = guarantee.get("content_provenance")
+            root_verified = guarantee.get("root_verified")
+            if level not in GUARANTEE_LEVELS or structural != "clean" or not isinstance(root_verified, bool):
+                raise OrigenError("INVALID_EVIDENCE", "final guarantee decision is invalid")
+            if level == "standard" and content != "unknown":
+                raise OrigenError("INVALID_EVIDENCE", "STANDARD must not overclaim content-level provenance")
+            if level == "strict_origin" and (content != "verified_clean" or root_verified is not True):
+                raise OrigenError("INVALID_EVIDENCE", "STRICT ORIGIN requires verified Human content and root")
+            toolchain = value.get("toolchain")
+            if not isinstance(toolchain, dict):
+                raise OrigenError("INVALID_EVIDENCE", "v2 final evidence requires a toolchain record")
+            for key in ("tool", "version", "dependency_provenance", "reproducible_install"):
+                require_string(toolchain, key, "toolchain")
+            if not SHA256_RE.fullmatch(require_string(toolchain, "executable_sha256", "toolchain")):
+                raise OrigenError("INVALID_EVIDENCE", "toolchain executable hash is invalid")
+            if level == "strict_origin":
+                if not isinstance(value.get("source_mapping"), dict):
+                    raise OrigenError("INVALID_EVIDENCE", "STRICT ORIGIN requires a signed source mapping")
+            elif value.get("source_mapping") is not None:
+                raise OrigenError("INVALID_EVIDENCE", "STANDARD evidence must not contain a Strict source mapping")
 
 
 def evidence_digest(evidence: dict[str, object]) -> str:
@@ -695,6 +885,160 @@ def verify_asset_record(path: Path, expected: dict[str, object], *, name_hint: s
     for key in ("id", "sha256", "size", "media_type"):
         if actual[key] != expected[key]:
             raise OrigenError("ASSET_MISMATCH", f"asset {key} does not match signed evidence")
+
+
+def canonical_text_output(text: str) -> bytes:
+    normalized, _ = normalize_text(text)
+    return normalized.rstrip("\n").encode("utf-8") + b"\n"
+
+
+def load_verified_source_map(
+    path: Path,
+    *,
+    verify_command: str,
+    root_evidence: dict[str, object],
+) -> dict[str, object]:
+    require_regular_file(path, "source map")
+    try:
+        raw = load_strict_json(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as error:
+        raise OrigenError("INVALID_SOURCE_MAP", "source map must be strict UTF-8 JSON") from error
+    if not isinstance(raw, dict) or raw.get("schema_version") != SOURCE_MAP_VERSION:
+        raise OrigenError("INVALID_SOURCE_MAP", "unsupported source map schema")
+    kind = raw.get("kind")
+    if kind not in {"text", "media"}:
+        raise OrigenError("INVALID_SOURCE_MAP", "source map kind must be text or media")
+    source_values = raw.get("sources")
+    if not isinstance(source_values, list) or not source_values:
+        raise OrigenError("SOURCE_MAP_INCOMPLETE", "source map requires at least one signed Human source")
+
+    sources: dict[str, dict[str, object]] = {}
+    source_summaries = []
+    base = path.parent
+    for item in source_values:
+        if not isinstance(item, dict):
+            raise OrigenError("INVALID_SOURCE_MAP", "each source map source must be an object")
+        source_id = item.get("source_id")
+        asset_value = item.get("asset")
+        evidence_value = item.get("evidence")
+        if not isinstance(source_id, str) or not SOURCE_ID_RE.fullmatch(source_id) or source_id in sources:
+            raise OrigenError("INVALID_SOURCE_MAP", "source_id must be unique and portable")
+        if not isinstance(asset_value, str) or not isinstance(evidence_value, str):
+            raise OrigenError("INVALID_SOURCE_MAP", "source asset and evidence paths must be strings")
+        source_candidate = base / asset_value if not Path(asset_value).is_absolute() else Path(asset_value)
+        evidence_candidate = base / evidence_value if not Path(evidence_value).is_absolute() else Path(evidence_value)
+        require_regular_file(source_candidate, "source asset")
+        require_regular_file(evidence_candidate, "source evidence")
+        source_path = source_candidate.resolve()
+        evidence_path = evidence_candidate.resolve()
+        evidence = load_evidence(evidence_path)
+        if evidence.get("evidence_type") != "human-root":
+            raise OrigenError("STRICT_SOURCE_NOT_HUMAN", "Strict Origin sources must use human-root evidence", source_id=source_id)
+        verify_signature(evidence, verify_command)
+        expected = validate_asset_record(evidence.get("asset"), f"source[{source_id}].asset")
+        verify_asset_record(source_path, expected)
+        summary = {
+            "source_id": source_id,
+            "asset_id": expected["id"],
+            "evidence_digest": evidence_digest(evidence),
+        }
+        sources[source_id] = {
+            "asset_path": source_path,
+            "evidence_path": evidence_path,
+            "evidence": evidence,
+            "summary": summary,
+        }
+        source_summaries.append(summary)
+
+    root_digest = evidence_digest(root_evidence)
+    root_asset_id = validate_asset_record(root_evidence.get("asset"), "root.asset")["id"]
+    if not any(
+        item["summary"]["evidence_digest"] == root_digest and item["summary"]["asset_id"] == root_asset_id
+        for item in sources.values()
+    ):
+        raise OrigenError("SOURCE_MAP_ROOT_MISSING", "source map must include the supplied primary Human Root")
+
+    summary: dict[str, object] = {
+        "schema_version": SOURCE_MAP_VERSION,
+        "kind": kind,
+        "sources": source_summaries,
+    }
+    assembled: bytes | None = None
+    if kind == "text":
+        operations = raw.get("operations")
+        if not isinstance(operations, list) or not operations:
+            raise OrigenError("SOURCE_MAP_INCOMPLETE", "text source map requires operations")
+        normalized_sources: dict[str, str] = {}
+        for source_id, item in sources.items():
+            media_type = item["evidence"]["asset"]["media_type"]
+            if media_type not in {"text/plain", "text/markdown"}:
+                raise OrigenError("STRICT_TEXT_SOURCE_UNSUPPORTED", "Strict text sources must be plain text or Markdown")
+            try:
+                text = item["asset_path"].read_text(encoding="utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise OrigenError("INVALID_UTF8", "Strict text source is not UTF-8", source_id=source_id) from error
+            normalized_sources[source_id], _ = normalize_text(text)
+        pieces = []
+        normalized_operations = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                raise OrigenError("INVALID_SOURCE_MAP", "source map operation must be an object")
+            op = operation.get("op")
+            if op == "slice":
+                source_id = operation.get("source_id")
+                start = operation.get("start")
+                end = operation.get("end")
+                if source_id not in normalized_sources or not isinstance(start, int) or not isinstance(end, int):
+                    raise OrigenError("INVALID_SOURCE_MAP", "slice requires a known source_id and integer bounds")
+                source_text = normalized_sources[source_id]
+                if start < 0 or end < start or end > len(source_text):
+                    raise OrigenError("SOURCE_MAP_RANGE_INVALID", "slice bounds are outside the normalized Human source")
+                pieces.append(source_text[start:end])
+                normalized_operations.append({"op": "slice", "source_id": source_id, "start": start, "end": end})
+            elif op == "separator":
+                value = operation.get("value")
+                if value not in ALLOWED_SEPARATORS:
+                    raise OrigenError("STRICT_LITERAL_FORBIDDEN", "Strict text permits only fixed whitespace separators")
+                pieces.append(value)
+                normalized_operations.append({"op": "separator", "value": value})
+            else:
+                raise OrigenError("INVALID_SOURCE_MAP", "unsupported source map operation", operation=op)
+        assembled = canonical_text_output("".join(pieces))
+        summary["operations"] = normalized_operations
+    else:
+        primary_source_id = raw.get("primary_source_id")
+        transformation = raw.get("transformation")
+        if primary_source_id not in sources:
+            raise OrigenError("SOURCE_MAP_INCOMPLETE", "media source map requires a known primary_source_id")
+        if not isinstance(transformation, dict) or transformation.get("op") not in {"identity", "trusted-deterministic"}:
+            raise OrigenError("INVALID_SOURCE_MAP", "media transformation must be identity or trusted-deterministic")
+        canonical_bytes(transformation)
+        summary["primary_source_id"] = primary_source_id
+        summary["transformation"] = transformation
+
+    summary["mapping_digest"] = sha256_bytes(canonical_bytes(summary))
+    return {
+        "kind": kind,
+        "sources": sources,
+        "summary": summary,
+        "assembled": assembled,
+        "primary_source_id": raw.get("primary_source_id"),
+        "transformation": raw.get("transformation"),
+    }
+
+
+def verify_signed_source_map(
+    path: Path | None,
+    *,
+    expected: object,
+    verify_command: str,
+    root_evidence: dict[str, object] | None,
+) -> None:
+    if path is None or root_evidence is None:
+        raise OrigenError("SOURCE_MAP_REQUIRED", "Strict Origin verification requires the source map and Human Root")
+    actual = load_verified_source_map(path, verify_command=verify_command, root_evidence=root_evidence)
+    if not isinstance(expected, dict) or canonical_bytes(actual["summary"]) != canonical_bytes(expected):
+        raise OrigenError("SOURCE_MAP_MISMATCH", "source map does not match signed final evidence")
 
 
 def verify_linked_evidence(
@@ -757,6 +1101,8 @@ def command_root(args: argparse.Namespace) -> dict[str, object]:
         "inspection": {
             "container_valid": inspection["container_valid"],
             "provenance_status": inspection["provenance_status"],
+            "structural_provenance": inspection["structural_provenance"],
+            "content_provenance": "unknown",
             "findings": inspection["findings"],
         },
         "publish_ready": False,
@@ -785,16 +1131,34 @@ def external_rebuild(
     destination: Path,
     inspection: dict[str, object],
     command: str,
+    *,
+    guarantee_level: str,
+    source_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    request: dict[str, object] = {
+        "operation": "rebuild",
+        "input_path": str(source),
+        "output_path": str(destination),
+        "input_media_type": inspection["asset"]["media_type"],
+        "input_family": inspection["asset"]["family"],
+        "guarantee_level": guarantee_level,
+    }
+    if source_context is not None:
+        request["strict_origin"] = {
+            "verified_sources": [
+                {
+                    "source_id": source_id,
+                    "asset_path": str(item["asset_path"]),
+                    "asset_id": item["summary"]["asset_id"],
+                    "evidence_digest": item["summary"]["evidence_digest"],
+                }
+                for source_id, item in source_context["sources"].items()
+            ],
+            "transformation": source_context["transformation"],
+        }
     response = run_json_command(
         command,
-        {
-            "operation": "rebuild",
-            "input_path": str(source),
-            "output_path": str(destination),
-            "input_media_type": inspection["asset"]["media_type"],
-            "input_family": inspection["asset"]["family"],
-        },
+        request,
         operation="adapter",
     )
     if response.get("status") != "rebuilt":
@@ -806,9 +1170,12 @@ def external_rebuild(
     if not isinstance(guarantees, list) or any(not isinstance(item, str) for item in guarantees):
         raise OrigenError("INVALID_ADAPTER_RESPONSE", "trusted adapter guarantees must be a string list")
     missing = sorted(REQUIRED_ADAPTER_GUARANTEES - set(guarantees))
+    if guarantee_level == "strict_origin":
+        missing.extend(sorted(STRICT_ADAPTER_GUARANTEES - set(guarantees)))
     if missing:
         raise OrigenError("ADAPTER_GUARANTEE_MISSING", "trusted adapter omitted required guarantees", missing=missing)
     require_regular_file(destination, "adapter output")
+    response["toolchain"] = command_toolchain(command, response)
     return response
 
 
@@ -825,9 +1192,13 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
     if not args.transformation or any(not item.strip() for item in args.transformation):
         raise OrigenError("TRANSFORMATION_REQUIRED", "at least one non-empty transformation is required")
 
+    guarantee_level = args.guarantee_level
+    if guarantee_level == "standard" and args.source_map:
+        raise OrigenError("SOURCE_MAP_NOT_ALLOWED", "source mapping is reserved for Strict Origin")
     input_inspection = inspect_asset(source)
-    if input_inspection["findings"]:
-        raise OrigenError("INPUT_AMBIGUOUS", "input media type is ambiguous", findings=input_inspection["findings"])
+    ambiguous_findings = [item for item in input_inspection["findings"] if item["code"].startswith("MEDIA_TYPE_")]
+    if ambiguous_findings:
+        raise OrigenError("INPUT_AMBIGUOUS", "input media type is ambiguous", findings=ambiguous_findings)
     if input_inspection["asset"]["family"] == "unknown":
         raise OrigenError("UNSUPPORTED_FORMAT", "unknown binary input cannot be finalized")
 
@@ -854,42 +1225,148 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
             if parent_lineage.get("root_asset_id") != root["asset"]["id"]:
                 raise OrigenError("LINEAGE_MISMATCH", "parent and supplied root asset disagree")
 
+    source_context: dict[str, object] | None = None
+    if guarantee_level == "strict_origin":
+        if root is None or not args.verify_command:
+            raise OrigenError("STRICT_ROOT_REQUIRED", "Strict Origin requires a verified signed Human Root")
+        if args.source_kind not in {"human-edit", "captured-original"}:
+            raise OrigenError("STRICT_AI_CONTENT_FORBIDDEN", "Strict Origin cannot accept AI/external generated final content")
+        if not args.source_map:
+            raise OrigenError("SOURCE_MAP_REQUIRED", "Strict Origin requires a complete source map")
+        source_context = load_verified_source_map(
+            Path(args.source_map).resolve(),
+            verify_command=args.verify_command,
+            root_evidence=root,
+        )
+
     output.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="origen-finalize-") as temporary_dir:
         temporary_output = Path(temporary_dir) / ("final" + output.suffix.lower())
         media_type = input_inspection["asset"]["media_type"]
-        adapter = builtin_rebuild(source, temporary_output, media_type)
-        if adapter is None:
-            if not args.adapter_command:
-                raise OrigenError(
-                    "TRUSTED_ADAPTER_REQUIRED",
-                    "format has no built-in Clean Build adapter",
-                    media_type=media_type,
+        if guarantee_level == "strict_origin" and source_context is not None:
+            if source_context["kind"] == "text":
+                if media_type not in {"text/plain", "text/markdown"}:
+                    raise OrigenError("STRICT_TEXT_TYPE_UNSUPPORTED", "Strict text finalization supports plain text and Markdown")
+                try:
+                    proposed_text = source.read_text(encoding="utf-8", errors="strict")
+                except UnicodeDecodeError as error:
+                    raise OrigenError("INVALID_UTF8", "Strict final text must be UTF-8") from error
+                if canonical_text_output(proposed_text) != source_context["assembled"]:
+                    raise OrigenError(
+                        "STRICT_CONTENT_MISMATCH",
+                        "final text contains content not produced by the signed Human source mapping",
+                    )
+                temporary_output.write_bytes(source_context["assembled"])
+                adapter = {
+                    "tool": "origen/builtin-strict-text-compose",
+                    "version": VERSION,
+                    "media_type": media_type,
+                    "guarantees": sorted(REQUIRED_ADAPTER_GUARANTEES | STRICT_ADAPTER_GUARANTEES),
+                    "embedded_provenance": "none",
+                }
+            else:
+                primary = source_context["sources"][source_context["primary_source_id"]]
+                if input_inspection["asset"]["id"] != primary["summary"]["asset_id"]:
+                    raise OrigenError(
+                        "STRICT_CONTENT_MISMATCH",
+                        "Strict media input must be the signed Human primary source, not generated pixel/waveform/frame data",
+                    )
+                transformation_op = source_context["transformation"]["op"]
+                if transformation_op == "identity":
+                    adapter = builtin_rebuild(source, temporary_output, media_type)
+                    if adapter is None:
+                        if not args.adapter_command:
+                            raise OrigenError(
+                                "TRUSTED_ADAPTER_REQUIRED",
+                                "Strict identity rebuild has no built-in adapter for this media type",
+                                media_type=media_type,
+                            )
+                        adapter = external_rebuild(
+                            source,
+                            temporary_output,
+                            input_inspection,
+                            args.adapter_command,
+                            guarantee_level=guarantee_level,
+                            source_context=source_context,
+                        )
+                    else:
+                        adapter["guarantees"] = sorted(set(adapter["guarantees"]) | STRICT_ADAPTER_GUARANTEES)
+                else:
+                    if not args.adapter_command:
+                        raise OrigenError("TRUSTED_ADAPTER_REQUIRED", "Strict deterministic media transformation requires an adapter")
+                    adapter = external_rebuild(
+                        source,
+                        temporary_output,
+                        input_inspection,
+                        args.adapter_command,
+                        guarantee_level=guarantee_level,
+                        source_context=source_context,
+                    )
+        else:
+            adapter = builtin_rebuild(source, temporary_output, media_type)
+            if adapter is None:
+                if not args.adapter_command:
+                    raise OrigenError(
+                        "TRUSTED_ADAPTER_REQUIRED",
+                        "format has no built-in Clean Build adapter",
+                        media_type=media_type,
+                    )
+                adapter = external_rebuild(
+                    source,
+                    temporary_output,
+                    input_inspection,
+                    args.adapter_command,
+                    guarantee_level=guarantee_level,
                 )
-            adapter = external_rebuild(source, temporary_output, input_inspection, args.adapter_command)
+
+        if "toolchain" not in adapter:
+            adapter["toolchain"] = builtin_toolchain(adapter)
 
         final_inspection = inspect_asset(temporary_output, name_hint=output.name)
         if final_inspection["findings"]:
-            raise OrigenError("FINAL_VALIDATION_FAILED", "final media type is ambiguous", findings=final_inspection["findings"])
+            raise OrigenError("FINAL_VALIDATION_FAILED", "final asset retains prohibited or ambiguous structure", findings=final_inspection["findings"])
         if final_inspection["asset"]["family"] != input_inspection["asset"]["family"]:
             raise OrigenError("FINAL_FAMILY_MISMATCH", "trusted rebuild changed the media family")
         if final_inspection["asset"]["media_type"] != adapter["media_type"]:
             raise OrigenError("FINAL_MEDIA_TYPE_MISMATCH", "adapter media type does not match final bytes")
         provenance_status = final_inspection["provenance_status"]
+        structural_provenance = final_inspection["structural_provenance"]
         markers = final_inspection["provenance_markers"]
+        metadata = final_inspection["metadata"]
         embedded_policy = adapter.get("embedded_provenance", "none")
         if embedded_policy not in {"none", "validated-final"}:
             raise OrigenError("INVALID_ADAPTER_RESPONSE", "trusted adapter returned an invalid embedded provenance policy")
         if markers and embedded_policy != "validated-final":
             raise OrigenError("FINAL_PROVENANCE_PRESENT", "final asset contains embedded provenance not validated for this final")
         if markers and embedded_policy == "validated-final":
+            unexpected_markers = sorted(set(markers) - ALLOWED_FINAL_PROVENANCE_MARKERS)
+            unexpected_metadata = sorted(set(metadata) - {"C2PA/JUMBF", "caBX"})
+            if unexpected_markers or unexpected_metadata:
+                raise OrigenError(
+                    "FINAL_STRUCTURAL_PROVENANCE_DETECTED",
+                    "validated-final policy cannot authorize unrelated metadata or provenance",
+                    markers=unexpected_markers,
+                    metadata=unexpected_metadata,
+                )
             provenance_status = "validated-final"
-        if provenance_status == "unknown":
+            structural_provenance = "clean"
+        if structural_provenance == "detected":
+            raise OrigenError("FINAL_STRUCTURAL_PROVENANCE_DETECTED", "prohibited structural provenance remains after rebuild")
+        if structural_provenance == "unknown":
             if args.adapter_command and "provenance-inspected" in adapter["guarantees"]:
                 provenance_status = "verified-by-adapter"
+                structural_provenance = "clean"
             else:
-                raise OrigenError("FINAL_PROVENANCE_UNKNOWN", "final provenance state is unknown")
+                raise OrigenError("FINAL_STRUCTURAL_PROVENANCE_UNKNOWN", "final structural provenance state is unknown")
+        if structural_provenance != "clean":
+            raise OrigenError("FINAL_STRUCTURAL_PROVENANCE_UNKNOWN", "final structural provenance is not clean")
+        reported_content = adapter.get("content_provenance", "unknown")
+        if reported_content == "detected":
+            raise OrigenError("CONTENT_PROVENANCE_DETECTED", "trusted adapter detected content-level provenance")
+        if reported_content not in {"unknown", "verified_clean"}:
+            raise OrigenError("INVALID_ADAPTER_RESPONSE", "invalid content_provenance status")
+        content_provenance = "verified_clean" if guarantee_level == "strict_origin" else "unknown"
 
         final_asset = dict(final_inspection["asset"])
         final_asset.pop("family", None)
@@ -919,8 +1396,10 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
             "inspection": {
                 "container_valid": final_inspection["container_valid"],
                 "provenance_status": provenance_status,
+                "structural_provenance": structural_provenance,
+                "content_provenance": content_provenance,
                 "provenance_markers": markers,
-                "metadata": final_inspection["metadata"],
+                "metadata": metadata,
             },
             "lineage": {
                 "root_asset_id": root_asset["id"] if root_asset else None,
@@ -928,8 +1407,17 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
                 "parent_asset_id": parent_asset["id"] if parent_asset else None,
                 "parent_evidence_digest": evidence_digest(parent) if parent else None,
             },
+            "guarantee": {
+                "level": guarantee_level,
+                "structural_provenance": structural_provenance,
+                "content_provenance": content_provenance,
+                "root_verified": root is not None,
+            },
+            "toolchain": adapter["toolchain"],
             "publish_ready": True,
         }
+        if source_context is not None:
+            statement["source_mapping"] = source_context["summary"]
         evidence = {**statement, "proof": sign_evidence(statement, args.sign_command)}
 
         temporary_evidence = Path(temporary_dir) / "final.origen.json"
@@ -951,6 +1439,10 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
         "asset_id": final_asset["id"],
         "evidence": str(evidence_path),
         "evidence_digest": evidence_digest(evidence),
+        "guarantee_level": guarantee_level,
+        "structural_provenance": structural_provenance,
+        "content_provenance": content_provenance,
+        "root_verified": root is not None,
         "publish_ready": True,
     }
 
@@ -963,6 +1455,7 @@ def verify_common(args: argparse.Namespace, *, prepublish: bool) -> dict[str, ob
     verify_asset_record(asset, expected_asset)
 
     chain_verified = True
+    root: dict[str, object] | None = None
     if evidence.get("evidence_type") == "final-asset":
         lineage = evidence["lineage"]
         root = verify_linked_evidence(
@@ -990,18 +1483,53 @@ def verify_common(args: argparse.Namespace, *, prepublish: bool) -> dict[str, ob
                     raise OrigenError("LINEAGE_MISMATCH", "linked parent and root evidence disagree")
                 if parent_lineage.get("root_asset_id") != root["asset"]["id"]:
                     raise OrigenError("LINEAGE_MISMATCH", "linked parent and root asset disagree")
+        if evidence.get("schema_version") == SCHEMA_VERSION:
+            guarantee = evidence["guarantee"]
+            if guarantee["root_verified"] != (root is not None):
+                raise OrigenError("ROOT_VERIFICATION_MISMATCH", "signed root verification status does not match supplied chain")
+            if guarantee["level"] == "strict_origin":
+                verify_signed_source_map(
+                    Path(args.source_map).resolve() if args.source_map else None,
+                    expected=evidence.get("source_mapping"),
+                    verify_command=args.verify_command,
+                    root_evidence=root,
+                )
+            elif args.source_map:
+                raise OrigenError("UNEXPECTED_SOURCE_MAP", "STANDARD evidence does not accept a Strict source map")
     elif args.root_evidence or args.parent_evidence:
         raise OrigenError("UNEXPECTED_LINEAGE", "human-root verification does not accept linked evidence")
 
     if prepublish:
         if evidence.get("evidence_type") != "final-asset" or evidence.get("publish_ready") is not True:
             raise OrigenError("NOT_PUBLISH_READY", "prepublish requires signed final-asset evidence")
+        if evidence.get("schema_version") != SCHEMA_VERSION:
+            raise OrigenError("EVIDENCE_UPGRADE_REQUIRED", "legacy final evidence cannot satisfy the v2 guarantee gate")
+    if evidence.get("evidence_type") == "final-asset" and evidence.get("schema_version") == SCHEMA_VERSION:
+        guarantee = evidence["guarantee"]
+        guarantee_level = guarantee["level"]
+        structural_provenance = guarantee["structural_provenance"]
+        content_provenance = guarantee["content_provenance"]
+        root_verified = guarantee["root_verified"]
+    elif evidence.get("evidence_type") == "human-root":
+        guarantee_level = None
+        structural_provenance = evidence.get("inspection", {}).get("structural_provenance", "unknown")
+        content_provenance = "unknown"
+        root_verified = True
+    else:
+        guarantee_level = "legacy_standard"
+        structural_provenance = "unknown"
+        content_provenance = "unknown"
+        root_verified = root is not None
     return {
         "status": "publish-ready" if prepublish else "verified",
         "asset_id": expected_asset["id"],
         "evidence_type": evidence["evidence_type"],
         "evidence_digest": evidence_digest(evidence),
         "chain_verified": chain_verified,
+        "guarantee_level": guarantee_level,
+        "structural_provenance": structural_provenance,
+        "content_provenance": content_provenance,
+        "root_verified": root_verified,
         "publish_ready": bool(evidence.get("publish_ready")),
     }
 
@@ -1029,6 +1557,8 @@ def parser() -> argparse.ArgumentParser:
     finalize.add_argument("--output", required=True)
     finalize.add_argument("--evidence", required=True)
     finalize.add_argument("--source-kind", required=True, choices=SOURCE_KINDS)
+    finalize.add_argument("--guarantee-level", choices=GUARANTEE_LEVELS, default="standard")
+    finalize.add_argument("--source-map")
     finalize.add_argument("--transformation", action="append", required=True)
     finalize.add_argument("--root-evidence")
     finalize.add_argument("--parent-evidence")
@@ -1047,6 +1577,7 @@ def parser() -> argparse.ArgumentParser:
         verify.add_argument("--evidence", required=True)
         verify.add_argument("--root-evidence")
         verify.add_argument("--parent-evidence")
+        verify.add_argument("--source-map")
         verify.add_argument("--verify-command", required=True)
         verify.set_defaults(handler=lambda args, mode=prepublish: verify_common(args, prepublish=mode))
     return root
@@ -1060,6 +1591,9 @@ def main(argv: list[str] | None = None) -> int:
         payload: dict[str, object] = {
             "status": "rejected",
             "publish_ready": False,
+            "guarantee_level": getattr(args, "guarantee_level", None),
+            "structural_provenance": "unknown",
+            "content_provenance": "unknown",
             "error": {"code": error.code, "message": error.message, **error.details},
         }
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
@@ -1068,6 +1602,9 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "status": "rejected",
             "publish_ready": False,
+            "guarantee_level": getattr(args, "guarantee_level", None),
+            "structural_provenance": "unknown",
+            "content_provenance": "unknown",
             "error": {"code": "IO_ERROR", "message": str(error)},
         }
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)

@@ -1,45 +1,55 @@
 # File type adapters
 
-Origen 0.1は共通CLIの内部でMIME/containerを検出し、形式別adapterへrouteする。拡張子だけでは判定しない。
+Origenはmagic/containerとMIMEから形式別adapterへrouteし、inputをin-place変更せず新規final assetを作る。
 
 ## 内蔵Clean Build
 
-| family | 対応 | 処理 |
+| family | STANDARD | STRICT ORIGIN |
 | --- | --- | --- |
-| plain text / Markdown | built-in | strict UTF-8 decode、Unicode NFC、LF改行、末尾改行1つで新規bytesを生成 |
-| JSON | built-in | duplicate key / NaNをrejectし、UTF-8・sorted key・compact JSONとして再生成 |
-| PNG | built-in | signature/chunk/CRC/critical chunk/IDAT zlib/scanlineを検証し、許可した表示用chunkと再圧縮IDATから新containerを生成 |
+| plain text / Markdown | strict UTF-8、BOM除去、NFC、LF、不可視/control文字拒否 | signed Human sourceのsliceと固定whitespace separatorだけで再構成 |
+| JSON | duplicate key / NaN拒否、文字policy、sorted compact JSON再生成 | v0.2内蔵source mappingは未対応。将来schema-aware mappingが必要 |
+| PNG | chunk/CRC/IDAT zlib/scanline検証、新container生成 | signed Human PNGのidentity/container rebuild。生成pixelの入力は拒否 |
 
-PNGはnon-interlaced、標準color type / bit depthだけを受け入れる。text、XMP、EXIF、time、C2PA/JUMBF等のancillary chunkを継承しない。ICC profileや未知critical chunkなど、安全に意味を保持できない構造はrejectする。
+Textのleading BOMは除去する。embedded BOM、Unicode category `Cf`、TAB/LF/CR以外のcontrol characterはrejectする。これはhidden/invisible structureへのpolicyであり、統計的・token-selection watermarkの除去保証ではない。
 
-## 外部trusted adapterが必要
+## HTML / SVG
 
-| family | 期待するtoolchain例 | Origen 0.1の既定動作 |
-| --- | --- | --- |
-| HTML | parser / sanitizer / serializer + active-content policy | reject |
-| YAML | schema-aware safe parser + canonical emitter | reject |
-| JPEG / WebP / other image | full decode + trusted encoder + metadata/provenance inspection | reject |
-| audio | decoder + trusted re-encoder + stream/metadata validation | reject |
-| video | decoder/remux/transcode + stream/container validation | reject |
-| PDF | parser + supported trusted rebuild + render/structure validation | reject |
-| unknown binary | format-specific inspector and rebuild guaranteeがない | reject |
+内蔵inspectionはscript、event handler、iframe/object/embed/foreignObject、JavaScript URL、refresh等を検出する。安全なparser/sanitizer/serializerを内蔵していないため、finalizeにはtrusted external adapterが必要である。検出patternがないことだけで安全とは判定せず、adapterの`provenance-inspected`保証とfinal再検査を両方要求する。
 
-`ffmpeg`、ImageMagick、Pillow、qpdf、Ghostscript等がPATHにあるだけでは信頼済みにならない。Projectがversion、option、format policy、output validationを固定したadapter commandを明示する。
+## Media / documents
 
-## Inspectionとfinalizationの違い
+JPEG、WebP、audio、video、PDF、その他documentは次を実行するtrusted adapterが必要である。
 
-`inspect` はknown metadata/provenance、MIME mismatch、container異常を報告するread-only操作であり、公開許可ではない。`provenance_status = clean` も「検出できる埋め込みがない」ことだけを示す。
+```text
+decode / parse
+→ trusted deterministic processing
+→ trusted encoder / generator
+→ new container
+→ output validation
+→ Origen final inspection
+```
 
-`finalize` は必ず新しいoutputを作り、input fileをin-place変更しない。外部adapterを使う場合も、Origenがoutputを再検査・hashしてsigned evidenceへ固定する。
+metadata stripやremux成功だけをClean Buildとしない。STANDARDではpixel/waveform/frame/token levelの信号を検証できないため`content_provenance=unknown`を返す。
+
+STRICTではadapter inputをsource mapで検証したsigned Human assetだけに限定し、追加で次の保証を要求する。
+
+- `human-origin-inputs-only`
+- `deterministic-transformation`
+- `content-origin-mapped`
+
+AI-generated pixel、waveform、frame、PDF bytesをHuman sourceとして渡した場合はhash/source mapping不一致で拒否する。
+
+## Structural inspection
+
+Structural statusは次の意味を持つ。
+
+- `clean`: prohibited metadata/manifest/active fieldがないことをadapter範囲でfinal再確認した
+- `detected`: prohibited structural propertyを検出した
+- `unknown`: format/inspectorでは保証できない
+
+外部adapterの再構築後もknown marker、metadata、active contentが残れば拒否する。C2PA等をfinal用に正しく再発行した場合だけ`embedded_provenance=validated-final`を許可し、AI provider由来manifestの黙示継承には使わない。
 
 ## Fail-closed
 
-次は `publish_ready = false` としてrejectする。
-
-- magic bytesと宣言/拡張子が矛盾する
-- invalid UTF-8、duplicate JSON key、NaN/Infinity
-- truncated/corrupt PNG、CRC error、interlaced PNG、unknown critical chunk、unsupported color profile
-- known provenance containerがfinal outputに残る
-- external adapterが必須guaranteeを返さない
-- input/outputのfamilyが意図せず変わる
-- format、provenance状態、再構築結果のいずれかがunknown
+- STANDARD: Structural `detected/unknown`、malformed/unsupported、rebuild/verification failure、broken signature/lineageを拒否。Content `unknown`だけは許容する。
+- STRICT ORIGIN: 上記に加え、root/source map不足、未知span/frame/sample、AI/external generated content、Human source hash不一致、決定性保証不足を拒否する。

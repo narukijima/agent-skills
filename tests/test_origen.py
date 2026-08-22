@@ -36,6 +36,11 @@ if request["operation"] == "sign":
         "key_id": "test-key-1",
         "algorithm": "test-sha256",
         "signature": signature,
+        "provider_version": "test-1",
+        "key_protection": "external-service",
+        "dependency_provenance": "generated test fixture",
+        "reproducible_install": "python stdlib fixture",
+        "request_scope": request.get("request_scope"),
     }
 elif request["operation"] == "verify":
     response = {
@@ -43,6 +48,8 @@ elif request["operation"] == "verify":
         "provider": "origen-test-provider",
         "key_id": "test-key-1",
         "algorithm": "test-sha256",
+        "provider_version": "test-1",
+        "key_protection": "external-service",
     }
 else:
     raise SystemExit(2)
@@ -72,6 +79,30 @@ json.dump(response, sys.stdout)
         stream = completed.stdout if expected == 0 else completed.stderr
         return json.loads(stream)
 
+    def resign_evidence(self, record, *, legacy=False):
+        statement = {key: value for key, value in record.items() if key != "proof"}
+        payload = json.dumps(
+            statement, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        request = {
+            "operation": "sign",
+            "request_scope": "sign-canonical-evidence-only",
+            "payload": base64.b64encode(payload).decode("ascii"),
+            "payload_sha256": "unused-by-test-provider",
+        }
+        completed = subprocess.run(
+            [sys.executable, str(self.provider)],
+            input=json.dumps(request),
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        proof = json.loads(completed.stdout)
+        if legacy:
+            proof = {key: proof[key] for key in ("provider", "key_id", "algorithm", "signature")}
+        record["proof"] = proof
+        return record
+
     def capture_root(self, asset):
         evidence = self.root / f"{asset.name}.root.json"
         result = self.run_origen(
@@ -90,7 +121,7 @@ json.dump(response, sys.stdout)
         )
         return evidence, result
 
-    def make_jpeg_adapter(self, *, missing_guarantee=None):
+    def make_jpeg_adapter(self, *, missing_guarantee=None, fail=False, strict=False, content_status="unknown"):
         adapter = self.root / f"adapter-{missing_guarantee or 'complete'}.py"
         guarantees = [
             "decoded-content",
@@ -99,6 +130,12 @@ json.dump(response, sys.stdout)
             "provenance-inspected",
             "output-validated",
         ]
+        if strict:
+            guarantees.extend((
+                "human-origin-inputs-only",
+                "deterministic-transformation",
+                "content-origin-mapped",
+            ))
         if missing_guarantee:
             guarantees.remove(missing_guarantee)
         adapter.write_text(
@@ -107,6 +144,7 @@ from pathlib import Path
 import sys
 
 request = json.load(sys.stdin)
+FAIL
 Path(request["output_path"]).write_bytes(b"\\xff\\xd8\\xff\\xd9")
 json.dump({
     "status": "rebuilt",
@@ -114,11 +152,34 @@ json.dump({
     "version": "1.0.0",
     "media_type": "image/jpeg",
     "guarantees": GUARANTEES,
+    "content_provenance": CONTENT_STATUS,
+    "dependency_provenance": "test fixture source",
+    "reproducible_install": "python stdlib test fixture",
 }, sys.stdout)
-""".replace("GUARANTEES", repr(guarantees)),
+""".replace("GUARANTEES", repr(guarantees)).replace("CONTENT_STATUS", repr(content_status)).replace(
+                "FAIL", "raise SystemExit(9)" if fail else ""
+            ),
             encoding="utf-8",
         )
         return f"{sys.executable} {adapter}"
+
+    def write_source_map(self, path, *, source, evidence, kind="text", operations=None, transformation=None):
+        value = {
+            "schema_version": "origen-source-map/1",
+            "kind": kind,
+            "sources": [{
+                "source_id": "root",
+                "asset": str(source),
+                "evidence": str(evidence),
+            }],
+        }
+        if kind == "text":
+            value["operations"] = operations or []
+        else:
+            value["primary_source_id"] = "root"
+            value["transformation"] = transformation or {"op": "identity"}
+        path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        return path
 
     @staticmethod
     def png_chunk(kind, data):
@@ -129,10 +190,10 @@ json.dump({
             + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
         )
 
-    def make_png(self, path, extra_chunks=()):
+    def make_png(self, path, extra_chunks=(), pixel=0x7F):
         signature = b"\x89PNG\r\n\x1a\n"
         ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
-        raw = b"\x00\x7f"
+        raw = b"\x00" + bytes([pixel])
         chunks = [self.png_chunk(b"IHDR", ihdr)]
         chunks.extend(self.png_chunk(kind, data) for kind, data in extra_chunks)
         chunks.extend((self.png_chunk(b"IDAT", zlib.compress(raw)), self.png_chunk(b"IEND", b"")))
@@ -178,6 +239,32 @@ json.dump({
         )
         self.assertEqual(rejected["error"]["code"], "IDENTITY_REQUIRED")
 
+    def test_signing_provider_with_agent_readable_key_mode_is_rejected(self):
+        unsafe_provider = self.root / "unsafe-provider.py"
+        unsafe_provider.write_text(
+            self.provider.read_text(encoding="utf-8").replace(
+                '"key_protection": "external-service"',
+                '"key_protection": "agent-readable-file"',
+            ),
+            encoding="utf-8",
+        )
+        asset = self.root / "human.txt"
+        asset.write_text("human\n", encoding="utf-8")
+        rejected = self.run_origen(
+            "root",
+            asset,
+            "--creator-id",
+            "creator:test",
+            "--origin-id",
+            "origin:test",
+            "--sign-command",
+            f"{sys.executable} {unsafe_provider}",
+            "--evidence",
+            self.root / "root.json",
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "UNSAFE_SIGNING_PROVIDER")
+
     def test_json_finalization_is_canonical_and_links_signed_root(self):
         human = self.root / "human.txt"
         human.write_text("human\n", encoding="utf-8")
@@ -208,6 +295,9 @@ json.dump({
             "2026-08-23T01:00:00Z",
         )
         self.assertTrue(result["publish_ready"])
+        self.assertEqual(result["guarantee_level"], "standard")
+        self.assertEqual(result["structural_provenance"], "clean")
+        self.assertEqual(result["content_provenance"], "unknown")
         self.assertEqual(final.read_text(encoding="utf-8"), '{"a":"é","z":1}\n')
         record = json.loads(evidence.read_text(encoding="utf-8"))
         self.assertEqual(record["event"]["source_kind"], "ai-output")
@@ -420,6 +510,8 @@ json.dump({
 
         inspection = self.run_origen("inspect", final)
         self.assertEqual(inspection["provenance_status"], "clean")
+        self.assertEqual(inspection["structural_provenance"], "clean")
+        self.assertEqual(inspection["content_provenance"], "unknown")
         self.assertNotIn("tEXt", inspection["chunks"])
         self.assertTrue(final.exists())
 
@@ -489,6 +581,8 @@ json.dump({
         self.assertTrue(result["publish_ready"])
         record = json.loads(evidence.read_text(encoding="utf-8"))
         self.assertEqual(record["inspection"]["provenance_status"], "verified-by-adapter")
+        self.assertRegex(record["toolchain"]["executable_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(record["guarantee"]["content_provenance"], "unknown")
         ready = self.run_origen(
             "prepublish",
             final,
@@ -544,6 +638,407 @@ json.dump({
             expected=1,
         )
         self.assertEqual(rejected["error"]["code"], "INPUT_AMBIGUOUS")
+
+    def test_invisible_text_character_is_detected_and_rejected(self):
+        source = self.root / "hidden.txt"
+        source.write_text("visible\u200bhidden\n", encoding="utf-8")
+        inspection = self.run_origen("inspect", source)
+        self.assertEqual(inspection["structural_provenance"], "detected")
+        self.assertIn("TEXT_INVISIBLE_CHARACTER", {item["code"] for item in inspection["findings"]})
+
+        rejected = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            self.root / "final.txt",
+            "--evidence",
+            self.root / "final.json",
+            "--source-kind",
+            "ai-output",
+            "--transformation",
+            "normalize",
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "TEXT_INVISIBLE_CHARACTER")
+        self.assertFalse(rejected["publish_ready"])
+
+    def test_leading_bom_is_removed_then_final_structure_is_clean(self):
+        source = self.root / "bom.txt"
+        source.write_bytes(b"\xef\xbb\xbfsafe\r\n")
+        inspection = self.run_origen("inspect", source)
+        self.assertEqual(inspection["structural_provenance"], "detected")
+        final = self.root / "final.txt"
+        evidence = self.root / "final.json"
+        result = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            final,
+            "--evidence",
+            evidence,
+            "--source-kind",
+            "ai-output",
+            "--transformation",
+            "BOM and line-ending normalization",
+            "--sign-command",
+            self.provider_command,
+        )
+        self.assertEqual(final.read_bytes(), b"safe\n")
+        self.assertEqual(result["structural_provenance"], "clean")
+        self.assertEqual(result["content_provenance"], "unknown")
+
+    def test_active_html_is_detected_and_requires_a_sanitizing_adapter(self):
+        source = self.root / "active.html"
+        source.write_text('<p onclick="x()">safe</p><script>alert(1)</script>\n', encoding="utf-8")
+        inspection = self.run_origen("inspect", source)
+        self.assertEqual(inspection["structural_provenance"], "detected")
+        codes = {item["code"] for item in inspection["findings"]}
+        self.assertIn("ACTIVE_SCRIPT", codes)
+        self.assertIn("ACTIVE_EVENT_HANDLER", codes)
+        rejected = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            self.root / "final.html",
+            "--evidence",
+            self.root / "final.json",
+            "--source-kind",
+            "external-tool",
+            "--transformation",
+            "sanitize active content",
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "TRUSTED_ADAPTER_REQUIRED")
+
+    def test_standard_ai_text_never_claims_content_level_clean(self):
+        source = self.root / "ai.txt"
+        source.write_text("AI-generated wording\n", encoding="utf-8")
+        result = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            self.root / "final.txt",
+            "--evidence",
+            self.root / "final.json",
+            "--source-kind",
+            "ai-output",
+            "--transformation",
+            "canonical UTF-8 rebuild",
+            "--sign-command",
+            self.provider_command,
+        )
+        self.assertTrue(result["publish_ready"])
+        self.assertEqual(result["guarantee_level"], "standard")
+        self.assertEqual(result["structural_provenance"], "clean")
+        self.assertEqual(result["content_provenance"], "unknown")
+        self.assertFalse(result["root_verified"])
+
+    def test_legacy_v1_final_can_be_verified_but_not_prepublished(self):
+        source = self.root / "legacy.txt"
+        source.write_text("legacy\n", encoding="utf-8")
+        final = self.root / "final.txt"
+        evidence = self.root / "final.json"
+        self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            final,
+            "--evidence",
+            evidence,
+            "--source-kind",
+            "human-edit",
+            "--transformation",
+            "normalize",
+            "--sign-command",
+            self.provider_command,
+        )
+        record = json.loads(evidence.read_text(encoding="utf-8"))
+        record["schema_version"] = "origen-evidence/1"
+        record.pop("guarantee")
+        record.pop("toolchain")
+        record.pop("source_mapping", None)
+        self.resign_evidence(record, legacy=True)
+        evidence.write_text(json.dumps(record), encoding="utf-8")
+
+        verified = self.run_origen(
+            "verify",
+            final,
+            "--evidence",
+            evidence,
+            "--verify-command",
+            self.provider_command,
+        )
+        self.assertEqual(verified["guarantee_level"], "legacy_standard")
+        rejected = self.run_origen(
+            "prepublish",
+            final,
+            "--evidence",
+            evidence,
+            "--verify-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "EVIDENCE_UPGRADE_REQUIRED")
+
+    def test_strict_text_rejects_ai_wording_outside_human_source_map(self):
+        human = self.root / "human.txt"
+        human.write_text("Human words.\n", encoding="utf-8")
+        root_evidence, _ = self.capture_root(human)
+        source_map = self.write_source_map(
+            self.root / "map.json",
+            source=human,
+            evidence=root_evidence,
+            operations=[{"op": "slice", "source_id": "root", "start": 0, "end": len("Human words.\n")}],
+        )
+        proposed = self.root / "proposed.txt"
+        proposed.write_text("Human words. AI added this.\n", encoding="utf-8")
+        rejected = self.run_origen(
+            "finalize",
+            proposed,
+            "--output",
+            self.root / "final.txt",
+            "--evidence",
+            self.root / "final.json",
+            "--guarantee-level",
+            "strict_origin",
+            "--source-map",
+            source_map,
+            "--source-kind",
+            "human-edit",
+            "--transformation",
+            "Human-source selection",
+            "--root-evidence",
+            root_evidence,
+            "--verify-command",
+            self.provider_command,
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "STRICT_CONTENT_MISMATCH")
+
+    def test_strict_media_rejects_generated_pixels_as_human_origin(self):
+        human = self.root / "human.png"
+        self.make_png(human, pixel=0x11)
+        root_evidence, _ = self.capture_root(human)
+        source_map = self.write_source_map(
+            self.root / "media-map.json",
+            source=human,
+            evidence=root_evidence,
+            kind="media",
+            transformation={"op": "identity"},
+        )
+        generated = self.root / "generated.png"
+        self.make_png(generated, pixel=0xEE)
+        rejected = self.run_origen(
+            "finalize",
+            generated,
+            "--output",
+            self.root / "final.png",
+            "--evidence",
+            self.root / "final.json",
+            "--guarantee-level",
+            "strict_origin",
+            "--source-map",
+            source_map,
+            "--source-kind",
+            "human-edit",
+            "--transformation",
+            "identity rebuild",
+            "--root-evidence",
+            root_evidence,
+            "--verify-command",
+            self.provider_command,
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "STRICT_CONTENT_MISMATCH")
+
+    def test_signed_human_png_identity_rebuild_passes_strict_origin(self):
+        human = self.root / "human.png"
+        self.make_png(human, extra_chunks=((b"tEXt", b"Comment\x00human camera"),), pixel=0x22)
+        root_evidence, _ = self.capture_root(human)
+        source_map = self.write_source_map(
+            self.root / "media-map.json",
+            source=human,
+            evidence=root_evidence,
+            kind="media",
+            transformation={"op": "identity"},
+        )
+        final = self.root / "final.png"
+        evidence = self.root / "final.json"
+        result = self.run_origen(
+            "finalize",
+            human,
+            "--output",
+            final,
+            "--evidence",
+            evidence,
+            "--guarantee-level",
+            "strict_origin",
+            "--source-map",
+            source_map,
+            "--source-kind",
+            "captured-original",
+            "--transformation",
+            "trusted PNG container rebuild",
+            "--root-evidence",
+            root_evidence,
+            "--verify-command",
+            self.provider_command,
+            "--sign-command",
+            self.provider_command,
+        )
+        self.assertTrue(result["publish_ready"])
+        self.assertEqual(result["structural_provenance"], "clean")
+        self.assertEqual(result["content_provenance"], "verified_clean")
+        inspection = self.run_origen("inspect", final)
+        self.assertNotIn("tEXt", inspection["chunks"])
+
+    def test_human_text_derivative_passes_strict_origin_and_source_map_recheck(self):
+        human = self.root / "human.txt"
+        human.write_text("Alpha\nBeta\n", encoding="utf-8")
+        root_evidence, _ = self.capture_root(human)
+        source_map = self.write_source_map(
+            self.root / "map.json",
+            source=human,
+            evidence=root_evidence,
+            operations=[
+                {"op": "slice", "source_id": "root", "start": 6, "end": 10},
+                {"op": "separator", "value": "\n\n"},
+                {"op": "slice", "source_id": "root", "start": 0, "end": 5},
+            ],
+        )
+        proposed = self.root / "proposed.txt"
+        proposed.write_text("Beta\n\nAlpha\n", encoding="utf-8")
+        final = self.root / "final.txt"
+        evidence = self.root / "final.json"
+        result = self.run_origen(
+            "finalize",
+            proposed,
+            "--output",
+            final,
+            "--evidence",
+            evidence,
+            "--guarantee-level",
+            "strict_origin",
+            "--source-map",
+            source_map,
+            "--source-kind",
+            "human-edit",
+            "--transformation",
+            "move signed Human spans",
+            "--root-evidence",
+            root_evidence,
+            "--verify-command",
+            self.provider_command,
+            "--sign-command",
+            self.provider_command,
+        )
+        self.assertTrue(result["publish_ready"])
+        self.assertEqual(result["guarantee_level"], "strict_origin")
+        self.assertEqual(result["content_provenance"], "verified_clean")
+        self.assertTrue(result["root_verified"])
+        ready = self.run_origen(
+            "prepublish",
+            final,
+            "--evidence",
+            evidence,
+            "--root-evidence",
+            root_evidence,
+            "--source-map",
+            source_map,
+            "--verify-command",
+            self.provider_command,
+        )
+        self.assertEqual(ready["content_provenance"], "verified_clean")
+        self.assertTrue(ready["publish_ready"])
+
+    def test_strict_origin_rejects_incomplete_source_map(self):
+        human = self.root / "human.txt"
+        human.write_text("Human\n", encoding="utf-8")
+        root_evidence, _ = self.capture_root(human)
+        source_map = self.write_source_map(
+            self.root / "map.json",
+            source=human,
+            evidence=root_evidence,
+            operations=[],
+        )
+        rejected = self.run_origen(
+            "finalize",
+            human,
+            "--output",
+            self.root / "final.txt",
+            "--evidence",
+            self.root / "final.json",
+            "--guarantee-level",
+            "strict_origin",
+            "--source-map",
+            source_map,
+            "--source-kind",
+            "human-edit",
+            "--transformation",
+            "select source",
+            "--root-evidence",
+            root_evidence,
+            "--verify-command",
+            self.provider_command,
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "SOURCE_MAP_INCOMPLETE")
+
+    def test_external_toolchain_failure_never_becomes_publish_ready(self):
+        source = self.root / "source.jpg"
+        source.write_bytes(b"\xff\xd8\xff\xd9")
+        rejected = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            self.root / "final.jpg",
+            "--evidence",
+            self.root / "final.json",
+            "--source-kind",
+            "external-tool",
+            "--transformation",
+            "rebuild",
+            "--adapter-command",
+            self.make_jpeg_adapter(fail=True),
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "PROVIDER_FAILED")
+        self.assertFalse(rejected["publish_ready"])
+
+    def test_detected_content_level_provenance_is_not_called_clean(self):
+        source = self.root / "source.jpg"
+        source.write_bytes(b"\xff\xd8\xff\xd9")
+        rejected = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            self.root / "final.jpg",
+            "--evidence",
+            self.root / "final.json",
+            "--source-kind",
+            "ai-output",
+            "--transformation",
+            "rebuild",
+            "--adapter-command",
+            self.make_jpeg_adapter(content_status="detected"),
+            "--sign-command",
+            self.provider_command,
+            expected=1,
+        )
+        self.assertEqual(rejected["error"]["code"], "CONTENT_PROVENANCE_DETECTED")
+        self.assertEqual(rejected["content_provenance"], "unknown")
 
     def test_unknown_binary_is_fail_closed(self):
         source = self.root / "unknown.bin"
