@@ -6,7 +6,7 @@
 
 - このrepositoryは`agent-directory`とは別のGit repository、remote、validation、配布境界を持つ。monorepo化や自動同期をしない。
 - ここが所有するのは、再利用Capabilityの目的、Skill契約、Domain Safety、import/provenance、validator、test、利用者向け文書である。
-- ClaudAGT Owner Agentの現在目標、優先順位、到達履歴、次の一手、handoff、採用revisionはClaudAGT rootが所有する。rootの`PROJECT.md`や`STATE.md`をこの公開repositoryへ複製しない。
+- Owner Agentの現在目標、優先順位、到達履歴、次の一手、handoff、採用revisionはowner rootが所有する。rootの`PROJECT.md`や`STATE.md`をこの公開repositoryへ複製しない。
 - Agent Directoryを利用する一般Projectの`PROJECT.md` / `STATE.md`契約は`agent-directory`が所有する。
 
 ## 製品不変条件
