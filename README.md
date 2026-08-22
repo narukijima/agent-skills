@@ -2,8 +2,8 @@
 
 AIエージェントが共通利用するSkillの公開配布元です。各Skillは自己完結した `skills/<name>/` で、[Agent Skills標準](https://agentskills.io)の `SKILL.md` を正本とします。利用側は必要なSkillだけをvendored copyとして明示的に取り込み、各Runtime(Claude Code、Codex等)の標準Skill配置へ薄いadapterで接続します。
 
-- 配布元: [`claudagt/agent-skills`](https://github.com/claudagt/agent-skills)
-- 利用側の例: [`claudagt/agent-directory`](https://github.com/claudagt/agent-directory)
+- 配布元: [`narukijima/agent-skills`](https://github.com/narukijima/agent-skills)
+- 利用側の例: [`narukijima/agent-directory`](https://github.com/narukijima/agent-directory)
 
 ## 構成
 

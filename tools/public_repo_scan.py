@@ -56,9 +56,9 @@ def scan_bytes(path: Path, content: bytes) -> list[str]:
 
 
 def scan_owner_agent_state_files(paths: Iterable[Path]) -> list[str]:
-    """Reject ClaudAGT's active Project state at this public product root."""
+    """Reject the owner agent's active Project state at this public product root."""
     return [
-        f"{path}: owner-agent active state belongs in the ClaudAGT root"
+        f"{path}: owner-agent active state belongs in the owner root"
         for path in sorted(set(paths))
         if path in OWNER_AGENT_STATE_FILES
     ]
