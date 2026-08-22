@@ -689,6 +689,29 @@ json.dump({
         self.assertEqual(result["structural_provenance"], "clean")
         self.assertEqual(result["content_provenance"], "unknown")
 
+    def test_large_multibyte_text_is_not_misclassified_by_prefix_truncation(self):
+        source = self.root / "large.md"
+        source.write_text("記" * 30000 + "\n", encoding="utf-8")
+        inspection = self.run_origen("inspect", source)
+        self.assertEqual(inspection["asset"]["media_type"], "text/markdown")
+        self.assertEqual(inspection["findings"], [])
+        result = self.run_origen(
+            "finalize",
+            source,
+            "--output",
+            self.root / "large-final.md",
+            "--evidence",
+            self.root / "large-final.json",
+            "--source-kind",
+            "human-edit",
+            "--transformation",
+            "canonical UTF-8 build",
+            "--sign-command",
+            self.provider_command,
+        )
+        self.assertTrue(result["publish_ready"])
+        self.assertEqual(result["structural_provenance"], "clean")
+
     def test_active_html_is_detected_and_requires_a_sanitizing_adapter(self):
         source = self.root / "active.html"
         source.write_text('<p onclick="x()">safe</p><script>alert(1)</script>\n', encoding="utf-8")

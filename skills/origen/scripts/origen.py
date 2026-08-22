@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import codecs
 import hashlib
 import json
 import math
@@ -227,8 +228,10 @@ def magic_type(prefix: bytes) -> str | None:
 
 
 def detect_media_type(path: Path, *, name_hint: str | None = None) -> tuple[str, list[dict[str, str]]]:
+    prefix_limit = 65536
     with path.open("rb") as stream:
-        prefix = stream.read(65536)
+        prefix = stream.read(prefix_limit)
+        truncated = len(prefix) == prefix_limit and stream.read(1) != b""
     detected = magic_type(prefix)
     suffix = Path(name_hint or path.name).suffix.lower()
     declared = EXTENSION_TYPES.get(suffix)
@@ -237,7 +240,7 @@ def detect_media_type(path: Path, *, name_hint: str | None = None) -> tuple[str,
     decoded_as_text = False
     if detected is None and b"\x00" not in prefix:
         try:
-            prefix.decode("utf-8", errors="strict")
+            codecs.getincrementaldecoder("utf-8")().decode(prefix, final=not truncated)
         except UnicodeDecodeError:
             pass
         else:
@@ -1241,7 +1244,8 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="origen-finalize-") as temporary_dir:
+    # Stage in the output directory so the final os.replace stays on one filesystem.
+    with tempfile.TemporaryDirectory(prefix=".origen-finalize-", dir=str(output.parent)) as temporary_dir:
         temporary_output = Path(temporary_dir) / ("final" + output.suffix.lower())
         media_type = input_inspection["asset"]["media_type"]
         if guarantee_level == "strict_origin" and source_context is not None:
@@ -1420,14 +1424,9 @@ def command_finalize(args: argparse.Namespace) -> dict[str, object]:
             statement["source_mapping"] = source_context["summary"]
         evidence = {**statement, "proof": sign_evidence(statement, args.sign_command)}
 
-        temporary_evidence = Path(temporary_dir) / "final.origen.json"
-        temporary_evidence.write_text(
-            json.dumps(evidence, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
         os.replace(temporary_output, output)
         try:
-            os.replace(temporary_evidence, evidence_path)
+            write_json_atomic(evidence_path, evidence)
         except Exception:
             if output.exists():
                 output.unlink()
