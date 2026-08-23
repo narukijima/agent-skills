@@ -17,7 +17,7 @@ STRICT ORIGINはdetector推測ではなく、Final bytesをSigned Human Source�
 }
 ```
 
-全source asset/evidenceをsecure snapshotし、v3 Human Root signature、Policy digest、trusted timestamp、hash/media/sizeを確認する。primary Rootを含むmulti-rootを許す。Human additionは新しいsigned sourceが必須。
+全source asset/evidenceをsecure snapshotし、v4 Human Root signature、authorization boundary、Policy digest、trusted timestamp、hash/media/sizeを確認する。primary Rootを含むmulti-rootを許す。Human additionは新しいsigned sourceが必須。
 
 ## Strict text
 

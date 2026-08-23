@@ -12,4 +12,4 @@ valid credentialはvalidateしoriginal manifest digest/statusをEvidenceへ記�
 
 ## Base representations
 
-SHA-256、RFC 3339 UTC、IANA media type、deterministic JSONを使う。Origen JSONはRFC 8785準拠を標榜しない。signature algorithm、PKI、TSA、trust listはPolicy-pinned external providerが所有する。
+Ed25519、SHA-256、RFC 3339 UTC、IANA media type、deterministic JSONを使う。Origen JSONはRFC 8785準拠を標榜しない。private-key custody、PKI、TSA、trust listはexternal Providerが所有する。

@@ -1,4 +1,4 @@
-# Phase 1 coverage matrix
+# Coverage matrix
 
 `Built-in`はProduction finalizeでexternal builderなしに成立する範囲。`Inspect`だけのmarker/resource checkはBuilt-in finalize対応を意味しない。
 

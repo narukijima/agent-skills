@@ -1,62 +1,62 @@
-# Evidence schema v3
+# Evidence schema v4
 
-`origen-evidence/3`はProduction Evidence Planeの正本であり、C2PA manifestではない。JSONはduplicate key、NaN、Infinity、unknown critical field、invalid cross-field combinationをstrict parserで拒否する。
+`origen-evidence/4`はOrigen Evidence Planeの正本であり、C2PA manifestではない。JSONはduplicate key、NaN、Infinity、unknown critical field、invalid cross-field combinationを拒否する。
 
-## 分離する4概念
+## Signature statement
 
-```json
-{
-  "assurance": {
-    "structural": {"state": "clean", "coverage": {}, "inspector_id": "..."},
-    "content_signals": {"state": "unknown", "checks": []},
-    "derivation": {
-      "mode": "standard | strict_origin",
-      "no_unmapped_generated_content": false,
-      "source_map_digest": null,
-      "final_snapshot_digest": "...",
-      "operation_schema_version": "origen-operation/1"
-    },
-    "root": {"verified": true, "assurance_level": "trusted_time"}
-  }
-}
-```
+`proof`を除く全objectをdeterministic JSON化したbytesが署名payloadである。digestはSHA-256、signature algorithmはEd25519。
 
-- structural provenance: container、metadata、active content等、Inspector coverage内の構造状態。
-- content signal detection: provider watermark等のcheck。`not_detected`はcheck結果でありcleanではない。STANDARD aggregateは常に`unknown`。
-- content derivation: STANDARDかSigned Human Source mappingからのSTRICT再構築か。
-- root assurance: `signed_assertion | trusted_time | capture_attested`。Phase 1 Productionは`trusted_time`までを必須にする。
-
-## 署名statement
-
-`proof`を除く全objectをdeterministic JSON化したbytesが署名payloadである。statementには少なくとも次を含む。
+Evidenceは少なくとも次を固定する。
 
 - exact Policy ID/version/mode/digest
-- expected signer/verifier identity、role、key ID、algorithm
-- builder/inspector identity
-- executable/script/resource hashes、dependency provenance、Python/Unicode/NFC record
-- timestamp receipt digest（Root）、Root receipt digest link（Final）
-- source map digest、rebuilt output digest、final snapshot digest
-- `origen-operation/1`
-- publication representation、allowed transport metadata
-- root/parent lineage
+- role、signer alias、Provider ID、key ID、signer identity、algorithm
+- public keyまたはverifier reference
+- Human Root authorization boundary、subject digest、receipt digest
+- trusted timestamp Provider、trusted time、receipt digest
+- asset/input digest、source map/final snapshot digest、lineage
+- builder/Inspector/toolchainとProvider registry digest
+- publication representationとtransport metadata
 
-signature bytesとprovider-issued timestamp receipt本体だけを`proof`へ置く。toolchain、Policy、identity等のtrust claimを`proof`だけに置かない。
+`proof`にはsignature、opaque authorization receipt、opaque timestamp receiptだけを置く。private keyは置かない。
 
 ## Human Root
 
-Human Rootはcreator ID、origin ID、asset hash/media type、Policy digest、signer key/identity、local claimed time、trusted time、timestamp receipt digest、root assurance levelを署名する。`--timestamp`はlocal claimでありtrusted timeではない。Productionはcreator/key mapping、root-attestor role、外部authorization receipt、trusted timestamp verificationを要求する。
+Human Rootは次の境界である。
 
-署名は「指定identityがこのbytesをHuman Rootとしてassertした」ことを示す。生物学的人間が全bytesを作ったこと、Root内部に未知signalがないことは示さない。
+```text
+Human Source -> trusted capture / ingest boundary -> Root Attestation
+```
 
-## Final Asset
+Root Evidenceの`authorization`:
 
-Final evidenceはinput/final snapshot、source kind、instruction/content/builder actors、independent Inspector coverage、lineage、publication contractを署名する。
+```json
+{
+  "boundary_type": "trusted_ingest",
+  "boundary_id": "capture-service",
+  "provider_id": "sign-provider",
+  "provider_identity": "capture-and-sign-service",
+  "subject_sha256": "...",
+  "receipt_digest": "..."
+}
+```
 
-- STANDARD: AI/external contentを許す。`content_signals.state=unknown`、`no_unmapped_generated_content=false`。
-- STRICT ORIGIN: `content_basis=signed_human_sources`、`no_unmapped_generated_content=true`、source mapping必須。
+手動承認の有無は保証の定義ではない。explicit authorizationもpre-authorized workflowも、Providerがsubject-bound receiptを発行し検証できれば同じEvidence modelで表す。AIが任意contentをRoot keyで署名する経路は、authorization receiptなしでは成立しない。
+
+Rootは`publish_ready=false`であり、Root roleは`root-attestor`。trusted timeはexternal timestamp Providerから得る。
+
+## Final Attestation
+
+Finalはvalidationとinspection後に自動署名してよい。roleは`final-attestor`、`authorization=null`。
+
+- STANDARD: AI/external contentを許す。`content_signals.state=unknown`、`no_unmapped_generated_content=false`
+- STRICT ORIGIN: `content_basis=signed_human_sources`、source mapping必須、`no_unmapped_generated_content=true`
+
+Root/Finalはlogical roleとして異なるaliasを使う。同一Provider利用は可能。
+
+## Verification and rotation
+
+verifyはEvidenceに固定されたkey ID、algorithm、public verifier referenceを使い、秘密鍵なしで成立する。rotation後も旧Signer aliasとverifier recordをregistryに残す。新しいdefault aliasは新Evidenceだけに使う。
 
 ## Schema lifecycle
 
-- current schemaは`origen-evidence/3`だけであり、それ以外はread/verify/prepublishすべてでunsupportedとして拒否する。
-- 別Policy digest、development evidenceはProduction prepublish拒否。
-- 古いsidecarを機械的に書き換えるmigrationは提供しない。必要なら現Policy下でRootを再attestし、Finalを再build・再inspect・再署名する。
+v4 commandは`origen-evidence/4`と`origen-trust-policy/2`だけを受理する。旧Evidenceを機械的に書き換えない。必要なら現Policy下でRootを再attestし、Finalを再build・inspect・signする。

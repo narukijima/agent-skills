@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Origen CLI: the current Policy-enforced specification only."""
+"""Origen CLI: provider-neutral Content Origin / Provenance operations."""
 
 from __future__ import annotations
 

@@ -1,33 +1,92 @@
-# External provider protocol v3
+# Provider protocol v1
 
-Productionではcommand文字列をCLIへ渡さない。Policyのapproved IDからabsolute executable、literal argv、hash、identityを解決し、実行前に照合する。shellは使わない。
+Origen coreとSigner / Verifier / trusted time実装の間は、JSON requestをstdin、単一JSON responseをstdoutで交換する小さなprocess protocolである。shell commandや秘密鍵をCLIへ渡さない。
 
-共通実行境界:
+Provider transportは`origen-provider-registry/1`へ置き、Trust Policyから分離する。実装はlocal process、OS key store adapter、environment/secret store、password manager、remote signer、cloud KMS、HSM/PKCS#11のいずれでもよい。
 
-- sanitized environment / approved PATH
-- private working directory
-- read-only content-addressed input snapshots
-- dedicated output directory
-- Policy timeout / stdout / stderr cap
-- network denyまたはexplicit Policy（実network sandboxはProject contract）
+## Signer / Verifier
 
-## Sign / verify
+共通request:
 
-Rootは先に`authorize_root`を呼び、外部workflowが返すauthorization receipt digestをRoot statementへ入れる。続くsign requestはcanonical payloadとdigest、expected signer role/key/identityだけを含む。Root request scopeは`sign-root-attestor-evidence-v3`、Finalは`sign-final-attestor-evidence-v3`。root-attestorは署名時にstatement内receipt digestをechoし、一致しなければ拒否する。
+```json
+{
+  "operation": "sign",
+  "protocol": "origen-signer/1",
+  "role": "root-attestor | final-attestor",
+  "key_id": "key:2026-08",
+  "algorithm": "Ed25519",
+  "payload": "BASE64_CANONICAL_BYTES",
+  "payload_sha256": "..."
+}
+```
 
-verifyはpayload、proof、signed expected signerを受け、signature validityとkey/algorithm/identityを返す。secret/private keyをstdin/stdout/argv/repositoryへ置かない。
+`verify`は同じkey ID、algorithm、payload、payload digestに加え、`signature`とEvidenceに固定された`verifier`を受ける。
+
+Providerは次を返す。
+
+- sign: `provider_id`, `key_id`, `algorithm`, `signer_identity`, `signature`
+- verify: 上記identityと`verified`
+- get_public_key: `key_id`, `algorithm`, `verifier`
+- health: `healthy`
+- capabilities: supported `operations`
+
+`verifier`は`public_key`または`verifier_ref`を持つ。private keyをrequest/response、stdout、argv、repositoryへ出さない。
+
+## Human Root authorization
+
+Root signerは`sign`の前に`authorize_root`を実行する。
+
+```json
+{
+  "operation": "authorize_root",
+  "protocol": "origen-root-authorization/2",
+  "subject_sha256": "...",
+  "policy_id": "...",
+  "policy_version": "..."
+}
+```
+
+responseは次を返す。
+
+```json
+{
+  "boundary_type": "trusted_ingest",
+  "boundary_id": "capture-service",
+  "subject_sha256": "...",
+  "receipt": "OPAQUE_PROVIDER_RECEIPT"
+}
+```
+
+標準boundary type:
+
+- `trusted_ingest`
+- `explicit_authorization`
+- `pre_authorized_workflow`
+- `trusted_capture_service`
+- `hardware_backed_authorization`
+- `provider_authorization`
+
+Origenはtype、boundary ID、Provider identity、subject digest、receipt digestをRoot statementへ署名する。receipt本体はproofへ置く。検証時は`verify_authorization`でreceiptを再検証する。
+
+これは「毎回人間がボタンを押した」ことではなく、「Human Sourceとして承認されたProvider boundaryを通過した」ことを保証する。Providerが任意のAI contentへreceiptを発行しないことはProviderのsecurity contractである。
 
 ## Trusted time
 
-`origen-trusted-time/1`はRFC 3161 TSAまたは同等provider-issued receiptへ接続する。
+`origen-trusted-time/1`はRFC 3161 TSAまたは同等の検証可能なexternal timestamp serviceへ接続する。
 
-- `timestamp`: subject SHA-256を受け、trusted time、provider identity、protocol、receiptを返す。
-- `verify_timestamp`: subject digest、trusted time、receiptを再検証する。
+- `timestamp(subject_sha256)`: trusted time、Provider identity、protocol、opaque receipt
+- `verify_timestamp(subject_sha256, trusted_time, receipt)`: `verified`
 
-Origenはreceipt digestをRoot statementへ署名し、receipt本体をproofへ置く。任意`--timestamp`をtrusted timeへ昇格しない。
+Origenは独自Time Keyやtimestamp authorityを持たない。local clockはcreated-at claimにすぎず、trusted timeへ昇格しない。
 
-## Build / inspect
+## Registry transport hardening
 
-Builderはsnapshot path、input digest/media type、output directory、typed operation/source bindingsを受ける。InspectorはFinal snapshot、required coverage、STRICT summaryを受ける。Inspectorはcoverage全項目とcontent signal checksを返す。自己申告だけでなく、approved/pinned独立Inspectorであることがtrust boundaryである。
+Process adapterはabsolute executable、literal argv、実行ファイル/script/resource hash、timeout、stdout/stderr上限、sanitized environmentを使う。`inherit_environment`はProviderに必要な既存変数名だけを列挙し、値をregistryへ保存しない。
 
-External toolのbinary/version/script/config/resource hashes、dependency provenance、reproducible installはPolicyとsigned toolchain claimへ残す。
+Builder / Inspectorも同じtransport hardeningを再利用するが、Signer protocolとは別Capabilityである。
+
+## Setup / recovery / rotation
+
+`origen setup`はProvider health/capabilities、public verifier、Final key sign/verify、trusted timeをself-testする。Root keyで任意self-test payloadを署名しない。
+
+generate、import、existing key reference、remote key enrollment、backup、restoreはProvider固有operationまたは運用手順であり、Origen coreは実装しない。rotationでは新aliasをdefaultへ切り替え、旧Evidence検証用の旧alias、key ID、verifier recordを保持する。

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`ai-native-design`](ai-native-design/SKILL.md) | active | AI-native UIの既存Project調査、source探索、選定、統合、品質検証 |
 | [`comprehension-level`](comprehension-level/SKILL.md) | active | ELI5〜Expert / autoのLevelを認知制約へ変換し、媒体横断で最低理解レベルを制御・検証 |
-| [`origen`](origen/SKILL.md) | active | Human Root、Policy-pinned build、独立inspection、atomic bundleをProduction publication境界で検証 |
+| [`origen`](origen/SKILL.md) | active | Provider-neutralなHuman Root authorization、Ed25519署名、Final Evidence、atomic publish bundleを検証 |
 | [`seo`](seo/SKILL.md) | active | 検索・AI可視性を実測し、crawl / index / content / schema / pSEOの原因修正を再検証 |
 | [`sns-algorithm`](sns-algorithm/SKILL.md) | active | 6 SNSの推薦・ranking・searchをsurface別の公式根拠から分析し、仮説と実験へ変換 |
 | [`sns-api`](sns-api/SKILL.md) | active | X media/URL引用、YouTube resumable、Meta stage recoveryを含む5 SNS公式APIの署名manifest・canonical ledger実行 |

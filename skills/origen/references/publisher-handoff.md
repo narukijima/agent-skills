@@ -15,7 +15,7 @@ receipt fields:
 - `guarantee_mode`, `media_type`, `publication_representation`
 - `allowed_transport_metadata`
 
-`prepublish`はbundle entryをno-follow snapshotし、exact entry set、Evidence signature/Policy/lineage、receipt binding、Final hash、STRICT rebuilt digestを検証し、verified receiptをstdoutへ返す。boolだけをpublication authorizationとして返さない。
+`prepublish`はbundle entryをno-follow snapshotし、exact entry set、Evidence signature/Policy/lineage、public verifier、authorization/trusted-time receipt、receipt binding、Final hash、STRICT rebuilt digestを検証し、verified receiptをstdoutへ返す。boolだけをpublication authorizationとして返さない。
 
 Publisher contract:
 

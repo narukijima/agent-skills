@@ -11,7 +11,7 @@ BuilderとInspectorは別authorityである。adapterの`output-validated`や`pr
 
 ## External builder
 
-Policy-pinned absolute executableだけを起動し、input snapshotとoutput directoryだけを渡す。network fetch、URL/base64/freeform binary/shell argumentはtyped operationに持ち込めない。builder終了後のoutputを再snapshotし、元output pathはFinal判定に使わない。
+Provider registryでhash-pinnedされたabsolute executableだけを起動し、input snapshotとoutput directoryだけを渡す。network fetch、URL/base64/freeform binary/shell argumentはtyped operationに持ち込めない。builder終了後のoutputを再snapshotし、元output pathはFinal判定に使わない。
 
 ## Independent Final Inspector
 
