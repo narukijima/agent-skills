@@ -1,40 +1,15 @@
 # Standards boundary
 
-## Agent Skills
+## C2PA 2.4
 
-OrigenはAgent Skillsの標準layoutに従う。
+Origen built-inはmarker/carrier discoveryを行うが、manifest validation、certificate/trust list/revocation、reissueを独自実装しない。approved C2PA SDK/c2patool相当をexternal Inspector/Builderとしてpinする。
 
-- `SKILL.md`: 発動契約と最小workflow
-- `references/`: evidence、adapter、provider、標準境界
-- `scripts/`: 再利用する決定的処理
+検出対象: PNG caBX、JPEG JUMBF/APP11、RIFF C2PA、ID3 GEOB C2PA、ISO BMFF C2PA/JUMBF、HTML inline/external manifest、SVG metadata、Markdown structured block、U+FEFF/Variation Selector/C2PATXT、PDF embedded manifest、external `.c2pa`。
 
-正本仕様: <https://agentskills.io/specification>
+valid credentialはvalidateしoriginal manifest digest/statusをEvidenceへ記録後、Policyでpreserve/reissue/explicit detachを選ぶ。黙って削除しない。
 
-## C2PA / Content Credentials
+正本: [C2PA 2.4](https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html)、[CAI SDK / c2patool](https://opensource.contentauthenticity.org/)。
 
-C2PA 2.4はasset provenanceをcryptographic binding、signed claim、ingredient/action、validation stateで表す既存標準である。Origenはこれを再実装せず、次の境界で共存する。
+## Base representations
 
-- embedded/external C2PA manifestをinspection対象として扱う
-- C2PA/CAWG生成・検証は適合SDK/toolを外部provider/adapterとして接続する
-- Origen sidecarをC2PA manifestやContent Credentialと呼ばない
-- C2PAを除去してAI由来を隠す用途にしない。Origen evidenceの `source_kind` とtransformationを保持する
-- 有効なC2PAを継承・更新すべきpolicyでは、削除して独自sidecarだけに置き換えず、C2PA-aware adapterでingredient/action chainを更新する
-
-正本仕様:
-
-- C2PA 2.4: <https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html>
-- Human / organizational identity recommendation: <https://spec.c2pa.org/specifications/specifications/2.4/identity/identity.html>
-- CAI SDK / c2patool: <https://opensource.contentauthenticity.org/>
-
-## 基礎表現
-
-- Content digest: SHA-256
-- Time: RFC 3339 UTC
-- Media type: IANA media type
-- Signature algorithm、certificate、trust list、revocation、timestamp authority: external provider policy
-
-Origen JSONは限定型のdeterministic serializationを使うが、RFC 8785準拠を標榜しない。将来、相互運用が必要になった時点で標準canonicalizationまたはC2PAへ移行し、独自仕様を拡張し続けない。
-
-## Guarantee boundary
-
-Origenは「すべてのAI watermarkを除去する」「AI signalが存在しない」とは主張しない。STANDARDは検証可能なStructural Provenanceだけをclean判定し、Content-Levelを`unknown`として保持する。STRICT ORIGINはC2PAの代替規格ではなく、署名済みHuman source mapping外のcontentをFinalへ入れないlocal publication policyである。
+SHA-256、RFC 3339 UTC、IANA media type、deterministic JSONを使う。Origen JSONはRFC 8785準拠を標榜しない。signature algorithm、PKI、TSA、trust listはPolicy-pinned external providerが所有する。

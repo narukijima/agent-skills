@@ -1,83 +1,62 @@
-# Evidence schema
+# Evidence schema v3
 
-Origen 0.2はasset本体へ独自metadataを埋め込まず、`origen-evidence/2` JSON sidecarをEvidence Planeの正本にする。これはC2PA manifestではない。
+`origen-evidence/3`はProduction Evidence Planeの正本であり、C2PA manifestではない。JSONはduplicate key、NaN、Infinity、unknown critical field、invalid cross-field combinationをstrict parserで拒否する。
 
-## Provenanceの2層
-
-- `structural_provenance`: `clean | detected | unknown`
-  container、metadata、manifest、document property、hidden/active field等、形式adapterが構造として検査できる範囲。
-- `content_provenance`: `verified_clean | detected | unknown`
-  pixel、waveform、frame、token等のcontent dataそのもののorigin状態。
-
-`structural_provenance = clean` は `content_provenance = verified_clean` を意味しない。re-encode、UTF-8保存、metadata除去だけでContent-Level信号の不存在を主張しない。
-
-STRICTの`verified_clean`は「署名済みHuman source mapping外の未知/AI-generated contentをFinalへ追加していない」ことを示す。Human Root自身にsteganographyやwatermarkが絶対にないという万能なforensic保証ではない。
-
-## 共通構造
+## 分離する4概念
 
 ```json
 {
-  "schema_version": "origen-evidence/2",
-  "evidence_type": "human-root | final-asset",
-  "created_at": "RFC3339 UTC",
-  "asset": {
-    "id": "sha256:<hex>",
-    "sha256": "<hex>",
-    "size": 123,
-    "media_type": "IANA media type"
-  },
-  "publish_ready": false,
-  "proof": {
-    "provider": "provider identifier",
-    "key_id": "non-secret key identifier",
-    "algorithm": "provider algorithm identifier",
-    "signature": "provider-encoded signature"
+  "assurance": {
+    "structural": {"state": "clean", "coverage": {}, "inspector_id": "..."},
+    "content_signals": {"state": "unknown", "checks": []},
+    "derivation": {
+      "mode": "standard | strict_origin",
+      "no_unmapped_generated_content": false,
+      "source_map_digest": null,
+      "final_snapshot_digest": "...",
+      "operation_schema_version": "origen-operation/1"
+    },
+    "root": {"verified": true, "assurance_level": "trusted_time"}
   }
 }
 ```
 
-`proof`を除くobjectをUTF-8、sorted key、余分な空白なしでserializeしたbytesが署名payloadである。
+- structural provenance: container、metadata、active content等、Inspector coverage内の構造状態。
+- content signal detection: provider watermark等のcheck。`not_detected`はcheck結果でありcleanではない。STANDARD aggregateは常に`unknown`。
+- content derivation: STANDARDかSigned Human Source mappingからのSTRICT再構築か。
+- root assurance: `signed_assertion | trusted_time | capture_attested`。Phase 1 Productionは`trusted_time`までを必須にする。
 
-## Guarantee decision
+## 署名statement
 
-Final evidenceは次を必須にする。
+`proof`を除く全objectをdeterministic JSON化したbytesが署名payloadである。statementには少なくとも次を含む。
 
-```json
-{
-  "guarantee": {
-    "level": "standard | strict_origin",
-    "structural_provenance": "clean",
-    "content_provenance": "unknown | verified_clean",
-    "root_verified": true
-  },
-  "publish_ready": true
-}
-```
+- exact Policy ID/version/mode/digest
+- expected signer/verifier identity、role、key ID、algorithm
+- builder/inspector identity
+- executable/script/resource hashes、dependency provenance、Python/Unicode/NFC record
+- timestamp receipt digest（Root）、Root receipt digest link（Final）
+- source map digest、rebuilt output digest、final snapshot digest
+- `origen-operation/1`
+- publication representation、allowed transport metadata
+- root/parent lineage
 
-- STANDARD: Structural Clean必須。Content-Levelは常に`unknown`として保持する。Human Rootがない場合、`root_verified=false`を許容する。
-- STRICT ORIGIN: Structural Clean、`content_provenance=verified_clean`、`root_verified=true`、signed `source_mapping`をすべて必須にする。
-- adapterがContent-Level signalを`detected`と報告した場合、どちらのmodeでも公開拒否する。
+signature bytesとprovider-issued timestamp receipt本体だけを`proof`へ置く。toolchain、Policy、identity等のtrust claimを`proof`だけに置かない。
 
 ## Human Root
 
-`human-root`はcreator/origin identity、asset hash、inspection、timestampを署名する。root captureは公開承認ではないため`publish_ready=false`である。
+Human Rootはcreator ID、origin ID、asset hash/media type、Policy digest、signer key/identity、local claimed time、trusted time、timestamp receipt digest、root assurance levelを署名する。`--timestamp`はlocal claimでありtrusted timeではない。Productionはcreator/key mapping、root-attestor role、外部authorization receipt、trusted timestamp verificationを要求する。
 
-## Final Assetとlineage
+署名は「指定identityがこのbytesをHuman Rootとしてassertした」ことを示す。生物学的人間が全bytesを作ったこと、Root内部に未知signalがないことは示さない。
 
-Final evidenceは次を追加する。
+## Final Asset
 
-- `input_asset`: finalizeへ入ったbytesのhash
-- `event.source_kind` / `event.transformations`
-- `event.adapter`: 実行adapterと保証
-- `inspection`: final再検査結果
-- `lineage.root_*` / `lineage.parent_*`: Human Rootとpredecessorへのlink
-- `toolchain`: binary/script hash、version、dependency provenance、reproducible install記述
-- STRICTのみ`source_mapping`: pathを除いたsigned Human sourceとoperationのportable summary
+Final evidenceはinput/final snapshot、source kind、instruction/content/builder actors、independent Inspector coverage、lineage、publication contractを署名する。
 
-Evidence digestは署名を含むsidecar JSONのcanonical SHA-256であり、filesystem pathをlineageへ埋め込まない。
+- STANDARD: AI/external contentを許す。`content_signals.state=unknown`、`no_unmapped_generated_content=false`。
+- STRICT ORIGIN: `content_basis=signed_human_sources`、`no_unmapped_generated_content=true`、source mapping必須。
 
-## Verification
+## Schema lifecycle
 
-`verify` / `prepublish`はasset hash、proof、root/parent evidence、guarantee decisionを再検証する。STRICTではsource mapを再読込し、全source evidence、source asset bytes、mapping summaryを再検証する。
-
-`origen-evidence/1`はread/`verify`互換を維持するが、Structural/Content保証を分離していないため、v2 `prepublish`では`EVIDENCE_UPGRADE_REQUIRED`として拒否する。
+- current schemaは`origen-evidence/3`だけであり、それ以外はread/verify/prepublishすべてでunsupportedとして拒否する。
+- 別Policy digest、development evidenceはProduction prepublish拒否。
+- 古いsidecarを機械的に書き換えるmigrationは提供しない。必要なら現Policy下でRootを再attestし、Finalを再build・再inspect・再署名する。

@@ -1,128 +1,33 @@
-# External provider protocol
+# External provider protocol v3
 
-Origenは秘密鍵や複雑なmedia encoderを所有しない。commandはshellを介さずargvとして起動し、stdin/stdoutの1 JSON messageで接続する。
+Productionではcommand文字列をCLIへ渡さない。Policyのapproved IDからabsolute executable、literal argv、hash、identityを解決し、実行前に照合する。shellは使わない。
 
-## Signing provider
+共通実行境界:
 
-`--sign-command '/trusted/origen-sign-provider --profile human-root'`
+- sanitized environment / approved PATH
+- private working directory
+- read-only content-addressed input snapshots
+- dedicated output directory
+- Policy timeout / stdout / stderr cap
+- network denyまたはexplicit Policy（実network sandboxはProject contract）
 
-stdin:
+## Sign / verify
 
-```json
-{
-  "operation": "sign",
-  "request_scope": "sign-canonical-evidence-only",
-  "payload": "base64 encoded canonical evidence payload",
-  "payload_sha256": "hex"
-}
-```
+Rootは先に`authorize_root`を呼び、外部workflowが返すauthorization receipt digestをRoot statementへ入れる。続くsign requestはcanonical payloadとdigest、expected signer role/key/identityだけを含む。Root request scopeは`sign-root-attestor-evidence-v3`、Finalは`sign-final-attestor-evidence-v3`。root-attestorは署名時にstatement内receipt digestをechoし、一致しなければ拒否する。
 
-stdout:
+verifyはpayload、proof、signed expected signerを受け、signature validityとkey/algorithm/identityを返す。secret/private keyをstdin/stdout/argv/repositoryへ置かない。
 
-```json
-{
-  "provider": "kms:example",
-  "key_id": "non-secret stable key id",
-  "algorithm": "ES256",
-  "signature": "base64 or provider-defined encoded signature",
-  "provider_version": "pinned provider version",
-  "key_protection": "kms | hsm | hardware-backed | external-service",
-  "dependency_provenance": "provider build/deployment origin",
-  "reproducible_install": "pinned deployment procedure",
-  "request_scope": "sign-canonical-evidence-only"
-}
-```
+## Trusted time
 
-Providerは秘密鍵をstdout/stderrへ出さない。KMS/HSM/service内部で署名し、Agentへkey materialを返さない。sign requestにはcanonical payloadとdigestしか渡さず、filesystem output path、Publisher credential、任意write操作を渡さない。Provider側もkey ID、caller identity、evidence type等でauthorizeし、`sign ≠ arbitrary agent write permission`を維持する。
+`origen-trusted-time/1`はRFC 3161 TSAまたは同等provider-issued receiptへ接続する。
 
-長期private key fileやsecret値をcommand line、Agent-readable environment/fileへ置く構成は本番providerとして認めない。test fixtureのdigest signerはprotocol test専用であり、production signatureではない。
+- `timestamp`: subject SHA-256を受け、trusted time、provider identity、protocol、receiptを返す。
+- `verify_timestamp`: subject digest、trusted time、receiptを再検証する。
 
-## Verification provider
+Origenはreceipt digestをRoot statementへ署名し、receipt本体をproofへ置く。任意`--timestamp`をtrusted timeへ昇格しない。
 
-`--verify-command '/trusted/origen-verify-provider --trust-policy publisher-v1'`
+## Build / inspect
 
-stdinはsign requestと同じpayload情報に `proof` を追加する。stdoutは次を返す。
+Builderはsnapshot path、input digest/media type、output directory、typed operation/source bindingsを受ける。InspectorはFinal snapshot、required coverage、STRICT summaryを受ける。Inspectorはcoverage全項目とcontent signal checksを返す。自己申告だけでなく、approved/pinned独立Inspectorであることがtrust boundaryである。
 
-```json
-{
-  "verified": true,
-  "provider": "kms:example",
-  "key_id": "non-secret stable key id",
-  "algorithm": "ES256",
-  "provider_version": "pinned provider version",
-  "key_protection": "kms"
-}
-```
-
-Origenはprovider/key/algorithmがsigned proofと一致しない場合もrejectする。certificate chain、revocation、timestamp authority、trust list等のpolicyはprovider側が所有する。
-
-## Trusted rebuild adapter
-
-`--adapter-command '/trusted/origen-media-adapter --policy publisher-v1'`
-
-stdin:
-
-```json
-{
-  "operation": "rebuild",
-  "input_path": "/absolute/untrusted/input",
-  "output_path": "/absolute/temporary/output",
-  "input_media_type": "image/jpeg",
-  "input_family": "image",
-  "guarantee_level": "standard"
-}
-```
-
-adapterは指定outputへ新規assetを書き、stdoutへ次を返す。
-
-```json
-{
-  "status": "rebuilt",
-  "tool": "organization/tool-name",
-  "version": "pinned version",
-  "media_type": "image/jpeg",
-  "guarantees": [
-    "decoded-content",
-    "clean-container-rebuild",
-    "metadata-policy-applied",
-    "provenance-inspected",
-    "output-validated"
-  ],
-  "content_provenance": "unknown",
-  "dependency_provenance": "package/lock or binary origin",
-  "reproducible_install": "pinned installation procedure"
-}
-```
-
-5つのguaranteeはすべて必須。これは文字列を返せば任意toolが安全になるという意味ではない。Projectはcommand path、binary/version、configuration、sandbox、trust policyを別途管理する。Origenはその明示的trust decisionを証拠へ固定する境界である。
-
-final assetへC2PA等を意図的に再発行した場合だけ、`embedded_provenance: "validated-final"` を追加する。これがないoutputでknown provenance markerを検出した場合、Origenはrejectする。
-
-Origenはadapter commandの解決済みexecutableと、argv中の実在script/config fileをSHA-256でfingerprintし、version、dependency provenance、reproducible install記述とともにfinal evidenceへ固定する。内蔵adapterはPython runtime path/version/hashとOrigen script hashを記録する。
-
-## STRICT ORIGIN adapter
-
-STRICT requestは通常fieldに加えて、検証済みHuman sourceだけを渡す。
-
-```json
-{
-  "guarantee_level": "strict_origin",
-  "strict_origin": {
-    "verified_sources": [
-      {
-        "source_id": "root",
-        "asset_path": "/verified/human-source",
-        "asset_id": "sha256:...",
-        "evidence_digest": "..."
-      }
-    ],
-    "transformation": {"op": "trusted-deterministic", "parameters": {}}
-  }
-}
-```
-
-STRICT adapterは通常の5保証に加え、`human-origin-inputs-only`、`deterministic-transformation`、`content-origin-mapped`を返す。Origenはpositional inputがprimary signed Human sourceと一致することをadapter起動前に確認する。
-
-## C2PA provider
-
-C2PA/CAWGを使う場合、適合SDKや`c2patool` wrapperをprovider/adapterに実装し、private key pathをOrigenへ渡さない。C2PA validation result、trust list、certificate identityをprovider側で検証し、Origenには成功/失敗と非秘密identifierだけを返す。
+External toolのbinary/version/script/config/resource hashes、dependency provenance、reproducible installはPolicyとsigned toolchain claimへ残す。
