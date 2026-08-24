@@ -3,7 +3,7 @@ name: origen
 description: Human Sourceをauthorization-bound Rootとして固定し、AI/tool outputを検証・署名してContent Origin / Provenance Evidenceとatomic publish bundleを作る。Signerの秘密鍵保管やPublisher実装には使わない。
 license: MIT. See LICENSE.txt
 metadata:
-  agent-directory.version: "0.4.0"
+  agent-directory.version: "0.5.0"
   agent-directory.status: "active"
   agent-directory.aliases: "Origen,オリジェン,content-origin,content-provenance"
 ---
@@ -107,6 +107,18 @@ python3 skills/origen/scripts/origen.py prepublish \
   --bundle publish-bundle --root-evidence ROOT.origen.json
 ```
 
+複数bundleを1回のPublisher handoffで出すときは`prepublish-batch`を使う。singleと同じ署名・Policy・asset・receipt・lineage・trusted time・STRICT rebuild検証をそのまま使い、configごとにPolicyとProvider registryを1回だけsnapshotし、bundle検証だけをbounded concurrencyで走らせる。
+
+```bash
+python3 skills/origen/scripts/origen.py prepublish-batch \
+  --input prepublish-batch.json --concurrency 4
+```
+
+- input schemaは`origen-prepublish-batch/1`、itemは`id`（非空・一意）、`bundle`、`config`、任意の`root_evidence` / `parent_evidence` / `source_map`。
+- item数は1..10000、concurrencyは1..8（既定4、item数で頭打ち）。
+- result schemaは`origen-prepublish-batch-result/1`で、input順の`results`、`item_count`、`config_loads`、実効`concurrency`を返す。
+- 1件でも失敗したらbatch全体をfail closedし、`BATCH_VERIFICATION_FAILED`とitem ID / index / 原因codeを返す。partial resultもpartial receiptも返さない。
+
 別configは `--config` または `ORIGEN_CONFIG` で指定できる。通常操作ではsigner ID、verifier ID、timestamp Provider ID、Provider固有CLIを渡さない。
 
 ## 保証
@@ -117,13 +129,14 @@ python3 skills/origen/scripts/origen.py prepublish \
 - STRICT ORIGIN: Signed Human Source mapping外のgenerated contentをFinalへ導入していないことを検証
 - Final: trusted build、independent inspection、final signature、atomic no-overwrite bundle
 - verify/prepublish: 秘密鍵なしでsignature、Policy、asset、receipt、lineageを再検証
+- prepublish-batch: 同一検証をbundle単位で並列化し、全件合格までpublish-readyを出さない
 - unsupported、malformed、unknown critical field、incomplete coverage、不一致はfail closed
 
 Evidence詳細は[Evidence v4](references/evidence-schema.md)、STRICTは[Strict Origin](references/strict-origin.md)、formatは[coverage matrix](references/coverage.md)と[Adapters](references/adapters.md)を読む。
 
 ## Publisher境界
 
-OrigenはPublisherを含めない。Publisherはverified bundle内の `asset` だけをstreamし、upload時にSHA-256を再確認し、prepublish後にrewrite/re-encodeしない。詳細は[publisher handoff](references/publisher-handoff.md)。
+OrigenはPublisherを含めない。Publisherはverified bundle内の `asset` だけをstreamし、upload時にSHA-256を再確認し、prepublish後にrewrite/re-encodeしない。batch handoffでは全receiptが揃うまでstagingを開始しない。詳細は[publisher handoff](references/publisher-handoff.md)。
 
 ## 秘密鍵・recovery
 
