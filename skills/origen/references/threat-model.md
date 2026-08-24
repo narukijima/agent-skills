@@ -24,6 +24,7 @@ secure snapshot、config alias resolution、Provider registry hash check、autho
 
 - Root signatureはidentity assertionでありhuman authorship forensic proofではない。
 - OS-level network deny、read-only mount、key custody、HSM policy、dual approvalはProject/Providerが実装する。Origenはportable protocolとEvidence bindingを持つ。
+- 無人運用で`interaction: none`を選ぶことは、同一ユーザ権限のprocessから秘密鍵を使える状態を受け入れる判断である。Origenはこれを隠さず宣言・実測させ、漏洩疑いをrotationで扱う。AIが任意contentをRoot keyで署名する経路はauthorization receipt要求で塞いだままにする。
 - approved external Inspectorのparser/decoder correctnessとtrust listは外部tool責務。
 - grapheme boundaryはPython Unicode databaseに基づくconservative implementationで、versionをEvidenceへ記録する。
 - atomic no-replace directory publicationはruntime adapterが提供する。現在のprocess runtimeは対応するPOSIX primitiveを選択し、利用不能ならfail closedする。

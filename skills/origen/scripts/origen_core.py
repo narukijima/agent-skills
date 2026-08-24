@@ -15,7 +15,7 @@ import unicodedata
 import zlib
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REQUIRED_ADAPTER_GUARANTEES = {
     "decoded-content",
     "clean-container-rebuild",

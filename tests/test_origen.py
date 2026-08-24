@@ -37,7 +37,9 @@ def load_engine_module():
     return module
 
 
-class OrigenTests(unittest.TestCase):
+class OrigenFixture(unittest.TestCase):
+    """Registry, config, and command helpers shared by every Origen suite."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -48,14 +50,18 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 request = json.load(sys.stdin)
 operation = request["operation"]
+delay = os.environ.get("ORIGEN_TEST_INTERACTION_DELAY")
+if delay and operation in {"sign", "timestamp"}:
+    time.sleep(float(delay))
 identity = {"root-key": "human-root-service", "final-key": "final-build-service", "final-key-v2": "final-build-service-v2"}
 verifiers = {"root-key": {"public_key": "ed25519:test-root"}, "final-key": {"public_key": "ed25519:test-final"}, "final-key-v2": {"verifier_ref": "did:key:test-final-v2"}}
 
 if operation == "health":
-    json.dump({"healthy": True}, sys.stdout)
+    json.dump({"healthy": os.environ.get("ORIGEN_TEST_UNHEALTHY") != "1"}, sys.stdout)
 elif operation == "capabilities":
     json.dump({"operations": ["authorize_root", "verify_authorization", "sign", "verify", "get_public_key", "timestamp", "verify_timestamp"]}, sys.stdout)
 elif operation == "get_public_key":
@@ -79,8 +85,8 @@ elif operation == "sign":
     key_id = request["key_id"]
     signature = hashlib.sha256(b"ed25519-test:" + key_id.encode() + b":" + payload).hexdigest()
     response = {"provider_id": "sign-provider", "key_id": key_id, "algorithm": "Ed25519", "signer_identity": identity[key_id], "signature": signature}
-    if request.get("role") == "root-attestor":
-        statement = json.loads(payload)
+    statement = json.loads(payload)
+    if request.get("role") == "root-attestor" and "authorization" in statement:
         response["authorization_receipt_digest"] = statement["authorization"]["receipt_digest"]
     json.dump(response, sys.stdout)
 elif operation == "verify":
@@ -116,7 +122,7 @@ else:
             "expected_script_sha256": {str(self.provider): sha256(self.provider)},
             "expected_resource_sha256": {},
             "provider_identity": provider_identity,
-            "inherit_environment": ["ORIGEN_TEST_AUTH_TYPE"],
+            "inherit_environment": ["ORIGEN_TEST_AUTH_TYPE", "ORIGEN_TEST_INTERACTION_DELAY", "ORIGEN_TEST_UNHEALTHY"],
             "version": "test-1",
             "dependency_provenance": "test fixture",
             "reproducible_install": "python stdlib fixture",
@@ -151,6 +157,27 @@ else:
             mutate(value)
         self.registry.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
         return value
+
+    def declare_interaction(self, value):
+        def mutate(registry):
+            for provider in registry["providers"].values():
+                provider["interaction"] = value
+        return self.write_registry(mutate)
+
+    def unattended_setup(self, *, config_name="unattended.json", probe_timeout=None, expected=0, env=None):
+        policy_path = None
+        if probe_timeout is not None:
+            policy_path = self.root / "unattended-policy.json"
+            policy_path.write_text(json.dumps({"resource_limits": {"unattended_probe_timeout_seconds": probe_timeout}}), encoding="utf-8")
+        config = self.root / config_name
+        arguments = [
+            "setup", "--provider-registry", self.registry, "--root-signer", "default-root",
+            "--final-signer", "default-final", "--timestamp-provider", "default",
+            "--unattended", "--config", config,
+        ]
+        if policy_path is not None:
+            arguments += ["--policy", policy_path]
+        return config, self.run_origen(*arguments, expected=expected, cwd=REPO_ROOT, env=env)
 
     def update_config_policy(self, **values):
         config = json.loads(self.config.read_text(encoding="utf-8"))
@@ -218,9 +245,11 @@ else:
         chunks.extend([self.png_chunk(b"IDAT", zlib.compress(b"\x00\x00")), self.png_chunk(b"IEND", b"")])
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"".join(chunks))
 
+
+class OrigenTests(OrigenFixture):
     def test_setup_writes_minimal_alias_config_and_self_tests(self):
         config = json.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(config["schema_version"], "origen-config/1")
+        self.assertEqual(config["schema_version"], "origen-config/2")
         self.assertEqual(config["root_signer"], "default-root")
         self.assertEqual(config["final_signer"], "default-final")
         self.assertEqual(config["timestamp_provider"], "default")
@@ -614,6 +643,212 @@ else:
         self.assertEqual(result["status"], "development-publish-ready")
         self.assertEqual(result["concurrency"], 1)
         self.assertEqual(result["results"][0]["receipt"]["status"], "development-publish-ready")
+
+
+    def test_unattended_setup_measures_declared_providers_instead_of_trusting_them(self):
+        self.declare_interaction("none")
+        config, result = self.unattended_setup()
+        self.assertTrue(result["unattended"])
+        checked = {entry["id"]: entry for entry in result["providers_checked"]}
+        self.assertEqual({entry["interaction"] for entry in checked.values()}, {"none"})
+        for entry in checked.values():
+            self.assertEqual(entry["unattended_probe"]["result"], "passed")
+        # The Root key is exercised only because the deployment claimed unattended eligibility.
+        self.assertEqual(checked["default-root"]["self_test"], "passed")
+        self.assertTrue(json.loads(config.read_text(encoding="utf-8"))["unattended"])
+
+    def test_root_key_is_not_exercised_when_unattended_is_not_claimed(self):
+        result = self.run_origen("doctor", "--config", self.config)
+        checked = {entry["id"]: entry for entry in result["providers"]}
+        self.assertEqual(checked["default-root"]["self_test"], "skipped")
+        self.assertEqual(checked["default-final"]["self_test"], "passed")
+        self.assertIsNone(checked["default-root"]["interaction"])
+        self.assertNotIn("unattended_probe", checked["default-root"])
+        self.assertFalse(result["unattended"])
+        self.assertEqual(result["status"], "healthy")
+
+    def test_declared_unattended_provider_that_waits_for_interaction_fails_closed(self):
+        self.declare_interaction("none")
+        environment = dict(os.environ, ORIGEN_TEST_INTERACTION_DELAY="5")
+        _, rejected = self.unattended_setup(probe_timeout=1, expected=1, env=environment)
+        self.assertEqual(rejected["error"]["code"], "UNATTENDED_PROBE_TIMEOUT")
+        self.assertEqual(rejected["error"]["deadline_seconds"], 1)
+        self.assertFalse((self.root / "unattended.json").exists())
+
+    def test_unattended_setup_rejects_providers_that_never_declared_eligibility(self):
+        _, rejected = self.unattended_setup(expected=1)
+        self.assertEqual(rejected["error"]["code"], "UNATTENDED_PROVIDER_REQUIRED")
+        self.assertIsNone(rejected["error"]["interaction"])
+
+    def test_unattended_config_rejects_a_provider_that_loses_its_declaration(self):
+        self.declare_interaction("none")
+        config, _ = self.unattended_setup()
+        self.declare_interaction("per-signature")
+        rejected = self.run_origen("doctor", "--config", config, expected=1)
+        self.assertEqual(rejected["error"]["code"], "UNATTENDED_PROVIDER_REQUIRED")
+        self.assertEqual(rejected["error"]["interaction"], "per-signature")
+        human = self.root / "unattended-human.txt"
+        human.write_text("Human source\n", encoding="utf-8")
+        blocked = self.run_origen(
+            "root", human, "--creator-id", "creator:test", "--origin-id", "origin:test",
+            "--evidence", self.root / "unattended-root.json", "--config", config, expected=1,
+        )
+        self.assertEqual(blocked["error"]["code"], "UNATTENDED_PROVIDER_REQUIRED")
+
+    def test_unknown_interaction_declaration_is_rejected(self):
+        self.declare_interaction("occasionally")
+        rejected = self.run_origen("doctor", "--config", self.config, expected=1)
+        self.assertEqual(rejected["error"]["code"], "INVALID_INTERACTION_DECLARATION")
+
+    def test_doctor_fails_closed_on_an_unhealthy_provider_and_writes_nothing(self):
+        environment = dict(os.environ, ORIGEN_TEST_UNHEALTHY="1")
+        rejected = self.run_origen("doctor", "--config", self.config, expected=1, env=environment)
+        self.assertEqual(rejected["error"]["code"], "PROVIDER_SELF_TEST_FAILED")
+
+    def rotate_final_signer(self, config=None):
+        self.write_registry(lambda value: value["signers"].update({
+            "default-final-v2": {
+                "provider": "sign-provider", "key_id": "final-key-v2", "algorithm": "Ed25519",
+                "signer_identity": "final-build-service-v2", "verifier": {"verifier_ref": "did:key:test-final-v2"},
+            }
+        }))
+        config = config or self.config
+        value = json.loads(config.read_text(encoding="utf-8"))
+        value["final_signer"] = "default-final-v2"
+        config.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+    def test_signer_rotation_keeps_unpublished_human_roots_finalizable(self):
+        root_evidence, _ = self.capture_root()
+        self.rotate_final_signer()
+        draft = self.root / "draft.txt"
+        draft.write_text("backlog drafted before the rotation\n", encoding="utf-8")
+        bundle, result = self.finalize(draft, root_evidence)
+        self.assertTrue(result["publish_ready"])
+        final = json.loads((bundle / "evidence.json").read_text(encoding="utf-8"))
+        self.assertEqual(final["identities"]["signer"]["key_id"], "final-key-v2")
+        ready = self.run_origen("prepublish", "--bundle", bundle, "--root-evidence", root_evidence)
+        self.assertTrue(ready["verified"])
+
+    def test_policy_digest_ignores_signer_aliases_but_still_binds_the_trust_policy(self):
+        module = load_engine_module()
+        base = {
+            "schema_version": "origen-config/2", "root_signer": "default-root",
+            "final_signer": "default-final", "timestamp_provider": "default", "policy": {},
+        }
+        rotated = dict(base, root_signer="root-2026", final_signer="final-2026", timestamp_provider="tsa-2026")
+        changed = dict(base, policy={"mode": "development"})
+        digest = lambda config: module.digest_bytes(module.canonical_bytes(module.merged_policy(config)[1]))
+        self.assertEqual(digest(base), digest(rotated))
+        self.assertNotEqual(digest(base), digest(changed))
+
+    def test_policy_digest_mismatch_names_both_policy_claims(self):
+        root_evidence, _ = self.capture_root()
+        draft = self.root / "draft.txt"
+        draft.write_text("draft\n", encoding="utf-8")
+        bundle, _ = self.finalize(draft, root_evidence)
+        self.update_config_policy(policy_version="2.0.0")
+        rejected = self.run_origen("verify", "--bundle", bundle, "--root-evidence", root_evidence, expected=1)
+        self.assertEqual(rejected["error"]["code"], "POLICY_DIGEST_MISMATCH")
+        self.assertEqual(rejected["error"]["signed_policy"]["policy_version"], "1.0.0")
+        self.assertEqual(rejected["error"]["expected_policy"]["policy_version"], "2.0.0")
+        self.assertNotEqual(rejected["error"]["signed_policy"]["digest"], rejected["error"]["expected_policy"]["digest"])
+
+
+SSH_KEYGEN = next((candidate for candidate in ("/usr/bin/ssh-keygen", "/opt/homebrew/bin/ssh-keygen", "/usr/local/bin/ssh-keygen") if Path(candidate).is_file()), None)
+FILE_SIGNER = REPO_ROOT / "skills/origen/providers/unattended-file-signer.py"
+
+
+@unittest.skipUnless(SSH_KEYGEN, "OpenSSH ssh-keygen is required by the reference unattended signer")
+class UnattendedFileSignerTests(OrigenFixture):
+    """The shipped reference Provider, driven end to end through Origen itself."""
+
+    def setUp(self):
+        self.keys = tempfile.TemporaryDirectory()
+        self.environment = mock.patch.dict(os.environ, {
+            "ORIGEN_FILE_SIGNER_HOME": str(Path(self.keys.name) / "keys"),
+            "ORIGEN_SSH_KEYGEN": SSH_KEYGEN,
+        })
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.addCleanup(self.keys.cleanup)
+        initialized = subprocess.run(
+            [sys.executable, str(FILE_SIGNER), "init", "--home", os.environ["ORIGEN_FILE_SIGNER_HOME"]],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(initialized.returncode, 0, msg=initialized.stderr)
+        self.fragment = json.loads(initialized.stdout)
+        super().setUp()
+
+    def file_signer_provider(self):
+        runtime = Path(sys.executable).resolve()
+        return {
+            "executable": str(runtime),
+            "arguments": [str(FILE_SIGNER)],
+            "expected_executable_sha256": sha256(runtime),
+            "expected_script_sha256": {str(FILE_SIGNER): sha256(FILE_SIGNER)},
+            "expected_resource_sha256": {},
+            "provider_identity": "origen-file-signer",
+            "interaction": "none",
+            "inherit_environment": ["ORIGEN_FILE_SIGNER_HOME", "ORIGEN_SSH_KEYGEN"],
+            "version": "reference-1",
+            "dependency_provenance": "OpenSSH ssh-keygen SSHSIG",
+            "reproducible_install": "operator-generated Ed25519 key files, mode 0600",
+        }
+
+    def registry_value(self):
+        value = super().registry_value()
+        value["providers"]["origen-file-signer"] = self.file_signer_provider()
+        value["providers"]["time-provider"]["interaction"] = "none"
+        value["signers"] = self.fragment["signers"]
+        return value
+
+    def test_reference_signer_runs_the_whole_flow_without_interaction(self):
+        config, setup = self.unattended_setup(config_name="file-signer.json", probe_timeout=20)
+        self.assertEqual(setup["self_test"], "passed")
+        self.assertTrue(setup["unattended"])
+        doctor = self.run_origen("doctor", "--config", config)
+        self.assertEqual(doctor["status"], "healthy")
+        self.assertEqual({entry["interaction"] for entry in doctor["providers"]}, {"none"})
+        human = self.root / "human.txt"
+        human.write_text("Human source written by a person.\n", encoding="utf-8")
+        root_evidence = self.root / "file-root.json"
+        root = self.run_origen(
+            "root", human, "--creator-id", "creator:file", "--origin-id", "origin:file",
+            "--evidence", root_evidence, "--config", config,
+        )
+        self.assertEqual(root["root_assurance_level"], "trusted_time")
+        signed = json.loads(root_evidence.read_text(encoding="utf-8"))
+        self.assertEqual(signed["authorization"]["boundary_type"], "provider_authorization")
+        self.assertTrue(signed["identities"]["signer"]["verifier"]["public_key"].startswith("ssh-ed25519 "))
+        draft = self.root / "draft.txt"
+        draft.write_text("AI assisted body.\n", encoding="utf-8")
+        bundle = self.root / "file-bundle"
+        finalized = self.run_origen(
+            "finalize", draft, "--bundle", bundle, "--root-evidence", root_evidence, "--config", config,
+        )
+        self.assertTrue(finalized["publish_ready"])
+        ready = self.run_origen("prepublish", "--bundle", bundle, "--root-evidence", root_evidence, "--config", config)
+        self.assertTrue(ready["verified"])
+
+    def test_reference_signer_never_leaks_key_material_and_refuses_reinit(self):
+        config, _ = self.unattended_setup(config_name="file-signer.json", probe_timeout=20)
+        human = self.root / "human.txt"
+        human.write_text("Human source\n", encoding="utf-8")
+        root_evidence = self.root / "file-root.json"
+        self.run_origen(
+            "root", human, "--creator-id", "creator:file", "--origin-id", "origin:file",
+            "--evidence", root_evidence, "--config", config,
+        )
+        for path in (root_evidence, config, self.registry):
+            self.assertNotIn("PRIVATE KEY", path.read_text(encoding="utf-8"))
+        home = Path(os.environ["ORIGEN_FILE_SIGNER_HOME"])
+        self.assertEqual((home / "root.key").stat().st_mode & 0o077, 0)
+        again = subprocess.run(
+            [sys.executable, str(FILE_SIGNER), "init", "--home", str(home)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("refusing to overwrite", again.stderr)
 
 
 if __name__ == "__main__":
