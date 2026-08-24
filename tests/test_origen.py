@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import zlib
@@ -184,6 +185,27 @@ else:
             if name in extra:
                 args += ["--" + name.replace("_", "-"), extra[name]]
         return bundle, self.run_origen(*args, expected=extra.get("expected", 0))
+
+    def batch_input(self, items, path=None, schema_version="origen-prepublish-batch/1", extra=None):
+        path = path or self.root / "batch.json"
+        document = {"schema_version": schema_version, "items": items}
+        if extra:
+            document.update(extra)
+        path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+        return path
+
+    def batch_item(self, identifier, bundle, root_evidence, config=None, **extra):
+        item = {"id": identifier, "bundle": str(bundle), "config": str(config or self.config)}
+        if root_evidence is not None:
+            item["root_evidence"] = str(root_evidence)
+        item.update({key: str(value) for key, value in extra.items()})
+        return item
+
+    def make_bundle(self, name, root_evidence, body=None):
+        draft = self.root / (name + ".txt")
+        draft.write_text(body or (name + " output\n"), encoding="utf-8")
+        bundle, _ = self.finalize(draft, root_evidence, bundle=self.root / name)
+        return bundle
 
     @staticmethod
     def png_chunk(kind, data):
@@ -433,6 +455,165 @@ else:
         help_text = subprocess.run([sys.executable, str(ORIGEN), "root", "--help"], stdout=subprocess.PIPE, text=True, check=True).stdout
         self.assertNotIn("keychain", help_text.lower())
         self.assertNotIn("private", help_text.lower())
+
+    def test_prepublish_batch_matches_single_prepublish_and_loads_config_once(self):
+        root_evidence, _ = self.capture_root()
+        bundles = [self.make_bundle(f"batch-{index}", root_evidence) for index in range(3)]
+        singles = [
+            self.run_origen("prepublish", "--bundle", bundle, "--root-evidence", root_evidence)
+            for bundle in bundles
+        ]
+        batch_input = self.batch_input([
+            self.batch_item(f"item-{index}", bundle, root_evidence)
+            for index, bundle in enumerate(bundles)
+        ])
+        result = self.run_origen("prepublish-batch", "--input", batch_input, "--concurrency", 4)
+        self.assertEqual(result["schema_version"], "origen-prepublish-batch-result/1")
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["status"], "publish-ready")
+        self.assertEqual(result["item_count"], 3)
+        self.assertEqual(result["config_loads"], 1)
+        self.assertEqual(result["concurrency"], 3)
+        self.assertTrue(result["publisher_must_not_stage_partial_batch"])
+        self.assertEqual([entry["id"] for entry in result["results"]], ["item-0", "item-1", "item-2"])
+        self.assertEqual([entry["index"] for entry in result["results"]], [0, 1, 2])
+        self.assertEqual([entry["receipt"] for entry in result["results"]], singles)
+
+    def test_prepublish_batch_spans_multiple_configs_and_strict_origin_items(self):
+        human = self.root / "human.txt"
+        human.write_text("Alpha\nBeta\n", encoding="utf-8")
+        root_evidence, _ = self.capture_root(human)
+        standard = self.make_bundle("standard", root_evidence)
+        source_map = self.root / "map.json"
+        source_map.write_text(json.dumps({
+            "schema_version": "origen-source-map/2", "kind": "text", "instruction_actor": "human",
+            "sources": [{"source_id": "root", "asset": str(human), "evidence": str(root_evidence)}],
+            "operations": [{"op": "slice", "source_id": "root", "start": 0, "end": 6, "boundary": "line"}],
+        }), encoding="utf-8")
+        composed = self.root / "composed.txt"
+        self.run_origen("strict-compose", "--source-map", source_map, "--root-evidence", root_evidence, "--output", composed)
+        strict, _ = self.finalize(
+            composed, root_evidence, bundle=self.root / "strict-bundle",
+            guarantee_level="strict_origin", source_map=source_map, source_kind="human-edit",
+        )
+        second_config = self.root / "second" / "config.json"
+        second_config.parent.mkdir()
+        second_config.write_text(self.config.read_text(encoding="utf-8"), encoding="utf-8")
+        batch_input = self.batch_input([
+            self.batch_item("standard", standard, root_evidence),
+            self.batch_item("strict", strict, root_evidence, source_map=source_map),
+            self.batch_item("standard-second-config", standard, root_evidence, config=second_config),
+        ])
+        result = self.run_origen("prepublish-batch", "--input", batch_input, "--concurrency", 2)
+        self.assertEqual(result["config_loads"], 2)
+        self.assertEqual(result["concurrency"], 2)
+        self.assertEqual(result["item_count"], 3)
+        self.assertTrue(all(entry["receipt"]["verified"] for entry in result["results"]))
+        self.assertEqual(result["results"][1]["receipt"]["guarantee_mode"], "strict_origin")
+
+    def test_prepublish_batch_fails_closed_and_returns_no_partial_results(self):
+        root_evidence, _ = self.capture_root()
+        good = self.make_bundle("good", root_evidence)
+        tampered = self.make_bundle("tampered", root_evidence)
+        (tampered / "asset").chmod(0o600)
+        (tampered / "asset").write_text("swapped bytes\n", encoding="utf-8")
+        missing_root = self.make_bundle("missing-root", root_evidence)
+        batch_input = self.batch_input([
+            self.batch_item("good", good, root_evidence),
+            self.batch_item("tampered", tampered, root_evidence),
+            self.batch_item("no-root", missing_root, None),
+        ])
+        rejected = self.run_origen("prepublish-batch", "--input", batch_input, expected=1)
+        self.assertEqual(rejected["error"]["code"], "BATCH_VERIFICATION_FAILED")
+        self.assertNotIn("results", rejected)
+        self.assertFalse(rejected["publish_ready"])
+        error = rejected["error"]
+        self.assertEqual(error["item_count"], 3)
+        self.assertEqual(error["failed_count"], 2)
+        self.assertEqual([failure["index"] for failure in error["failures"]], [1, 2])
+        self.assertEqual([failure["id"] for failure in error["failures"]], ["tampered", "no-root"])
+        self.assertEqual(error["failures"][0]["code"], "ASSET_MISMATCH")
+        self.assertEqual(error["failures"][1]["code"], "LINEAGE_INCOMPLETE")
+        self.assertEqual(error["first_failure_code"], "ASSET_MISMATCH")
+
+    def test_prepublish_batch_reports_unreadable_config_against_every_owning_item(self):
+        root_evidence, _ = self.capture_root()
+        bundle = self.make_bundle("only", root_evidence)
+        batch_input = self.batch_input([
+            self.batch_item("a", bundle, root_evidence, config=self.root / "absent.json"),
+            self.batch_item("b", bundle, root_evidence),
+            self.batch_item("c", bundle, root_evidence, config=self.root / "absent.json"),
+        ])
+        rejected = self.run_origen("prepublish-batch", "--input", batch_input, expected=1)
+        error = rejected["error"]
+        self.assertEqual(rejected["error"]["code"], "BATCH_VERIFICATION_FAILED")
+        self.assertEqual([failure["id"] for failure in error["failures"]], ["a", "c"])
+        self.assertTrue(all(failure["code"] == "FILE_NOT_FOUND" for failure in error["failures"]))
+
+    def test_prepublish_batch_input_contract_is_fail_closed(self):
+        root_evidence, _ = self.capture_root()
+        bundle = self.make_bundle("contract", root_evidence)
+        item = self.batch_item("one", bundle, root_evidence)
+
+        def reject(items, *, expected_code, path=None, schema_version="origen-prepublish-batch/1", extra=None, concurrency=None):
+            arguments = ["prepublish-batch", "--input", self.batch_input(items, path=path, schema_version=schema_version, extra=extra)]
+            if concurrency is not None:
+                arguments += ["--concurrency", concurrency]
+            self.assertEqual(self.run_origen(*arguments, expected=1)["error"]["code"], expected_code)
+
+        reject([item], expected_code="INVALID_BATCH_INPUT", schema_version="origen-prepublish-batch/2")
+        reject([item], expected_code="INVALID_BATCH_INPUT", extra={"concurrency": 2})
+        reject([], expected_code="INVALID_BATCH_INPUT")
+        reject([item, dict(item)], expected_code="DUPLICATE_BATCH_ITEM_ID")
+        reject([{**item, "unexpected": "x"}], expected_code="INVALID_BATCH_INPUT")
+        reject([{key: value for key, value in item.items() if key != "config"}], expected_code="INVALID_BATCH_INPUT")
+        reject([{**item, "id": ""}], expected_code="INVALID_BATCH_INPUT")
+        reject([{**item, "bundle": ""}], expected_code="INVALID_BATCH_INPUT")
+        reject([item], expected_code="INVALID_BATCH_CONCURRENCY", concurrency=0)
+        reject([item], expected_code="INVALID_BATCH_CONCURRENCY", concurrency=9)
+        self.assertEqual(
+            self.run_origen("prepublish-batch", "--input", self.root / "absent-batch.json", expected=1)["error"]["code"],
+            "FILE_NOT_FOUND",
+        )
+
+    def test_run_batch_bounds_live_verifications_and_keeps_input_order(self):
+        module = load_engine_module()
+        items = [
+            module.BatchItem(
+                index=index, id=f"item-{index}", config_key="shared", config_path=Path("/absent"),
+                request=module.BundleRequest(bundle=f"bundle-{index}"),
+            )
+            for index in range(12)
+        ]
+        # A 3-party barrier only clears if the pool really runs 3 bundles at once,
+        # and max_workers=3 caps the live count at exactly the party size.
+        barrier = threading.Barrier(3, timeout=30)
+        lock = threading.Lock()
+        live = {"now": 0, "peak": 0}
+
+        def tracked(item, context, core):
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            barrier.wait()
+            with lock:
+                live["now"] -= 1
+            return {"status": "publish-ready", "bundle": item.request.bundle}
+
+        with mock.patch.object(module, "verify_batch_item", tracked):
+            receipts = module.run_batch(items, {"shared": None}, None, 3)
+        self.assertEqual(live["peak"], 3)
+        self.assertEqual([receipt["bundle"] for receipt in receipts], [f"bundle-{index}" for index in range(12)])
+
+    def test_prepublish_batch_labels_development_policy_and_bounds_concurrency(self):
+        self.update_config_policy(mode="development")
+        root_evidence, _ = self.capture_root()
+        bundle = self.make_bundle("development", root_evidence)
+        batch_input = self.batch_input([self.batch_item("only", bundle, root_evidence)])
+        result = self.run_origen("prepublish-batch", "--input", batch_input, "--concurrency", 8)
+        self.assertEqual(result["status"], "development-publish-ready")
+        self.assertEqual(result["concurrency"], 1)
+        self.assertEqual(result["results"][0]["receipt"]["status"], "development-publish-ready")
 
 
 if __name__ == "__main__":

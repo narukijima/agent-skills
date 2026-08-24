@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -27,12 +28,23 @@ from typing import Any
 import origen_atomic
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SCHEMA_VERSION = "origen-evidence/4"
 CONFIG_VERSION = "origen-config/1"
 POLICY_VERSION = "origen-trust-policy/2"
 REGISTRY_VERSION = "origen-provider-registry/1"
 OPERATION_VERSION = "origen-operation/1"
+BATCH_INPUT_VERSION = "origen-prepublish-batch/1"
+BATCH_RESULT_VERSION = "origen-prepublish-batch-result/1"
+BATCH_ROOT_FIELDS = {"schema_version", "items"}
+BATCH_ITEM_REQUIRED_FIELDS = {"id", "bundle", "config"}
+BATCH_ITEM_OPTIONAL_FIELDS = {"root_evidence", "parent_evidence", "source_map"}
+BATCH_MAX_ITEMS = 10000
+BATCH_MIN_CONCURRENCY = 1
+BATCH_MAX_CONCURRENCY = 8
+BATCH_DEFAULT_CONCURRENCY = 4
+BATCH_INPUT_BYTES = 16 * 1024 * 1024
+BATCH_INPUT_JSON_DEPTH = 8
 SOURCE_MAP_VERSIONS = {"origen-source-map/2"}
 POLICY_MODES = {"development", "production"}
 SIGNER_ROLES = {"root-attestor", "final-attestor"}
@@ -73,6 +85,7 @@ OPERATION_PARAMETERS = {
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+BATCH_ID_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
 
 DEFAULT_LIMITS: dict[str, int | float] = {
     "input_file_bytes": 64 * 1024 * 1024,
@@ -1519,8 +1532,17 @@ def discover_config_path(raw: str | None) -> Path:
     return Path.cwd() / ".origen" / "config.json"
 
 
-def policy_context(args: argparse.Namespace, store: SnapshotStore, core: Any) -> tuple[dict[str, object], str, dict[str, int | float]]:
-    config_path = discover_config_path(getattr(args, "config", None))
+@dataclass(frozen=True)
+class PolicyContext:
+    """One config's resolved Policy, Provider registry, and limits, snapshot exactly once."""
+
+    policy: dict[str, object]
+    policy_digest: str
+    limits: dict[str, int | float]
+    timestamp_provider_id: str
+
+
+def build_policy_context(config_path: Path, store: SnapshotStore, core: Any) -> PolicyContext:
     config_snapshot = store.capture(config_path, label="Origen config", maximum=4 * 1024 * 1024)
     config = load_config(config_snapshot, core)
     policy, policy_document = merged_policy(config)
@@ -1549,8 +1571,18 @@ def policy_context(args: argparse.Namespace, store: SnapshotStore, core: Any) ->
     environment = dict(policy["environment_policy"])
     environment["approved_path"] = list(dict.fromkeys([*environment.get("approved_path", []), *executable_dirs]))
     policy["environment_policy"] = environment
-    setattr(args, "timestamp_provider_id", config["timestamp_provider"])
-    return policy, digest_bytes(canonical_bytes(policy_document)), policy_limits(policy)
+    return PolicyContext(
+        policy=policy,
+        policy_digest=digest_bytes(canonical_bytes(policy_document)),
+        limits=policy_limits(policy),
+        timestamp_provider_id=config["timestamp_provider"],
+    )
+
+
+def policy_context(args: argparse.Namespace, store: SnapshotStore, core: Any) -> tuple[dict[str, object], str, dict[str, int | float]]:
+    context = build_policy_context(discover_config_path(getattr(args, "config", None)), store, core)
+    setattr(args, "timestamp_provider_id", context.timestamp_provider_id)
+    return context.policy, context.policy_digest, context.limits
 
 
 def command_root(args: argparse.Namespace, core: Any) -> dict[str, object]:
@@ -1866,56 +1898,250 @@ def verify_lineage_arg(path: str | None, *, label: str, expected_digest: object,
     return evidence
 
 
+@dataclass(frozen=True)
+class BundleRequest:
+    """One publish bundle plus the lineage inputs a single verification needs."""
+
+    bundle: str
+    root_evidence: str | None = None
+    parent_evidence: str | None = None
+    source_map: str | None = None
+
+
+def verify_bundle_with_context(request: BundleRequest, *, context: PolicyContext, store: SnapshotStore, core: Any, prepublish: bool) -> dict[str, object]:
+    """Verify exactly one bundle against an already-snapshot Policy context."""
+    policy, policy_digest, limits = context.policy, context.policy_digest, context.limits
+    timestamp_provider_id = context.timestamp_provider_id
+    if prepublish and policy["mode"] != "production":
+        # Development prepublish remains useful for integration tests, but is
+        # explicitly labeled and never accepted by a Production Policy.
+        status_name = "development-publish-ready"
+    else:
+        status_name = "publish-ready" if prepublish else "verified"
+    asset, _, evidence, receipt = load_bundle(Path(request.bundle), store, limits, core)
+    verify_policy_claim(evidence, policy, policy_digest)
+    with tempfile.TemporaryDirectory(prefix="bundle-verify-", dir=store.root) as work:
+        verify_statement(evidence, resolve_evidence_signer(policy, evidence), policy=policy, limits=limits, workdir=Path(work))
+    expected_asset = validate_asset_record(evidence["asset"], "asset")
+    if asset.sha256 != expected_asset["sha256"] or asset.size != expected_asset["size"]:
+        raise OrigenError("ASSET_MISMATCH", "bundle asset does not match signed Final Evidence")
+    if receipt["asset_sha256"] != asset.sha256 or receipt["evidence_digest"] != evidence_digest(evidence) or receipt["policy_digest"] != policy_digest:
+        raise OrigenError("RECEIPT_MISMATCH", "bundle receipt does not bind exact asset, evidence, and Policy")
+    if receipt["guarantee_mode"] != evidence["assurance"]["derivation"]["mode"] or receipt["media_type"] != expected_asset["media_type"]:
+        raise OrigenError("RECEIPT_MISMATCH", "bundle receipt guarantee/media type differs from Evidence")
+    if receipt["publication_representation"] != evidence["publication"]["representation"] or receipt["allowed_transport_metadata"] != evidence["publication"]["allowed_transport_metadata"]:
+        raise OrigenError("RECEIPT_MISMATCH", "bundle receipt publication contract differs from Evidence")
+    lineage = evidence["lineage"]
+    root = verify_lineage_arg(request.root_evidence, label="root", expected_digest=lineage.get("root_evidence_digest"), expected_asset_id=lineage.get("root_asset_id"), policy=policy, policy_digest=policy_digest, verifier=None, timestamp_provider_id=timestamp_provider_id, store=store, limits=limits, core=core)
+    parent = verify_lineage_arg(request.parent_evidence, label="parent", expected_digest=lineage.get("parent_evidence_digest"), expected_asset_id=lineage.get("parent_asset_id"), policy=policy, policy_digest=policy_digest, verifier=None, timestamp_provider_id=timestamp_provider_id, store=store, limits=limits, core=core)
+    if policy.get("root_required", True) and root is None:
+        raise OrigenError("ROOT_REQUIRED", "Production Policy requires linked Human Root")
+    if parent and parent["lineage"].get("root_evidence_digest") and root and parent["lineage"]["root_evidence_digest"] != evidence_digest(root):
+        raise OrigenError("LINEAGE_MISMATCH", "parent and supplied Human Root disagree")
+    if evidence["assurance"]["derivation"]["mode"] == "strict_origin":
+        if not request.source_map or root is None:
+            raise OrigenError("SOURCE_MAP_REQUIRED", "STRICT ORIGIN prepublish requires source map and Human Root")
+        map_path = Path(request.source_map)
+        map_snapshot = store.capture(map_path, label="source map", maximum=int(limits["source_map_bytes"]))
+        source_context = compose_source_map(map_snapshot, map_original_path=map_path, policy=policy, policy_digest=policy_digest, verifier=None, timestamp_provider_id=timestamp_provider_id, root_evidence=root, store=store, limits=limits, core=core)
+        if canonical_bytes(source_context["summary"]) != canonical_bytes(evidence["source_mapping"]):
+            raise OrigenError("SOURCE_MAP_MISMATCH", "source map summary differs from signed Final Evidence")
+        if source_context["kind"] == "text":
+            rebuilt_digest = digest_bytes(source_context["assembled"])
+            if rebuilt_digest != asset.sha256 or evidence["source_mapping"].get("rebuilt_output_sha256") != asset.sha256:
+                raise OrigenError("REBUILT_DIGEST_MISMATCH", "source snapshots rebuild to bytes different from Final asset")
+    if prepublish and evidence.get("publish_ready") is not True:
+        raise OrigenError("NOT_PUBLISH_READY", "signed Final Evidence is not publish-ready")
+    verified_receipt = dict(receipt)
+    verified_receipt.update({
+        "verified": True, "status": status_name, "bundle": str(request.bundle),
+        "verification_policy_mode": policy["mode"], "publisher_must_rehash_upload": True,
+        "publisher_must_not_transform": True,
+    })
+    return verified_receipt
+
+
 def command_verify(args: argparse.Namespace, core: Any, *, prepublish: bool) -> dict[str, object]:
     with SnapshotStore() as store:
-        policy, policy_digest, limits = policy_context(args, store, core)
-        if prepublish and policy["mode"] != "production":
-            # Development prepublish remains useful for integration tests, but is
-            # explicitly labeled and never accepted by a Production Policy.
-            status_name = "development-publish-ready"
-        else:
-            status_name = "publish-ready" if prepublish else "verified"
-        asset, _, evidence, receipt = load_bundle(Path(args.bundle), store, limits, core)
-        verify_policy_claim(evidence, policy, policy_digest)
-        with tempfile.TemporaryDirectory(prefix="bundle-verify-", dir=store.root) as work:
-            verify_statement(evidence, resolve_evidence_signer(policy, evidence), policy=policy, limits=limits, workdir=Path(work))
-        expected_asset = validate_asset_record(evidence["asset"], "asset")
-        if asset.sha256 != expected_asset["sha256"] or asset.size != expected_asset["size"]:
-            raise OrigenError("ASSET_MISMATCH", "bundle asset does not match signed Final Evidence")
-        if receipt["asset_sha256"] != asset.sha256 or receipt["evidence_digest"] != evidence_digest(evidence) or receipt["policy_digest"] != policy_digest:
-            raise OrigenError("RECEIPT_MISMATCH", "bundle receipt does not bind exact asset, evidence, and Policy")
-        if receipt["guarantee_mode"] != evidence["assurance"]["derivation"]["mode"] or receipt["media_type"] != expected_asset["media_type"]:
-            raise OrigenError("RECEIPT_MISMATCH", "bundle receipt guarantee/media type differs from Evidence")
-        if receipt["publication_representation"] != evidence["publication"]["representation"] or receipt["allowed_transport_metadata"] != evidence["publication"]["allowed_transport_metadata"]:
-            raise OrigenError("RECEIPT_MISMATCH", "bundle receipt publication contract differs from Evidence")
-        lineage = evidence["lineage"]
-        root = verify_lineage_arg(args.root_evidence, label="root", expected_digest=lineage.get("root_evidence_digest"), expected_asset_id=lineage.get("root_asset_id"), policy=policy, policy_digest=policy_digest, verifier=None, timestamp_provider_id=args.timestamp_provider_id, store=store, limits=limits, core=core)
-        parent = verify_lineage_arg(args.parent_evidence, label="parent", expected_digest=lineage.get("parent_evidence_digest"), expected_asset_id=lineage.get("parent_asset_id"), policy=policy, policy_digest=policy_digest, verifier=None, timestamp_provider_id=args.timestamp_provider_id, store=store, limits=limits, core=core)
-        if policy.get("root_required", True) and root is None:
-            raise OrigenError("ROOT_REQUIRED", "Production Policy requires linked Human Root")
-        if parent and parent["lineage"].get("root_evidence_digest") and root and parent["lineage"]["root_evidence_digest"] != evidence_digest(root):
-            raise OrigenError("LINEAGE_MISMATCH", "parent and supplied Human Root disagree")
-        if evidence["assurance"]["derivation"]["mode"] == "strict_origin":
-            if not args.source_map or root is None:
-                raise OrigenError("SOURCE_MAP_REQUIRED", "STRICT ORIGIN prepublish requires source map and Human Root")
-            map_path = Path(args.source_map)
-            map_snapshot = store.capture(map_path, label="source map", maximum=int(limits["source_map_bytes"]))
-            context = compose_source_map(map_snapshot, map_original_path=map_path, policy=policy, policy_digest=policy_digest, verifier=None, timestamp_provider_id=args.timestamp_provider_id, root_evidence=root, store=store, limits=limits, core=core)
-            if canonical_bytes(context["summary"]) != canonical_bytes(evidence["source_mapping"]):
-                raise OrigenError("SOURCE_MAP_MISMATCH", "source map summary differs from signed Final Evidence")
-            if context["kind"] == "text":
-                rebuilt_digest = digest_bytes(context["assembled"])
-                if rebuilt_digest != asset.sha256 or evidence["source_mapping"].get("rebuilt_output_sha256") != asset.sha256:
-                    raise OrigenError("REBUILT_DIGEST_MISMATCH", "source snapshots rebuild to bytes different from Final asset")
-        if prepublish and evidence.get("publish_ready") is not True:
-            raise OrigenError("NOT_PUBLISH_READY", "signed Final Evidence is not publish-ready")
-        verified_receipt = dict(receipt)
-        verified_receipt.update({
-            "verified": True, "status": status_name, "bundle": str(args.bundle),
-            "verification_policy_mode": policy["mode"], "publisher_must_rehash_upload": True,
-            "publisher_must_not_transform": True,
-        })
-        return verified_receipt
+        context = build_policy_context(discover_config_path(getattr(args, "config", None)), store, core)
+        setattr(args, "timestamp_provider_id", context.timestamp_provider_id)
+        request = BundleRequest(
+            bundle=args.bundle, root_evidence=args.root_evidence,
+            parent_evidence=args.parent_evidence, source_map=args.source_map,
+        )
+        return verify_bundle_with_context(request, context=context, store=store, core=core, prepublish=prepublish)
+
+
+@dataclass(frozen=True)
+class BatchItem:
+    """One declared prepublish-batch entry, bound to its input index and config."""
+
+    index: int
+    id: str
+    config_key: str
+    config_path: Path
+    request: BundleRequest
+
+
+def batch_concurrency(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not BATCH_MIN_CONCURRENCY <= value <= BATCH_MAX_CONCURRENCY:
+        raise OrigenError(
+            "INVALID_BATCH_CONCURRENCY",
+            f"concurrency must be an integer between {BATCH_MIN_CONCURRENCY} and {BATCH_MAX_CONCURRENCY}",
+            concurrency=value if isinstance(value, int) and not isinstance(value, bool) else None,
+        )
+    return value
+
+
+def batch_item_path(item: dict[str, object], key: str, index: int, *, required: bool) -> str | None:
+    value = item.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        raise OrigenError("INVALID_BATCH_INPUT", f"items[{index}].{key} must be a non-empty string", index=index)
+    return value
+
+
+def parse_batch_input(raw: dict[str, object]) -> list[BatchItem]:
+    unknown = set(raw) - BATCH_ROOT_FIELDS
+    if unknown:
+        raise OrigenError("INVALID_BATCH_INPUT", "batch input contains unknown fields", fields=sorted(unknown))
+    if raw.get("schema_version") != BATCH_INPUT_VERSION:
+        raise OrigenError("INVALID_BATCH_INPUT", f"batch input requires schema_version {BATCH_INPUT_VERSION}")
+    values = raw.get("items")
+    if not isinstance(values, list) or not values:
+        raise OrigenError("INVALID_BATCH_INPUT", "batch input requires a non-empty items array")
+    if len(values) > BATCH_MAX_ITEMS:
+        raise OrigenError("BATCH_ITEM_COUNT_EXCEEDED", "batch item count exceeds the supported limit", count=len(values), maximum=BATCH_MAX_ITEMS)
+    items: list[BatchItem] = []
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            raise OrigenError("INVALID_BATCH_INPUT", f"items[{index}] must be an object", index=index)
+        unknown = set(value) - BATCH_ITEM_REQUIRED_FIELDS - BATCH_ITEM_OPTIONAL_FIELDS
+        if unknown:
+            raise OrigenError("INVALID_BATCH_INPUT", f"items[{index}] contains unknown fields", index=index, fields=sorted(unknown))
+        missing = sorted(BATCH_ITEM_REQUIRED_FIELDS - set(value))
+        if missing:
+            raise OrigenError("INVALID_BATCH_INPUT", f"items[{index}] is missing required fields", index=index, fields=missing)
+        identifier = value["id"]
+        if not isinstance(identifier, str) or not BATCH_ID_RE.fullmatch(identifier):
+            raise OrigenError("INVALID_BATCH_INPUT", f"items[{index}].id must be a non-empty printable string", index=index)
+        if identifier in seen:
+            raise OrigenError("DUPLICATE_BATCH_ITEM_ID", "batch item IDs must be unique", index=index, id=identifier)
+        seen.add(identifier)
+        config = Path(batch_item_path(value, "config", index, required=True))
+        items.append(BatchItem(
+            index=index,
+            id=identifier,
+            config_key=os.path.abspath(config),
+            config_path=config,
+            request=BundleRequest(
+                bundle=batch_item_path(value, "bundle", index, required=True),
+                root_evidence=batch_item_path(value, "root_evidence", index, required=False),
+                parent_evidence=batch_item_path(value, "parent_evidence", index, required=False),
+                source_map=batch_item_path(value, "source_map", index, required=False),
+            ),
+        ))
+    return items
+
+
+def batch_failure(failures: list[dict[str, object]], item_count: int) -> OrigenError:
+    ordered = sorted(failures, key=lambda failure: failure["index"])
+    return OrigenError(
+        "BATCH_VERIFICATION_FAILED",
+        "prepublish-batch failed closed; no item in this batch is publish-ready",
+        item_count=item_count,
+        failed_count=len(ordered),
+        first_failure_code=ordered[0]["code"],
+        failures=ordered,
+    )
+
+
+def load_batch_contexts(items: list[BatchItem], store: SnapshotStore, core: Any) -> dict[str, PolicyContext]:
+    """Snapshot config, Trust Policy, and Provider registry exactly once per config."""
+    contexts: dict[str, PolicyContext] = {}
+    errors: dict[str, OrigenError] = {}
+    for item in items:
+        if item.config_key in contexts or item.config_key in errors:
+            continue
+        try:
+            contexts[item.config_key] = build_policy_context(item.config_path, store, core)
+        except OrigenError as error:
+            errors[item.config_key] = error
+        except OSError as error:
+            errors[item.config_key] = OrigenError("IO_ERROR", str(error))
+    if errors:
+        raise batch_failure(
+            [
+                {
+                    "index": item.index, "id": item.id,
+                    "code": errors[item.config_key].code, "message": errors[item.config_key].message,
+                }
+                for item in items if item.config_key in errors
+            ],
+            len(items),
+        )
+    return contexts
+
+
+def verify_batch_item(item: BatchItem, context: PolicyContext, core: Any) -> dict[str, object]:
+    # Each item gets a private snapshot store so bounded concurrency never shares
+    # mutable verification state between bundles.
+    with SnapshotStore() as store:
+        return verify_bundle_with_context(item.request, context=context, store=store, core=core, prepublish=True)
+
+
+def run_batch(items: list[BatchItem], contexts: dict[str, PolicyContext], core: Any, concurrency: int) -> list[dict[str, object]]:
+    results: list[dict[str, object] | None] = [None] * len(items)
+    failures: list[dict[str, object]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="origen-batch") as pool:
+        submitted = [(item, pool.submit(verify_batch_item, item, contexts[item.config_key], core)) for item in items]
+        # Every item runs to completion so the reported failure set is deterministic.
+        for item, future in submitted:
+            try:
+                results[item.index] = future.result()
+            except OrigenError as error:
+                failures.append({"index": item.index, "id": item.id, "code": error.code, "message": error.message})
+            except OSError as error:
+                failures.append({"index": item.index, "id": item.id, "code": "IO_ERROR", "message": str(error)})
+    # No item may reach the caller unverified: a receipt missing without a recorded
+    # cause is still a batch failure.
+    reported = {failure["index"] for failure in failures}
+    failures.extend(
+        {"index": item.index, "id": item.id, "code": "BATCH_RESULT_MISSING", "message": "item produced no verified receipt"}
+        for item in items if results[item.index] is None and item.index not in reported
+    )
+    if failures:
+        raise batch_failure(failures, len(items))
+    return [result for result in results if result is not None]
+
+
+def command_prepublish_batch(args: argparse.Namespace, core: Any) -> dict[str, object]:
+    concurrency = batch_concurrency(args.concurrency)
+    with SnapshotStore() as store:
+        snapshot = store.capture(Path(args.input), label="prepublish batch input", maximum=BATCH_INPUT_BYTES)
+        raw = load_strict_json_bytes(snapshot.read_bytes(), core, label="prepublish batch input", max_depth=BATCH_INPUT_JSON_DEPTH)
+        items = parse_batch_input(raw)
+        effective = min(concurrency, len(items))
+        contexts = load_batch_contexts(items, store, core)
+        receipts = run_batch(items, contexts, core, effective)
+    statuses = {receipt["status"] for receipt in receipts}
+    return {
+        "schema_version": BATCH_RESULT_VERSION,
+        "verified": True,
+        "status": "publish-ready" if statuses == {"publish-ready"} else "development-publish-ready",
+        "item_count": len(items),
+        "config_loads": len(contexts),
+        "concurrency": effective,
+        "publisher_must_rehash_upload": True,
+        "publisher_must_not_transform": True,
+        "publisher_must_not_stage_partial_batch": True,
+        "results": [
+            {"index": item.index, "id": item.id, "receipt": receipt}
+            for item, receipt in zip(items, receipts)
+        ],
+    }
 
 
 def command_setup(args: argparse.Namespace, core: Any) -> dict[str, object]:
@@ -2075,6 +2301,11 @@ def parser() -> argparse.ArgumentParser:
         verify.add_argument("--source-map")
         add_config(verify)
         verify.set_defaults(handler=lambda args, core, mode=prepublish: command_verify(args, core, prepublish=mode))
+
+    batch = commands.add_parser("prepublish-batch")
+    batch.add_argument("--input", required=True, help=f"{BATCH_INPUT_VERSION} document listing the bundles to verify")
+    batch.add_argument("--concurrency", type=int, default=BATCH_DEFAULT_CONCURRENCY, help=f"bounded bundle concurrency, {BATCH_MIN_CONCURRENCY}..{BATCH_MAX_CONCURRENCY}")
+    batch.set_defaults(handler=lambda args, core: command_prepublish_batch(args, core))
     return root
 
 
