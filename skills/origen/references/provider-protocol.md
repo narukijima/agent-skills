@@ -4,6 +4,16 @@ Origen coreとSigner / Verifier / trusted time実装の間は、JSON requestをs
 
 Provider transportは`origen-provider-registry/1`へ置き、Trust Policyから分離する。実装はlocal process、OS key store adapter、environment/secret store、password manager、remote signer、cloud KMS、HSM/PKCS#11のいずれでもよい。
 
+## Interaction declaration
+
+Provider entryは`interaction`で無人適格を宣言する。
+
+- `none`: 署名に人間の操作が要らない。無人運用に使えるのはこれだけ。
+- `per-launch`: process / 元アプリの起動ごとに承認が要る。
+- `per-signature`: 署名ごとに承認が要る。
+
+未宣言は「不明」として扱い、無人経路では拒否する。`interaction`はdeployment情報でありTrust Policy digestへ含めない。詳細と実測checkは[Unattended Signer Profile](unattended.md)を読む。
+
 ## Signer / Verifier
 
 共通request:
@@ -85,8 +95,26 @@ Process adapterはabsolute executable、literal argv、実行ファイル/script
 
 Builder / Inspectorも同じtransport hardeningを再利用するが、Signer protocolとは別Capabilityである。
 
+## Self-test / conformance
+
+`origen setup`と`origen doctor`はProvider health/capabilities、public verifier、Final key sign/verify、trusted timeをself-testする。`doctor`は同じ検査を既存configへ何も書かずに実行し、schedulerの投入前checkに使う。
+
+self-test payloadは次のdomain-separated documentだけである。`schema_version`が`origen-evidence/4`ではないので、self-test署名をEvidence proofへ再利用できない。
+
+```json
+{
+  "schema_version": "origen-signer-self-test/1",
+  "algorithm": "Ed25519",
+  "key_id": "...",
+  "nonce": "RANDOM_SHA256",
+  "role": "final-attestor"
+}
+```
+
+Root keyはこのpayloadを`interaction: none`宣言時だけ署名する。宣言がなければRoot keyをself-testで使わない。任意contentや利用者供給payloadをRoot keyで署名する経路は作らない。
+
+`interaction: none`のProviderには、`resource_limits.unattended_probe_timeout_seconds`（既定10秒）以内に秘密鍵を使う`sign`と`verify`を完了することを要求する。超過は`UNATTENDED_PROBE_TIMEOUT`である。
+
 ## Setup / recovery / rotation
 
-`origen setup`はProvider health/capabilities、public verifier、Final key sign/verify、trusted timeをself-testする。Root keyで任意self-test payloadを署名しない。
-
-generate、import、existing key reference、remote key enrollment、backup、restoreはProvider固有operationまたは運用手順であり、Origen coreは実装しない。rotationでは新aliasをdefaultへ切り替え、旧Evidence検証用の旧alias、key ID、verifier recordを保持する。
+generate、import、existing key reference、remote key enrollment、backup、restoreはProvider固有operationまたは運用手順であり、Origen coreは実装しない。rotationでは新aliasをdefaultへ切り替え、旧Evidence検証用の旧alias、key ID、verifier recordを保持する。signer aliasはTrust Policy digestへ入らないので、rotationは未publishのHuman Rootをfinalize不能にしない。rotationとfinalizeの関係は[Trust Policy / config](trust-policy.md)を読む。

@@ -59,4 +59,6 @@ verifyはEvidenceに固定されたkey ID、algorithm、public verifier referenc
 
 ## Schema lifecycle
 
-v4 commandは`origen-evidence/4`と`origen-trust-policy/2`だけを受理する。旧Evidenceを機械的に書き換えない。必要なら現Policy下でRootを再attestし、Finalを再build・inspect・signする。
+v4 commandは`origen-evidence/4`と`origen-trust-policy/3`だけを受理する。旧Evidenceを機械的に書き換えない。
+
+signer rotationはPolicy digestを動かさないので、rotation以前の未publish Rootはそのままfinalizeできる。Trust Policy自体が変わったときだけ、保管したHuman Sourceへ現Policy下で`root`を実行し直し、Finalを再build・inspect・signする。再rootは新しいtrusted timeになるので、旧Root Evidenceを検証可能なまま残す。

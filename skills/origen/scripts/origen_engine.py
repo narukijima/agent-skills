@@ -28,10 +28,10 @@ from typing import Any
 import origen_atomic
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SCHEMA_VERSION = "origen-evidence/4"
-CONFIG_VERSION = "origen-config/1"
-POLICY_VERSION = "origen-trust-policy/2"
+CONFIG_VERSION = "origen-config/2"
+POLICY_VERSION = "origen-trust-policy/3"
 REGISTRY_VERSION = "origen-provider-registry/1"
 OPERATION_VERSION = "origen-operation/1"
 BATCH_INPUT_VERSION = "origen-prepublish-batch/1"
@@ -48,6 +48,9 @@ BATCH_INPUT_JSON_DEPTH = 8
 SOURCE_MAP_VERSIONS = {"origen-source-map/2"}
 POLICY_MODES = {"development", "production"}
 SIGNER_ROLES = {"root-attestor", "final-attestor"}
+INTERACTION_MODES = {"none", "per-launch", "per-signature"}
+UNATTENDED_INTERACTION = "none"
+SELF_TEST_VERSION = "origen-signer-self-test/1"
 ROOT_AUTHORIZATION_TYPES = {
     "trusted_ingest", "explicit_authorization", "pre_authorized_workflow",
     "trusted_capture_service", "hardware_backed_authorization", "provider_authorization",
@@ -106,6 +109,7 @@ DEFAULT_LIMITS: dict[str, int | float] = {
     "subprocess_timeout_seconds": 60,
     "subprocess_stdout_bytes": 1024 * 1024,
     "subprocess_stderr_bytes": 1024 * 1024,
+    "unattended_probe_timeout_seconds": 10,
 }
 
 FINAL_COVERAGE = {
@@ -116,7 +120,7 @@ FINAL_COVERAGE = {
 
 CONFIG_FIELDS = {
     "schema_version", "root_signer", "final_signer", "timestamp_provider",
-    "provider_registry", "policy",
+    "provider_registry", "policy", "unattended",
 }
 POLICY_FIELDS = {
     "policy_id", "policy_version", "mode", "root_required",
@@ -130,6 +134,7 @@ TOOL_POLICY_FIELDS = {
     "reproducible_install", "role", "key_id", "algorithm", "signer_identity",
     "builder_identity", "inspector_identity", "provider_id", "provider_identity",
     "verifier", "root_authorization", "inherit_environment", "protocol",
+    "interaction",
 }
 
 EVIDENCE_FIELDS = {
@@ -436,13 +441,10 @@ def merged_policy(config: dict[str, object]) -> tuple[dict[str, object], dict[st
     for key, value in supplied.items():
         policy[key] = value
     validate_policy(policy)
-    policy_document = {
-        "schema_version": POLICY_VERSION,
-        "root_signer": config["root_signer"],
-        "final_signer": config["final_signer"],
-        "timestamp_provider": config["timestamp_provider"],
-        **policy,
-    }
+    # The signed Policy document carries the Trust Policy only. Signer aliases are
+    # deployment-local and are already signed into Evidence identities, so repeating
+    # them here would make every signer rotation a Policy change.
+    policy_document = {"schema_version": POLICY_VERSION, **policy}
     return policy, policy_document
 
 
@@ -462,6 +464,8 @@ def load_config(snapshot: Snapshot, core: Any) -> dict[str, object]:
         raise OrigenError("INVALID_CONFIG", "provider_registry must be a non-empty path")
     if not isinstance(config.get("policy", {}), dict):
         raise OrigenError("INVALID_CONFIG", "policy must be an object")
+    if not isinstance(config.get("unattended", False), bool):
+        raise OrigenError("INVALID_CONFIG", "unattended must be boolean")
     return config
 
 
@@ -480,6 +484,23 @@ def load_registry(snapshot: Snapshot, core: Any) -> dict[str, object]:
     return registry
 
 
+def interaction_mode(entry: dict[str, object], context: str) -> str | None:
+    """Return the declared unattended eligibility of a Provider entry, or None when undeclared."""
+    declared = entry.get("interaction")
+    if declared is None:
+        return None
+    if declared not in INTERACTION_MODES:
+        raise OrigenError("INVALID_INTERACTION_DECLARATION", f"{context}.interaction must be none, per-launch, or per-signature", interaction=declared)
+    return declared
+
+
+def require_unattended_interaction(entry: dict[str, object], context: str) -> str:
+    declared = interaction_mode(entry, context)
+    if declared != UNATTENDED_INTERACTION:
+        raise OrigenError("UNATTENDED_PROVIDER_REQUIRED", f"{context} must declare interaction=none to run unattended", interaction=declared)
+    return declared
+
+
 def merge_provider_entry(registry: dict[str, object], alias: str, category: str) -> dict[str, object]:
     aliases = registry.get(category, {})
     if not isinstance(aliases, dict) or alias not in aliases or not isinstance(aliases[alias], dict):
@@ -492,6 +513,7 @@ def merge_provider_entry(registry: dict[str, object], alias: str, category: str)
     entry = {**providers[provider_id], **specific, "provider_id": provider_id}
     entry.pop("provider", None)
     entry.setdefault("provider_identity", providers[provider_id].get("provider_identity", provider_id))
+    interaction_mode(entry, f"{category}.{alias}")
     if category == "signers":
         entry.setdefault("algorithm", "Ed25519")
         if entry["algorithm"] != "Ed25519":
@@ -549,6 +571,7 @@ def resolve_tool(policy: dict[str, object], category: str, tool_id: str | None, 
     unknown = set(entry) - TOOL_POLICY_FIELDS
     if unknown:
         raise OrigenError("UNKNOWN_POLICY_FIELD", f"{category}.{tool_id} contains unknown critical fields", fields=sorted(unknown))
+    interaction_mode(entry, f"{category}.{tool_id}")
     executable = Path(require_string(entry, "executable", f"{category}.{tool_id}"))
     expected_executable = require_sha256(entry.get("expected_executable_sha256"), f"{category}.{tool_id}.expected_executable_sha256")
     actual_executable, executable_stat = hash_regular_nofollow(executable, label=f"{category} executable")
@@ -645,7 +668,7 @@ def sanitized_environment(policy: dict[str, object], workdir: Path, entry: dict[
     return env
 
 
-def run_tool(entry: dict[str, object], request: dict[str, object], *, policy: dict[str, object], limits: dict[str, int | float], operation: str, workdir: Path) -> dict[str, object]:
+def run_tool(entry: dict[str, object], request: dict[str, object], *, policy: dict[str, object], limits: dict[str, int | float], operation: str, workdir: Path, timeout: float | None = None) -> dict[str, object]:
     payload = canonical_bytes(request)
     stdin_file = tempfile.TemporaryFile(dir=workdir)
     stdin_file.write(payload)
@@ -665,7 +688,7 @@ def run_tool(entry: dict[str, object], request: dict[str, object], *, policy: di
         "stdout": int(limits["subprocess_stdout_bytes"]),
         "stderr": int(limits["subprocess_stderr_bytes"]),
     }
-    deadline = time.monotonic() + float(limits["subprocess_timeout_seconds"])
+    deadline = time.monotonic() + float(limits["subprocess_timeout_seconds"] if timeout is None else timeout)
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
@@ -1178,12 +1201,18 @@ def verify_policy_claim(evidence: dict[str, object], policy: dict[str, object], 
         raise OrigenError("DEVELOPMENT_EVIDENCE_REJECTED", "development evidence cannot pass Production prepublish")
     expected = policy_claim(policy, policy_digest)
     if signed_policy != expected:
-        raise OrigenError("POLICY_DIGEST_MISMATCH", "evidence was not created under this exact Trust Policy")
+        raise OrigenError(
+            "POLICY_DIGEST_MISMATCH", "evidence was not created under this exact Trust Policy",
+            expected_policy=expected,
+            signed_policy=signed_policy if isinstance(signed_policy, dict) else None,
+        )
 
 
 def resolve_evidence_signer(policy: dict[str, object], evidence: dict[str, object]) -> dict[str, object]:
     signed = evidence["identities"]["signer"]
     signer = resolve_tool(policy, "approved_signers", signed.get("signer_id"), role=signed.get("role"))
+    if policy.get("_unattended"):
+        require_unattended_interaction(signer, f"signers.{signer['id']}")
     expected = signer_identity(signer)
     if canonical_bytes(expected) != canonical_bytes(signed):
         raise OrigenError("SIGNER_REGISTRY_MISMATCH", "Provider registry no longer contains the signed key identity; retain rotated verifier entries")
@@ -1201,6 +1230,8 @@ def verify_evidence_snapshot(snapshot: Snapshot, *, policy: dict[str, object], p
         if evidence["evidence_type"] == "human-root" and evidence["assurance"]["root"]["assurance_level"] in {"trusted_time", "capture_attested"}:
             provider_id = timestamp_provider_id or evidence["timestamp"].get("provider_id")
             provider = resolve_tool(policy, "approved_timestamp_providers", provider_id)
+            if policy.get("_unattended"):
+                require_unattended_interaction(provider, f"timestamp_providers.{provider['id']}")
             verify_trusted_timestamp(evidence, provider, policy=policy, limits=limits, workdir=Path(work))
     return evidence
 
@@ -1565,6 +1596,9 @@ def build_policy_context(config_path: Path, store: SnapshotStore, core: Any) -> 
     policy["_root_signer"] = config["root_signer"]
     policy["_final_signer"] = config["final_signer"]
     policy["_timestamp_provider"] = config["timestamp_provider"]
+    policy["_unattended"] = bool(config.get("unattended", False))
+    if policy["_unattended"]:
+        enforce_unattended_providers(policy)
     policy["_policy_document"] = policy_document
     policy["_registry_digest"] = digest_bytes(canonical_bytes(registry))
     executable_dirs = sorted({str(Path(entry["executable"]).parent) for entry in [*signers.values(), *timestamp_providers.values(), *builders.values(), *inspectors.values()] if isinstance(entry.get("executable"), str)})
@@ -2144,6 +2178,149 @@ def command_prepublish_batch(args: argparse.Namespace, core: Any) -> dict[str, o
     }
 
 
+ROOT_SIGNER_OPERATIONS = {"authorize_root", "verify_authorization", "sign", "verify", "get_public_key"}
+FINAL_SIGNER_OPERATIONS = {"sign", "verify", "get_public_key"}
+TIMESTAMP_OPERATIONS = {"timestamp", "verify_timestamp"}
+
+
+def self_test_payload(entry: dict[str, object]) -> bytes:
+    """Domain-separated probe bytes.
+
+    The schema version is not `origen-evidence/4`, so a probe signature can never be
+    replayed as an Evidence proof. This is what lets a Root key be exercised at all.
+    """
+    return canonical_bytes({
+        "schema_version": SELF_TEST_VERSION,
+        "algorithm": entry["algorithm"],
+        "key_id": entry["key_id"],
+        "nonce": digest_bytes(os.urandom(32)),
+        "role": entry["role"],
+    })
+
+
+def bounded_call(entry: dict[str, object], request: dict[str, object], *, policy: dict[str, object], limits: dict[str, int | float], workdir: Path, operation: str, deadline: float | None) -> dict[str, object]:
+    """Run one Provider operation, translating a bounded overrun into a conformance failure."""
+    try:
+        return run_tool(entry, request, policy=policy, limits=limits, operation=operation, workdir=workdir, timeout=deadline)
+    except OrigenError as error:
+        if deadline is not None and error.code == "PROVIDER_TIMEOUT":
+            raise OrigenError(
+                "UNATTENDED_PROBE_TIMEOUT",
+                f"{operation} did not complete inside the unattended deadline; the Provider is waiting for interaction",
+                provider_id=entry["provider_id"], operation=operation, deadline_seconds=deadline,
+            ) from error
+        raise
+
+
+def signer_self_test(entry: dict[str, object], *, policy: dict[str, object], limits: dict[str, int | float], workdir: Path, deadline: float | None) -> None:
+    """Exercise the private key through the Provider's real sign path and verify the result."""
+    payload = self_test_payload(entry)
+    encoded = base64.b64encode(payload).decode("ascii")
+    digest = digest_bytes(payload)
+    signed = bounded_call(entry, {
+        "operation": "sign", "protocol": "origen-signer/1", "role": entry["role"],
+        "key_id": entry["key_id"], "algorithm": entry["algorithm"],
+        "payload": encoded, "payload_sha256": digest,
+    }, policy=policy, limits=limits, workdir=workdir, operation="self-test-sign", deadline=deadline)
+    signature = signed.get("signature")
+    if not isinstance(signature, str) or not signature:
+        raise OrigenError("PROVIDER_SELF_TEST_FAILED", "signer self-test returned no signature", provider_id=entry["provider_id"])
+    verified = bounded_call(entry, {
+        "operation": "verify", "protocol": "origen-signer/1",
+        "key_id": entry["key_id"], "algorithm": entry["algorithm"],
+        "payload": encoded, "payload_sha256": digest,
+        "signature": signature, "verifier": entry["verifier"],
+    }, policy=policy, limits=limits, workdir=workdir, operation="self-test-verify", deadline=deadline)
+    expected = {
+        "provider_id": entry["provider_id"], "key_id": entry["key_id"],
+        "algorithm": entry["algorithm"], "signer_identity": entry["signer_identity"],
+    }
+    if any(signed.get(key) != value for key, value in expected.items()):
+        raise OrigenError("PROVIDER_SELF_TEST_FAILED", "signer returned an unexpected key identity during self-test", provider_id=entry["provider_id"])
+    if verified.get("verified") is not True or any(verified.get(key) != value for key, value in expected.items()):
+        raise OrigenError("PROVIDER_SELF_TEST_FAILED", "signer sign/verify self-test failed", provider_id=entry["provider_id"])
+
+
+def timestamp_self_test(entry: dict[str, object], *, policy: dict[str, object], limits: dict[str, int | float], workdir: Path, deadline: float | None) -> None:
+    subject = {"self_test": digest_bytes(os.urandom(32))}
+    subject_digest = digest_bytes(canonical_bytes(subject))
+    stamped = bounded_call(entry, {
+        "operation": "timestamp", "protocol": "origen-trusted-time/1", "subject_sha256": subject_digest,
+    }, policy=policy, limits=limits, workdir=workdir, operation="self-test-timestamp", deadline=deadline)
+    trusted_time = normalize_timestamp(stamped.get("trusted_time"), label="trusted_time")
+    receipt = stamped.get("receipt")
+    if not isinstance(receipt, str) or not receipt:
+        raise OrigenError("INVALID_TIMESTAMP_RESPONSE", "timestamp provider response is missing receipt")
+    if stamped.get("provider_id") != entry["provider_id"] or stamped.get("provider_identity") != entry["provider_identity"]:
+        raise OrigenError("TIMESTAMP_PROVIDER_MISMATCH", "timestamp provider identity does not match Policy")
+    verified = bounded_call(entry, {
+        "operation": "verify_timestamp", "protocol": "origen-trusted-time/1",
+        "subject_sha256": subject_digest, "trusted_time": trusted_time, "receipt": receipt,
+    }, policy=policy, limits=limits, workdir=workdir, operation="self-test-verify-timestamp", deadline=deadline)
+    if verified.get("verified") is not True:
+        raise OrigenError("TIMESTAMP_INVALID", "trusted timestamp self-test receipt was not verified")
+
+
+def provider_conformance(entry: dict[str, object], *, category: str, required: set[str], policy: dict[str, object], limits: dict[str, int | float], store: SnapshotStore) -> dict[str, object]:
+    """Health, capabilities, public verifier, and — when `interaction: none` is declared — a measured probe.
+
+    The probe is the whole point of the declaration: a Provider whose key listing is
+    instant but whose signature waits on an approval dialog passes every other check.
+    """
+    declared = interaction_mode(entry, f"{category}.{entry['id']}")
+    deadline = float(limits["unattended_probe_timeout_seconds"]) if declared == UNATTENDED_INTERACTION else None
+    record: dict[str, object] = {
+        "id": entry["id"], "provider_id": entry["provider_id"], "healthy": True,
+        "required_operations": sorted(required), "interaction": declared,
+    }
+    with tempfile.TemporaryDirectory(prefix="conformance-", dir=store.root) as work:
+        workdir = Path(work)
+        health = run_tool(entry, {"operation": "health", "protocol": "origen-provider/1"}, policy=policy, limits=limits, operation="provider-health", workdir=workdir)
+        capabilities = run_tool(entry, {"operation": "capabilities", "protocol": "origen-provider/1"}, policy=policy, limits=limits, operation="provider-capabilities", workdir=workdir)
+        operations = capabilities.get("operations")
+        if health.get("healthy") is not True or not isinstance(operations, list) or not required.issubset(set(operations)):
+            raise OrigenError("PROVIDER_SELF_TEST_FAILED", "provider health/capabilities do not satisfy the configured role", provider_id=entry["provider_id"])
+        if category == "approved_signers":
+            public = run_tool(entry, {
+                "operation": "get_public_key", "protocol": "origen-signer/1",
+                "key_id": entry["key_id"], "algorithm": entry["algorithm"],
+            }, policy=policy, limits=limits, operation="get-public-key", workdir=workdir)
+            if public.get("key_id") != entry["key_id"] or public.get("algorithm") != "Ed25519" or public.get("verifier") != entry["verifier"]:
+                raise OrigenError("VERIFIER_REFERENCE_MISMATCH", "provider public verifier information differs from the registry")
+            # A Root key is exercised only when the deployment claims unattended eligibility.
+            if entry["role"] != "root-attestor" or deadline is not None:
+                signer_self_test(entry, policy=policy, limits=limits, workdir=workdir, deadline=deadline)
+                record["self_test"] = "passed"
+            else:
+                record["self_test"] = "skipped"
+        else:
+            timestamp_self_test(entry, policy=policy, limits=limits, workdir=workdir, deadline=deadline)
+            record["self_test"] = "passed"
+    if deadline is not None:
+        record["unattended_probe"] = {"result": "passed", "deadline_seconds": deadline}
+    return record
+
+
+def enforce_unattended_providers(policy: dict[str, object]) -> None:
+    """Every Provider that signs on the unattended path must declare interaction=none."""
+    signers = policy["approved_signers"]
+    timestamps = policy["approved_timestamp_providers"]
+    for alias, table, category in (
+        (policy["_root_signer"], signers, "signers"),
+        (policy["_final_signer"], signers, "signers"),
+        (policy["_timestamp_provider"], timestamps, "timestamp_providers"),
+    ):
+        require_unattended_interaction(table[alias], f"{category}.{alias}")
+
+
+def configured_providers(policy: dict[str, object]) -> list[tuple[dict[str, object], str, set[str]]]:
+    return [
+        (resolve_tool(policy, "approved_signers", policy["_root_signer"], role="root-attestor"), "approved_signers", ROOT_SIGNER_OPERATIONS),
+        (resolve_tool(policy, "approved_signers", policy["_final_signer"], role="final-attestor"), "approved_signers", FINAL_SIGNER_OPERATIONS),
+        (resolve_tool(policy, "approved_timestamp_providers", policy["_timestamp_provider"], role=None), "approved_timestamp_providers", TIMESTAMP_OPERATIONS),
+    ]
+
+
 def command_setup(args: argparse.Namespace, core: Any) -> dict[str, object]:
     output = Path(args.config)
     registry_path = Path(args.provider_registry).resolve()
@@ -2156,6 +2333,7 @@ def command_setup(args: argparse.Namespace, core: Any) -> dict[str, object]:
             "final_signer": args.final_signer,
             "timestamp_provider": args.timestamp_provider,
             "provider_registry": os.path.relpath(registry_path, output.parent.resolve()),
+            "unattended": bool(args.unattended),
             "policy": {},
         }
         if args.policy:
@@ -2173,66 +2351,48 @@ def command_setup(args: argparse.Namespace, core: Any) -> dict[str, object]:
         policy["approved_timestamp_providers"] = timestamps
         policy["approved_builders"] = {}
         policy["approved_inspectors"] = {}
+        policy["_root_signer"] = args.root_signer
+        policy["_final_signer"] = args.final_signer
+        policy["_timestamp_provider"] = args.timestamp_provider
         executable_dirs = sorted({str(Path(entry["executable"]).parent) for entry in [*signers.values(), *timestamps.values()]})
         environment = dict(policy["environment_policy"])
         environment["approved_path"] = list(dict.fromkeys([*environment.get("approved_path", []), *executable_dirs]))
         policy["environment_policy"] = environment
         limits = policy_limits(policy)
-        root_signer = resolve_tool(policy, "approved_signers", args.root_signer, role="root-attestor")
-        final_signer = resolve_tool(policy, "approved_signers", args.final_signer, role="final-attestor")
-        timestamp_provider = resolve_tool(policy, "approved_timestamp_providers", args.timestamp_provider)
-        checked: list[dict[str, object]] = []
-        for entry, required in (
-            (root_signer, {"authorize_root", "verify_authorization", "sign", "verify", "get_public_key"}),
-            (final_signer, {"sign", "verify", "get_public_key"}),
-            (timestamp_provider, {"timestamp", "verify_timestamp"}),
-        ):
-            with tempfile.TemporaryDirectory(prefix="setup-provider-", dir=store.root) as work:
-                health = run_tool(entry, {"operation": "health", "protocol": "origen-provider/1"}, policy=policy, limits=limits, operation="provider-health", workdir=Path(work))
-                capabilities = run_tool(entry, {"operation": "capabilities", "protocol": "origen-provider/1"}, policy=policy, limits=limits, operation="provider-capabilities", workdir=Path(work))
-            operations = capabilities.get("operations")
-            if health.get("healthy") is not True or not isinstance(operations, list) or not required.issubset(set(operations)):
-                raise OrigenError("PROVIDER_SELF_TEST_FAILED", "provider health/capabilities do not satisfy the configured role", provider_id=entry["provider_id"])
-            checked.append({"provider_id": entry["provider_id"], "healthy": True, "required_operations": sorted(required)})
-        for signer in (root_signer, final_signer):
-            with tempfile.TemporaryDirectory(prefix="setup-key-", dir=store.root) as work:
-                public = run_tool(signer, {
-                    "operation": "get_public_key", "protocol": "origen-signer/1",
-                    "key_id": signer["key_id"], "algorithm": signer["algorithm"],
-                }, policy=policy, limits=limits, operation="get-public-key", workdir=Path(work))
-            if public.get("key_id") != signer["key_id"] or public.get("algorithm") != "Ed25519" or public.get("verifier") != signer["verifier"]:
-                raise OrigenError("VERIFIER_REFERENCE_MISMATCH", "provider public verifier information differs from the registry")
-        payload = canonical_bytes({"schema_version": "origen-self-test/1", "nonce": digest_bytes(os.urandom(32))})
-        with tempfile.TemporaryDirectory(prefix="setup-sign-", dir=store.root) as work:
-            signed = run_tool(final_signer, {
-                "operation": "sign", "protocol": "origen-signer/1", "role": "final-attestor",
-                "key_id": final_signer["key_id"], "algorithm": "Ed25519",
-                "payload": base64.b64encode(payload).decode("ascii"), "payload_sha256": digest_bytes(payload),
-            }, policy=policy, limits=limits, operation="setup-sign", workdir=Path(work))
-            verified = run_tool(final_signer, {
-                "operation": "verify", "protocol": "origen-signer/1",
-                "key_id": final_signer["key_id"], "algorithm": "Ed25519",
-                "payload": base64.b64encode(payload).decode("ascii"), "payload_sha256": digest_bytes(payload),
-                "signature": signed.get("signature"), "verifier": final_signer["verifier"],
-            }, policy=policy, limits=limits, operation="setup-verify", workdir=Path(work))
-        expected_sign_response = {
-            "provider_id": final_signer["provider_id"], "key_id": final_signer["key_id"],
-            "algorithm": "Ed25519", "signer_identity": final_signer["signer_identity"],
-        }
-        if any(signed.get(key) != value for key, value in expected_sign_response.items()) or not isinstance(signed.get("signature"), str):
-            raise OrigenError("PROVIDER_SELF_TEST_FAILED", "final signer returned unexpected key identity during self-test")
-        if verified.get("verified") is not True or any(verified.get(key) != value for key, value in expected_sign_response.items()):
-            raise OrigenError("PROVIDER_SELF_TEST_FAILED", "final signer sign/verify self-test failed")
-        with tempfile.TemporaryDirectory(prefix="setup-time-", dir=store.root) as work:
-            timestamp, proof = obtain_trusted_timestamp({"self_test": digest_bytes(payload)}, timestamp_provider, policy=policy, limits=limits, workdir=Path(work))
-            fake = {"timestamp": timestamp, "proof": proof}
-            verify_trusted_timestamp(fake, timestamp_provider, policy=policy, limits=limits, workdir=Path(work))
+        if config["unattended"]:
+            enforce_unattended_providers(policy)
+        checked = [
+            provider_conformance(entry, category=category, required=required, policy=policy, limits=limits, store=store)
+            for entry, category, required in configured_providers(policy)
+        ]
         output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_file_noreplace(output, json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n")
         return {
             "status": "configured", "config": str(output), "algorithm": "Ed25519", "digest": "SHA-256",
             "root_signer": args.root_signer, "final_signer": args.final_signer,
-            "timestamp_provider": args.timestamp_provider, "providers_checked": checked, "self_test": "passed",
+            "timestamp_provider": args.timestamp_provider, "unattended": config["unattended"],
+            "providers_checked": checked, "self_test": "passed",
+        }
+
+
+def command_doctor(args: argparse.Namespace, core: Any) -> dict[str, object]:
+    """Read-only pre-flight for the configured deployment; writes nothing and publishes nothing."""
+    config_path = discover_config_path(getattr(args, "config", None))
+    with SnapshotStore() as store:
+        context = build_policy_context(config_path, store, core)
+        policy = context.policy
+        checked = [
+            provider_conformance(entry, category=category, required=required, policy=policy, limits=context.limits, store=store)
+            for entry, category, required in configured_providers(policy)
+        ]
+        return {
+            "status": "healthy", "config": str(config_path),
+            "policy_id": policy["policy_id"], "policy_version": policy["policy_version"],
+            "mode": policy["mode"], "policy_digest": context.policy_digest,
+            "unattended": policy["_unattended"],
+            "root_signer": policy["_root_signer"], "final_signer": policy["_final_signer"],
+            "timestamp_provider": policy["_timestamp_provider"],
+            "providers": checked,
         }
 
 
@@ -2250,8 +2410,13 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--final-signer", default="default-final")
     setup.add_argument("--timestamp-provider", default="default")
     setup.add_argument("--policy", help="optional JSON object containing Trust Policy overrides")
+    setup.add_argument("--unattended", action="store_true", help="require every configured Provider to declare interaction=none and measure it")
     setup.add_argument("--config", default=str(Path.cwd() / ".origen" / "config.json"))
     setup.set_defaults(handler=lambda args, core: command_setup(args, core))
+
+    doctor = commands.add_parser("doctor")
+    add_config(doctor)
+    doctor.set_defaults(handler=lambda args, core: command_doctor(args, core))
 
     inspect = commands.add_parser("inspect")
     inspect.add_argument("asset")
